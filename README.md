@@ -25,7 +25,10 @@ de cada panel escrita en el prompt, sin ejecutarla** (pulsa Enter para lanzarla)
 | Shift+PgUp / PgDn, rueda | Historial de pantalla |
 | **Ctrl+Alt+Shift+← → ↑ ↓** | **Mover el panel** (intercambiarlo con el de ese lado). No es de Warp: allí se arrastra. |
 
-Ratón: arrastrar los divisores para redimensionar, arrastrar para seleccionar, clic derecho copia (si hay
+Aspecto: tema «Dark» de Warp (fondo casi negro y su paleta ANSI), pestañas en la barra de título y una
+cabecera con título y ✕ en cada panel cuando la pestaña está dividida.
+
+Ratón: arrastrar la cabecera de un panel y soltarla sobre otro los intercambia, arrastrar los divisores para redimensionar, arrastrar para seleccionar, clic derecho copia (si hay
 selección) o pega, clic central en una pestaña la cierra, `+` abre otra.
 
 ## Última orden

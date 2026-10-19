@@ -45,17 +45,22 @@ static PFN_ResizePseudoConsole pResizePseudoConsole;
 static PFN_ClosePseudoConsole pClosePseudoConsole;
 
 // ---------------------------------------------------------------------------
-// Aspecto
+// Aspecto: tema «Dark» de Warp (app/src/themes/default_themes.rs)
 
-static const COLORREF kBg = RGB(0x16, 0x18, 0x1d);
-static const COLORREF kFg = RGB(0xe6, 0xe6, 0xe6);
-static const COLORREF kTabBarBg = RGB(0x0e, 0x10, 0x13);
-static const COLORREF kTabActiveBg = RGB(0x26, 0x29, 0x31);
-static const COLORREF kTabText = RGB(0x9a, 0xa0, 0xaa);
-static const COLORREF kAccent = RGB(0x3b, 0x82, 0xf6);
-static const COLORREF kDivider = RGB(0x30, 0x34, 0x3c);
-static const COLORREF kSelBg = RGB(0x2f, 0x4f, 0x8a);
-static const int kGap = 4;           // separación entre paneles (px)
+static const COLORREF kBg = RGB(0x05, 0x05, 0x05);
+static const COLORREF kFg = RGB(0xff, 0xff, 0xff);
+static const COLORREF kTitleBg = RGB(0x11, 0x11, 0x11);
+static const COLORREF kTabActiveBg = RGB(0x24, 0x24, 0x24);
+static const COLORREF kTabText = RGB(0x9b, 0x9b, 0x9b);
+static const COLORREF kHdrActiveBg = RGB(0x1a, 0x1a, 0x1a);
+static const COLORREF kAccent = RGB(0x19, 0xaa, 0xd8);
+static const COLORREF kDivider = RGB(0x3a, 0x3a, 0x3a);
+static const COLORREF kSelBg = RGB(0x1d, 0x4f, 0x63);
+static const COLORREF kCloseHover = RGB(0xc4, 0x2b, 0x1c);
+static const uint32_t kAnsi[16] = {0x616161, 0xFF8272, 0xB4FA72, 0xFEFDC2, 0xA5D5FE, 0xFF8FFD,
+                                   0xD0D1FE, 0xF1F1F1, 0x8E8E8E, 0xFFC4BD, 0xD6FCB9, 0xFEFDD5,
+                                   0xC1E3FE, 0xFFB1FE, 0xE5E6FE, 0xFEFFFF};
+static const int kGap = 1;           // separación entre paneles (px)
 static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
@@ -93,7 +98,8 @@ struct Pane {
   CRITICAL_SECTION writeCs;  // ordena las escrituras a la shell
   std::string outBuf;        // bytes generados por libvterm pendientes de enviar
   int rows = 24, cols = 80;
-  RECT rc{};
+  RECT rc{};       // panel entero (cabecera incluida)
+  RECT content{};  // zona de texto
   VTermPos cursor{};
   bool cursorVisible = true;
   bool altScreen = false;
@@ -118,6 +124,7 @@ static std::set<Pane*> g_live;
 static std::atomic<bool> g_dirtyPosted{false};
 static HFONT g_fonts[4];  // normal, negrita, cursiva, negrita+cursiva
 static HFONT g_uiFont;
+static HFONT g_iconFont;  // Segoe MDL2 Assets: botones de ventana
 static int g_fontPt = 11;
 static int g_dpi = 96;
 static int g_cellW = 8, g_cellH = 16;
@@ -128,14 +135,22 @@ static bool g_focused = true;
 static Pane* g_selPane = nullptr;
 static VTermPos g_selA{}, g_selB{};
 static bool g_selecting = false, g_hasSel = false;
-// Arrastre de divisores.
+// Arrastre de divisores y de paneles (por su cabecera).
 static Node* g_dragNode = nullptr;
+static Pane* g_dragPane = nullptr;
+static Pane* g_dropTarget = nullptr;
+static bool g_layoutHeaders = false;
+// Barra de título propia.
+enum { HIT_NONE, HIT_TAB, HIT_TABCLOSE, HIT_PLUS, HIT_MIN, HIT_MAX, HIT_CLOSE };
+static int g_hoverHit = HIT_NONE, g_hoverTab = -1, g_pressedHit = HIT_NONE;
 
 // Guion de prueba (--script) para capturas automáticas.
 static std::vector<std::wstring> g_script;
 static size_t g_scriptPos = 0;
 
-static int TabBarH() { return g_cellH + 12; }
+static int Px(int v) { return MulDiv(v, g_dpi, 96); }
+static int TabBarH() { return Px(38); }
+static int PaneHdrH() { return std::max(Px(26), g_cellH + Px(8)); }
 static Tab& CurTab() { return g_tabs[g_activeTab]; }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +322,11 @@ static Pane* NewPane() {
   vterm_color_rgb(&fg, GetRValue(kFg), GetGValue(kFg), GetBValue(kFg));
   vterm_color_rgb(&bg, GetRValue(kBg), GetGValue(kBg), GetBValue(kBg));
   vterm_state_set_default_colors(st, &fg, &bg);
+  for (int i = 0; i < 16; i++) {
+    VTermColor c;
+    vterm_color_rgb(&c, kAnsi[i] >> 16, (kAnsi[i] >> 8) & 0xff, kAnsi[i] & 0xff);
+    vterm_state_set_palette_color(st, i, &c);
+  }
   vterm_screen_reset(p->scr, 1);
   g_live.insert(p);
   return p;
@@ -383,6 +403,7 @@ static bool SpawnPane(Pane* p) {
 static void DestroyPane(Pane* p) {
   g_live.erase(p);
   if (g_selPane == p) g_selPane = nullptr, g_hasSel = false;
+  if (g_dragPane == p || g_dropTarget == p) g_dragPane = g_dropTarget = nullptr;
   if (p->wait) UnregisterWaitEx(p->wait, INVALID_HANDLE_VALUE);
   if (p->hpc) pClosePseudoConsole(p->hpc);
   if (p->proc) {
@@ -402,9 +423,11 @@ static void DestroyPane(Pane* p) {
 }
 
 static void ResizePane(Pane* p, RECT r) {
-  p->rc = r;
-  int cols = std::max(2, (int)(r.right - r.left - 2 * kPad) / g_cellW);
-  int rows = std::max(1, (int)(r.bottom - r.top - 2 * kPad) / g_cellH);
+  p->rc = p->content = r;
+  if (g_layoutHeaders) p->content.top += PaneHdrH();
+  RECT& c = p->content;
+  int cols = std::max(2, (int)(c.right - c.left - 2 * kPad) / g_cellW);
+  int rows = std::max(1, (int)(c.bottom - c.top - 2 * kPad) / g_cellH);
   if (cols == p->cols && rows == p->rows) return;
   p->cols = cols;
   p->rows = rows;
@@ -441,7 +464,10 @@ static void Relayout() {
   RECT rc;
   GetClientRect(g_hwnd, &rc);
   rc.top += TabBarH();
-  for (auto& t : g_tabs) LayoutNode(t.root, rc);
+  for (auto& t : g_tabs) {
+    g_layoutHeaders = !t.root->leaf();  // cabeceras solo con el panel dividido
+    LayoutNode(t.root, rc);
+  }
   InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -993,8 +1019,8 @@ static Node* DividerAt(Node* n, int x, int y) {
 }
 
 static VTermPos CellFromPoint(Pane* p, int x, int y) {
-  int col = std::clamp((x - (int)p->rc.left - kPad) / g_cellW, 0, p->cols - 1);
-  int row = std::clamp((y - (int)p->rc.top - kPad) / g_cellH, 0, p->rows - 1);
+  int col = std::clamp((x - (int)p->content.left - kPad) / g_cellW, 0, p->cols - 1);
+  int row = std::clamp((y - (int)p->content.top - kPad) / g_cellH, 0, p->rows - 1);
   return VTermPos{row, col};
 }
 
@@ -1032,7 +1058,44 @@ static std::wstring SelectionText() {
   return out;
 }
 
-static int TabWidth() { return MulDiv(170, g_dpi, 96); }
+static int TabWidth() { return Px(200); }
+static int TabsX0() { return Px(8); }
+static int WinBtnW() { return Px(46); }
+
+static int TitleHit(int x, int y, int* tab) {
+  *tab = -1;
+  if (y >= TabBarH()) return HIT_NONE;
+  RECT rc;
+  GetClientRect(g_hwnd, &rc);
+  int bw = WinBtnW();
+  if (x >= rc.right - bw) return HIT_CLOSE;
+  if (x >= rc.right - 2 * bw) return HIT_MAX;
+  if (x >= rc.right - 3 * bw) return HIT_MIN;
+  int n = (int)g_tabs.size(), tw = TabWidth(), x0 = TabsX0();
+  if (x >= x0 && x < x0 + n * tw && y >= Px(6)) {
+    *tab = (x - x0) / tw;
+    return x >= x0 + (*tab + 1) * tw - Px(28) ? HIT_TABCLOSE : HIT_TAB;
+  }
+  if (x >= x0 + n * tw && x < x0 + n * tw + Px(34)) return HIT_PLUS;
+  return HIT_NONE;  // resto de la barra: arrastrar la ventana
+}
+
+static RECT HeaderRect(Pane* p) { return RECT{p->rc.left, p->rc.top, p->rc.right, p->content.top}; }
+
+// Cabecera de panel bajo el punto; *close indica si es su botón ×.
+static Pane* HeaderAt(int x, int y, bool* close) {
+  std::vector<Pane*> ls;
+  Leaves(CurTab().root, ls);
+  POINT pt{x, y};
+  for (Pane* p : ls) {
+    RECT h = HeaderRect(p);
+    if (h.bottom > h.top && PtInRect(&h, pt)) {
+      *close = x >= h.right - Px(30);
+      return p;
+    }
+  }
+  return nullptr;
+}
 
 static void MouseToApp(Pane* p, int x, int y, int button, bool pressed) {
   VTermPos c = CellFromPoint(p, x, y);
@@ -1088,6 +1151,9 @@ static void MakeFonts() {
   }
   g_uiFont = CreateFontW(-MulDiv(9, g_dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                          OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+  if (g_iconFont) DeleteObject(g_iconFont);
+  g_iconFont = CreateFontW(-MulDiv(7, g_dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                           OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe MDL2 Assets");
   HGDIOBJ old = SelectObject(dc, g_fonts[0]);
   TEXTMETRICW tm;
   GetTextMetricsW(dc, &tm);
@@ -1123,8 +1189,8 @@ struct Style {
 
 static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
   EnterCriticalSection(&p->cs);
-  Fill(dc, p->rc, kBg);
-  int ox = p->rc.left + kPad, oy = p->rc.top + kPad;
+  Fill(dc, p->content, kBg);
+  int ox = p->content.left + kPad, oy = p->content.top + kPad;
   std::wstring txt;
   std::vector<INT> dx;
   for (int row = 0; row < p->rows; row++) {
@@ -1208,52 +1274,87 @@ static void DrawDividers(HDC dc, Node* n) {
   DrawDividers(dc, n->b);
 }
 
-static std::wstring TabLabel(int i) {
-  Pane* p = g_tabs[i].active;
+static std::wstring ShortTitle(Pane* p) {
   std::wstring t = p->title;
   if (t.empty()) t = L"Terminal";
   size_t slash = t.find_last_of(L"\\/");
   if (slash != std::wstring::npos && slash + 1 < t.size()) t = t.substr(slash + 1);
-  return std::to_wstring(i + 1) + L"  " + t;
+  return t;
+}
+
+static void Text(HDC dc, const std::wstring& s, RECT r, COLORREF c, UINT flags) {
+  SetTextColor(dc, c);
+  DrawTextW(dc, s.c_str(), (int)s.size(), &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | flags);
+}
+
+static void DrawTitleBar(HDC dc, int w) {
+  int th = TabBarH();
+  Fill(dc, RECT{0, 0, w, th}, kTitleBg);
+  SetBkMode(dc, TRANSPARENT);
+  SelectObject(dc, g_uiFont);
+  int tw = TabWidth(), x0 = TabsX0();
+  for (int i = 0; i < (int)g_tabs.size(); i++) {
+    RECT r{x0 + i * tw, Px(6), x0 + (i + 1) * tw - Px(2), th};
+    bool act = i == g_activeTab, hover = g_hoverTab == i;
+    if (act || hover) Fill(dc, r, act ? kTabActiveBg : RGB(0x1a, 0x1a, 0x1a));
+    RECT tr{r.left + Px(28), r.top, r.right - Px(28), r.bottom};
+    Text(dc, ShortTitle(g_tabs[i].active), tr, act ? kFg : kTabText, DT_CENTER | DT_END_ELLIPSIS);
+    if (act || hover) {
+      RECT xr{r.right - Px(28), r.top, r.right - Px(6), r.bottom};
+      bool hx = g_hoverHit == HIT_TABCLOSE && hover;
+      SelectObject(dc, g_iconFont);
+      Text(dc, L"\uE8BB", xr, hx ? kFg : kTabText, DT_CENTER);
+      SelectObject(dc, g_uiFont);
+    }
+  }
+  int px = x0 + (int)g_tabs.size() * tw;
+  RECT plus{px, Px(6), px + Px(34), th};
+  if (g_hoverHit == HIT_PLUS) Fill(dc, plus, RGB(0x1a, 0x1a, 0x1a));
+  Text(dc, L"+", plus, g_hoverHit == HIT_PLUS ? kFg : kTabText, DT_CENTER);
+  // Minimizar, maximizar/restaurar, cerrar
+  SelectObject(dc, g_iconFont);
+  int bw = WinBtnW();
+  const wchar_t* glyphs[3] = {L"\uE921", IsZoomed(g_hwnd) ? L"\uE923" : L"\uE922", L"\uE8BB"};
+  for (int k = 0; k < 3; k++) {
+    RECT r{w - (3 - k) * bw, 0, w - (2 - k) * bw, th};
+    bool hover = g_hoverHit == HIT_MIN + k;
+    if (hover) Fill(dc, r, k == 2 ? kCloseHover : RGB(0x2a, 0x2a, 0x2a));
+    Text(dc, glyphs[k], r, hover ? kFg : kTabText, DT_CENTER);
+  }
+  SetBkMode(dc, OPAQUE);
+}
+
+static void DrawPaneHeader(HDC dc, Pane* p, bool active) {
+  RECT h = HeaderRect(p);
+  if (h.bottom <= h.top) return;
+  Fill(dc, h, active ? kHdrActiveBg : kBg);
+  SetBkMode(dc, TRANSPARENT);
+  SelectObject(dc, g_uiFont);
+  RECT tr{h.left + Px(34), h.top, h.right - Px(34), h.bottom};
+  Text(dc, ShortTitle(p), tr, active ? kFg : kTabText, DT_CENTER | DT_END_ELLIPSIS);
+  RECT xr{h.right - Px(30), h.top, h.right - Px(6), h.bottom};
+  SelectObject(dc, g_iconFont);
+  Text(dc, L"\uE8BB", xr, kTabText, DT_CENTER);
+  SetBkMode(dc, OPAQUE);
 }
 
 static void Render(HDC dc, int w, int h) {
   RECT all{0, 0, w, h};
   Fill(dc, all, kBg);
-  // Pestañas
-  int th = TabBarH();
-  Fill(dc, RECT{0, 0, w, th}, kTabBarBg);
-  SelectObject(dc, g_uiFont);
-  SetBkMode(dc, TRANSPARENT);
-  int tw = TabWidth();
-  for (int i = 0; i < (int)g_tabs.size(); i++) {
-    RECT r{i * tw, 0, (i + 1) * tw - 1, th};
-    if (i == g_activeTab) {
-      Fill(dc, r, kTabActiveBg);
-      Fill(dc, RECT{r.left, th - 2, r.right, th}, kAccent);
-    }
-    SetTextColor(dc, i == g_activeTab ? kFg : kTabText);
-    RECT tr = r;
-    tr.left += 12;
-    tr.right -= 8;
-    std::wstring label = TabLabel(i);
-    DrawTextW(dc, label.c_str(), -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-  }
-  RECT plus{(int)g_tabs.size() * tw, 0, (int)g_tabs.size() * tw + th, th};
-  SetTextColor(dc, kTabText);
-  DrawTextW(dc, L"+", 1, &plus, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
-  SetBkMode(dc, OPAQUE);
+  DrawTitleBar(dc, w);
   if (g_tabs.empty()) return;
-  // Paneles
   Tab& t = CurTab();
   std::vector<Pane*> ls;
   Leaves(t.root, ls);
-  for (Pane* p : ls) DrawPane(dc, p, p == t.active, g_focused);
+  for (Pane* p : ls) {
+    DrawPane(dc, p, p == t.active, g_focused);
+    DrawPaneHeader(dc, p, p == t.active);
+  }
   DrawDividers(dc, t.root);
-  if (ls.size() > 1) {  // marco del panel activo
+  if (g_dropTarget) {  // destino al arrastrar un panel por su cabecera
     HBRUSH b = CreateSolidBrush(kAccent);
-    RECT r = t.active->rc;
-    FrameRect(dc, &r, b);
+    RECT r = g_dropTarget->rc;
+    for (int i = 0; i < Px(2); i++, InflateRect(&r, -1, -1)) FrameRect(dc, &r, b);
     DeleteObject(b);
   }
 }
@@ -1296,7 +1397,7 @@ static bool SaveScreenshot(const std::wstring& path) {
 
 // ---------------------------------------------------------------------------
 // Guion de prueba: pasos separados por '|', uno cada ~1,2 s.
-//   type:<texto> enter splitR splitD tab close-pane left right up down shot:<fichero.bmp> wait quit
+//   type:<texto> enter splitR splitD tab close-pane left right up down swap-<dir> shot:<fichero.bmp> wait quit
 
 static void RunScriptStep() {
   if (g_scriptPos >= g_script.size()) return;
@@ -1313,6 +1414,11 @@ static void RunScriptStep() {
     int dx = s == L"left" ? -1 : s == L"right" ? 1 : 0, dy = s == L"up" ? -1 : s == L"down" ? 1 : 0;
     if (Pane* n = Neighbor(p, dx, dy)) CurTab().active = n;
     delay = 200;
+  } else if (s.rfind(L"swap-", 0) == 0 && p) {
+    std::wstring d = s.substr(5);
+    int dx = d == L"left" ? -1 : d == L"right" ? 1 : 0, dy = d == L"up" ? -1 : d == L"down" ? 1 : 0;
+    if (Pane* n = Neighbor(p, dx, dy)) SwapPanes(p, n);
+    delay = 300;
   } else if (s.rfind(L"shot:", 0) == 0) SaveScreenshot(s.substr(5)), delay = 200;
   else if (s == L"quit") {
     PostMessage(g_hwnd, WM_CLOSE, 0, 0);
@@ -1336,8 +1442,57 @@ static UINT WindowDpi(HWND h) {
   return fn ? fn(h) : 96;
 }
 
+static int SysMetric(int idx, UINT dpi) {
+  typedef int(WINAPI * PFN)(int, UINT);
+  static PFN fn = (PFN)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi");
+  return fn ? fn(idx, dpi) : GetSystemMetrics(idx);
+}
+
+static void SetHover(int hit, int tab) {
+  if (hit == g_hoverHit && tab == g_hoverTab) return;
+  g_hoverHit = hit;
+  g_hoverTab = tab;
+  RECT r{0, 0, 1 << 15, TabBarH()};
+  InvalidateRect(g_hwnd, &r, FALSE);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
+    case WM_NCCALCSIZE:
+      // Sin barra de título de Windows: las pestañas ocupan su sitio, como en Warp.
+      if (wp) {
+        RECT& r = ((NCCALCSIZE_PARAMS*)lp)->rgrc[0];
+        UINT dpi = WindowDpi(hwnd);
+        int pad = SysMetric(SM_CXPADDEDBORDER, dpi);
+        int fx = SysMetric(SM_CXFRAME, dpi) + pad, fy = SysMetric(SM_CYFRAME, dpi) + pad;
+        r.left += fx;
+        r.right -= fx;
+        r.bottom -= fy;
+        if (IsZoomed(hwnd)) r.top += fy;
+        return 0;
+      }
+      break;
+    case WM_NCHITTEST: {
+      LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
+      if (hit != HTCLIENT) return hit;
+      POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      ScreenToClient(hwnd, &pt);
+      int border = Px(6);
+      if (!IsZoomed(hwnd) && pt.y < border) {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        if (pt.x < 2 * border) return HTTOPLEFT;
+        if (pt.x >= rc.right - 2 * border) return HTTOPRIGHT;
+        return HTTOP;
+      }
+      int tab;
+      if (pt.y < TabBarH() && TitleHit(pt.x, pt.y, &tab) == HIT_NONE) return HTCAPTION;
+      return HTCLIENT;
+    }
+    case WM_NCMOUSEMOVE:
+    case WM_MOUSELEAVE:
+      SetHover(HIT_NONE, -1);
+      break;
     case WM_CREATE: {
       g_hwnd = hwnd;
       ApplyDpi(WindowDpi(hwnd));
@@ -1433,19 +1588,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_tabs.empty()) return 0;
       SetFocus(hwnd);
       if (y < TabBarH()) {
-        int i = x / TabWidth();
-        if (i < (int)g_tabs.size()) {
-          if (msg == WM_MBUTTONDOWN) {
-            std::vector<Pane*> ls;
-            Leaves(g_tabs[i].root, ls);
-            for (Pane* p : ls) ClosePane(p);
-          } else {
-            ActivateTab(i);
-          }
-        } else if (i == (int)g_tabs.size() && msg == WM_LBUTTONDOWN) {
-          NewTab();
+        int i;
+        int hit = TitleHit(x, y, &i);
+        if ((hit == HIT_TAB && msg == WM_MBUTTONDOWN) || (hit == HIT_TABCLOSE && msg == WM_LBUTTONDOWN)) {
+          std::vector<Pane*> ls;
+          Leaves(g_tabs[i].root, ls);
+          for (Pane* p : ls) ClosePane(p);
+        } else if (msg == WM_LBUTTONDOWN) {
+          if (hit == HIT_TAB) ActivateTab(i);
+          else if (hit == HIT_PLUS) NewTab();
+          else if (hit >= HIT_MIN) g_pressedHit = hit;  // se ejecuta al soltar
         }
         return 0;
+      }
+      if (msg == WM_LBUTTONDOWN) {
+        bool close;
+        if (Pane* p = HeaderAt(x, y, &close)) {
+          if (close) {
+            ClosePane(p);
+          } else {  // activar y empezar a arrastrar el panel
+            CurTab().active = p;
+            g_dragPane = p;
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+          }
+          return 0;
+        }
       }
       if (msg == WM_LBUTTONDOWN)
         if (Node* d = DividerAt(CurTab().root, x, y)) {
@@ -1479,6 +1647,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
       int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
       if (g_tabs.empty()) return 0;
+      {
+        int tab;
+        int hit = y < TabBarH() ? TitleHit(x, y, &tab) : HIT_NONE;
+        SetHover(hit, tab);
+        TRACKMOUSEEVENT tme{sizeof tme, TME_LEAVE, hwnd, 0};
+        TrackMouseEvent(&tme);
+      }
+      if (g_dragPane) {
+        Pane* t = PaneAt(x, y);
+        if (t == g_dragPane) t = nullptr;
+        if (t != g_dropTarget) g_dropTarget = t, InvalidateRect(hwnd, nullptr, FALSE);
+        SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+        return 0;
+      }
       if (g_dragNode) {
         RECT r = g_dragNode->rc;
         float ratio = g_dragNode->vertical ? (float)(x - r.left) / std::max(1L, r.right - r.left)
@@ -1497,13 +1679,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         MouseToApp(p, x, y, 0, false);
       }
       Node* d = y >= TabBarH() ? DividerAt(CurTab().root, x, y) : nullptr;
-      SetCursor(LoadCursor(nullptr, d ? (d->vertical ? IDC_SIZEWE : IDC_SIZENS) : IDC_IBEAM));
+      bool onHeader;
+      LPCWSTR cur = d ? (d->vertical ? IDC_SIZEWE : IDC_SIZENS)
+                    : (y < TabBarH() || HeaderAt(x, y, &onHeader)) ? IDC_ARROW : IDC_IBEAM;
+      SetCursor(LoadCursor(nullptr, cur));
       return 0;
     }
     case WM_LBUTTONUP:
     case WM_MBUTTONUP:
     case WM_RBUTTONUP: {
       int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+      if (g_pressedHit != HIT_NONE) {
+        int tab, hit = TitleHit(x, y, &tab);
+        if (hit == g_pressedHit) {
+          if (hit == HIT_MIN) ShowWindow(hwnd, SW_MINIMIZE);
+          else if (hit == HIT_MAX) ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+          else if (hit == HIT_CLOSE) PostMessage(hwnd, WM_CLOSE, 0, 0);
+        }
+        g_pressedHit = HIT_NONE;
+        return 0;
+      }
+      if (g_dragPane) {  // soltar un panel sobre otro: intercambiarlos
+        Pane* target = g_dropTarget;
+        Pane* dragged = g_dragPane;
+        g_dragPane = g_dropTarget = nullptr;
+        ReleaseCapture();
+        if (target && g_live.count(target) && g_live.count(dragged)) SwapPanes(dragged, target);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
       if (g_dragNode || g_selecting) {
         g_dragNode = nullptr;
         g_selecting = false;
@@ -1579,6 +1783,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   HWND hwnd = CreateWindowExW(0, L"BetterWarp", L"better-warp", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                               1280, 760, nullptr, nullptr, inst, nullptr);
   if (!hwnd) return 1;
+  SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
   ShowWindow(hwnd, show);
   UpdateWindow(hwnd);
 

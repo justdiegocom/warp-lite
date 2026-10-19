@@ -9,7 +9,7 @@ function Run($script) {
   $p = Start-Process -FilePath "$dir\better-warp.exe" -ArgumentList "--script `"$script`"" -PassThru
   if (-not $p.WaitForExit(60000)) { $p.Kill(); Write-Output "TIMEOUT" }
 }
-Run "type:echo hola desde el panel 1|enter|splitR|type:Get-Date|enter|splitD|type:echo frhm1|enter|shot:$dir\1-antes.bmp|quit"
+Run "type:echo hola desde el panel 1|enter|tab|type:git --version|enter|splitR|type:Get-Date|enter|splitD|type:echo frhm1|enter|shot:$dir\1-antes.bmp|quit"
 Write-Output "--- session.txt"; Get-Content "$dir\session.txt"
-Run "wait|shot:$dir\2-reabierto.bmp|quit"
+Run "wait|shot:$dir\2-reabierto.bmp|swap-left|wait|shot:$dir\3-movido.bmp|quit"
 Get-ChildItem "$dir\*.bmp" | ForEach-Object { "$($_.Name) $($_.Length)" }
