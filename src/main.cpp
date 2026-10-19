@@ -30,6 +30,16 @@
 
 #include "vterm.h"
 
+// Hack, la fuente por defecto de Warp, va dentro del .exe (third_party/hack, MIT/Bitstream Vera).
+__asm__(".section .rdata,\"dr\"\n.balign 4\n"
+        ".global hack_regular\nhack_regular:\n.incbin \"third_party/hack/Hack-Regular.ttf\"\n.global hack_regular_end\nhack_regular_end:\n"
+        ".global hack_bold\nhack_bold:\n.incbin \"third_party/hack/Hack-Bold.ttf\"\n.global hack_bold_end\nhack_bold_end:\n"
+        ".global hack_italic\nhack_italic:\n.incbin \"third_party/hack/Hack-Italic.ttf\"\n.global hack_italic_end\nhack_italic_end:\n"
+        ".global hack_bolditalic\nhack_bolditalic:\n.incbin \"third_party/hack/Hack-BoldItalic.ttf\"\n"
+        ".global hack_bolditalic_end\nhack_bolditalic_end:\n.text\n");
+extern "C" const unsigned char hack_regular[], hack_regular_end[], hack_bold[], hack_bold_end[], hack_italic[],
+    hack_italic_end[], hack_bolditalic[], hack_bolditalic_end[];
+
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
 #endif
@@ -65,7 +75,7 @@ static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
 enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT };
-enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2 };
+enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3 };
 
 // ---------------------------------------------------------------------------
 // Modelo: pestañas -> árbol de paneles
@@ -86,6 +96,7 @@ struct Node {
 struct Tab {
   Node* root = nullptr;
   Pane* active = nullptr;
+  std::wstring name;  // puesto a mano (doble clic); vacío = título de la shell
 };
 
 struct Pane {
@@ -125,8 +136,15 @@ static std::atomic<bool> g_dirtyPosted{false};
 static HFONT g_fonts[4];  // normal, negrita, cursiva, negrita+cursiva
 static HFONT g_uiFont;
 static HFONT g_iconFont;  // Segoe MDL2 Assets: botones de ventana
-static int g_fontPt = 11;
+static const int kDefaultFontPx = 13;  // DEFAULT_MONOSPACE_FONT_SIZE de Warp
+static int g_fontPx = kDefaultFontPx;
+static int g_zoom = 100;  // escala de toda la interfaz, en %
 static int g_dpi = 96;
+// Renombrado de pestaña en curso.
+static int g_renameTab = -1;
+static std::wstring g_renameText;
+// Aviso breve en la barra de título (p. ej. la escala).
+static std::wstring g_toast;
 static int g_cellW = 8, g_cellH = 16;
 static std::wstring g_sessionPath;
 static bool g_focused = true;
@@ -148,7 +166,8 @@ static int g_hoverHit = HIT_NONE, g_hoverTab = -1, g_pressedHit = HIT_NONE;
 static std::vector<std::wstring> g_script;
 static size_t g_scriptPos = 0;
 
-static int Px(int v) { return MulDiv(v, g_dpi, 96); }
+static int ScaledDpi() { return MulDiv(g_dpi, g_zoom, 100); }
+static int Px(int v) { return MulDiv(v, ScaledDpi(), 96); }
 static int TabBarH() { return Px(38); }
 static int PaneHdrH() { return std::max(Px(26), g_cellH + Px(8)); }
 static Tab& CurTab() { return g_tabs[g_activeTab]; }
@@ -650,12 +669,12 @@ static void SaveNode(std::ostringstream& o, Node* n) {
 static void SaveSession() {
   if (g_tabs.empty() || g_sessionPath.empty()) return;
   std::ostringstream o;
-  o << "BW1\nactive " << g_activeTab << "\n";
+  o << "BW1\nactive " << g_activeTab << "\nui " << g_zoom << " " << g_fontPx << "\n";
   for (auto& t : g_tabs) {
     std::vector<Pane*> ls;
     Leaves(t.root, ls);
     int ai = (int)(std::find(ls.begin(), ls.end(), t.active) - ls.begin());
-    o << "tab " << ai << "\n";
+    o << "tab " << ai << " " << HexEncode(ToUtf8(t.name)) << "\n";
     SaveNode(o, t.root);
   }
   std::string data = o.str();
@@ -707,13 +726,29 @@ static bool LoadSession() {
   int active = 0;
   if (!(in >> magic) || magic != "BW1" || !(in >> word >> active)) return false;
   std::vector<Pane*> created;
-  while (in >> word && word == "tab") {
+  while (in >> word) {
+    if (word == "ui") {
+      in >> g_zoom >> g_fontPx;
+      g_zoom = std::clamp(g_zoom, 50, 300);
+      g_fontPx = std::clamp(g_fontPx, 6, 48);
+      continue;
+    }
+    if (word != "tab") break;
     int ai;
     in >> ai;
+    std::string name;
+    auto pos = in.tellg();
+    if (in >> name && name != "S" && name != "L") {  // sesiones antiguas no traen nombre
+      name = HexDecode(name);
+    } else {
+      name.clear();
+      in.clear();
+      in.seekg(pos);
+    }
     size_t first = created.size();
     Node* root = LoadNode(in, created);
     if (!root) break;
-    Tab t{root, created[std::min(first + std::max(ai, 0), created.size() - 1)]};
+    Tab t{root, created[std::min(first + std::max(ai, 0), created.size() - 1)], ToWide(name)};
     g_tabs.push_back(t);
   }
   if (g_tabs.empty()) return false;
@@ -883,10 +918,62 @@ static void Paste(Pane* p) {
 
 static void MakeFonts();
 
-static void SetFontSize(int pt) {
-  g_fontPt = std::clamp(pt, 6, 40);
+static void Toast(const std::wstring& t) {
+  g_toast = t;
+  SetTimer(g_hwnd, TIMER_TOAST, 1500, nullptr);
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Como Warp: Ctrl +/-/0 escala toda la interfaz; Ctrl+Shift +/- solo el tamaño de letra.
+static void SetZoom(int z) {
+  g_zoom = std::clamp(z, 50, 300);
   MakeFonts();
   Relayout();
+  Toast(L"Escala " + std::to_wstring(g_zoom) + L" %");
+  SaveSession();
+}
+
+static void SetFontSize(int px) {
+  g_fontPx = std::clamp(px, 6, 48);
+  MakeFonts();
+  Relayout();
+  Toast(L"Letra " + std::to_wstring(g_fontPx) + L" px");
+  SaveSession();
+}
+
+static std::wstring ShortTitle(Pane* p);
+
+// Renombrar pestaña (doble clic): Enter guarda, Esc cancela; vacío vuelve al título de la shell.
+static void BeginRename(int i) {
+  if (i < 0 || i >= (int)g_tabs.size()) return;
+  g_renameTab = i;
+  g_renameText = g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name;
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void EndRename(bool commit) {
+  if (g_renameTab < 0) return;
+  if (commit && g_renameTab < (int)g_tabs.size()) {
+    std::wstring t = g_renameText;
+    size_t a = t.find_first_not_of(L" \t"), b = t.find_last_not_of(L" \t");
+    g_tabs[g_renameTab].name = a == std::wstring::npos ? L"" : t.substr(a, b - a + 1);
+    SaveSession();
+  }
+  g_renameTab = -1;
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Teclas durante el renombrado; true si se consume.
+static bool RenameKey(WPARAM vk) {
+  if (vk == VK_RETURN) EndRename(true);
+  else if (vk == VK_ESCAPE) EndRename(false);
+  else if (vk == VK_BACK) {
+    if (!g_renameText.empty()) g_renameText.pop_back();
+    if (!g_renameText.empty() && g_renameText.back() >= 0xD800 && g_renameText.back() < 0xDC00)
+      g_renameText.pop_back();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+  } else return false;
+  return true;
 }
 
 static void ActivateTab(int i) {
@@ -904,6 +991,10 @@ static bool HandleShortcut(WPARAM vk) {
   Pane* act = CurTab().active;
   if (ctrl && shift && !alt) {
     switch (vk) {
+      case VK_OEM_PLUS:
+      case VK_ADD: SetFontSize(g_fontPx + 1); return true;
+      case VK_OEM_MINUS:
+      case VK_SUBTRACT: SetFontSize(g_fontPx - 1); return true;
       case 'D': SplitActive(true); return true;    // dividir a la derecha
       case 'E': SplitActive(false); return true;   // dividir hacia abajo
       case 'T': NewTab(g_activeTab + 1); return true;
@@ -940,9 +1031,12 @@ static bool HandleShortcut(WPARAM vk) {
       case VK_PRIOR: ActivateTab((g_activeTab + (int)g_tabs.size() - 1) % (int)g_tabs.size()); return true;
       case VK_NEXT:
       case VK_TAB: ActivateTab((g_activeTab + 1) % (int)g_tabs.size()); return true;
-      case VK_OEM_PLUS: SetFontSize(g_fontPt + 1); return true;
-      case VK_OEM_MINUS: SetFontSize(g_fontPt - 1); return true;
-      case '0': SetFontSize(11); return true;
+      case VK_OEM_PLUS:
+      case VK_ADD: SetZoom(g_zoom + 10); return true;
+      case VK_OEM_MINUS:
+      case VK_SUBTRACT: SetZoom(g_zoom - 10); return true;
+      case '0':
+      case VK_NUMPAD0: SetZoom(100); return true;
       case 'C':
         if (g_hasSel) {
           CopySelection();
@@ -1144,8 +1238,8 @@ static void MakeFonts() {
   for (auto& f : g_fonts)
     if (f) DeleteObject(f), f = nullptr;
   if (g_uiFont) DeleteObject(g_uiFont);
-  int h = -MulDiv(g_fontPt, g_dpi, 72);
-  const wchar_t* face = L"Cascadia Mono";
+  int h = -MulDiv(g_fontPx, ScaledDpi(), 96);
+  const wchar_t* face = L"Hack";
   HDC dc = GetDC(nullptr);
   for (int i = 0; i < 4; i++) {
     g_fonts[i] = CreateFontW(h, 0, 0, 0, (i & 1) ? FW_BOLD : FW_NORMAL, (i & 2) ? TRUE : FALSE, FALSE, FALSE,
@@ -1156,7 +1250,7 @@ static void MakeFonts() {
       wchar_t got[64];
       GetTextFaceW(dc, 64, got);
       SelectObject(dc, old);
-      if (_wcsicmp(got, face) != 0) {  // sin Cascadia: Consolas
+      if (_wcsicmp(got, face) != 0) {  // si Hack no cargara: Consolas
         DeleteObject(g_fonts[0]);
         face = L"Consolas";
         i = -1;
@@ -1164,10 +1258,10 @@ static void MakeFonts() {
       }
     }
   }
-  g_uiFont = CreateFontW(-MulDiv(9, g_dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+  g_uiFont = CreateFontW(-Px(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                          OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe UI");
   if (g_iconFont) DeleteObject(g_iconFont);
-  g_iconFont = CreateFontW(-MulDiv(7, g_dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+  g_iconFont = CreateFontW(-Px(9), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                            OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe MDL2 Assets");
   HGDIOBJ old = SelectObject(dc, g_fonts[0]);
   TEXTMETRICW tm;
@@ -1313,7 +1407,18 @@ static void DrawTitleBar(HDC dc, int w) {
     bool act = i == g_activeTab, hover = g_hoverTab == i;
     if (act || hover) Fill(dc, r, act ? kTabActiveBg : RGB(0x1a, 0x1a, 0x1a));
     RECT tr{r.left + Px(28), r.top, r.right - Px(28), r.bottom};
-    Text(dc, ShortTitle(g_tabs[i].active), tr, act ? kFg : kTabText, DT_CENTER | DT_END_ELLIPSIS);
+    if (i == g_renameTab) {  // editando el nombre: texto con cursor
+      Fill(dc, r, kTabActiveBg);
+      Fill(dc, RECT{r.left, r.bottom - Px(2), r.right, r.bottom}, kAccent);
+      SIZE sz{};
+      GetTextExtentPoint32W(dc, g_renameText.c_str(), (int)g_renameText.size(), &sz);
+      int cx = std::min((int)(tr.left + tr.right + sz.cx) / 2, (int)tr.right);
+      Text(dc, g_renameText, tr, kFg, DT_CENTER);
+      Fill(dc, RECT{cx + 1, r.top + Px(9), cx + 1 + std::max(1, Px(1)), r.bottom - Px(9)}, kFg);
+      continue;
+    }
+    const std::wstring& label = g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name;
+    Text(dc, label, tr, act ? kFg : kTabText, DT_CENTER | DT_END_ELLIPSIS);
     if (act || hover) {
       RECT xr{r.right - Px(28), r.top, r.right - Px(6), r.bottom};
       bool hx = g_hoverHit == HIT_TABCLOSE && hover;
@@ -1326,6 +1431,10 @@ static void DrawTitleBar(HDC dc, int w) {
   RECT plus{px, Px(6), px + Px(34), th};
   if (g_hoverHit == HIT_PLUS) Fill(dc, plus, RGB(0x1a, 0x1a, 0x1a));
   Text(dc, L"+", plus, g_hoverHit == HIT_PLUS ? kFg : kTabText, DT_CENTER);
+  if (!g_toast.empty()) {
+    RECT tr{px + Px(44), 0, w - 3 * WinBtnW() - Px(12), th};
+    Text(dc, g_toast, tr, kFg, DT_RIGHT);
+  }
   // Minimizar, maximizar/restaurar, cerrar
   SelectObject(dc, g_iconFont);
   int bw = WinBtnW();
@@ -1412,7 +1521,8 @@ static bool SaveScreenshot(const std::wstring& path) {
 
 // ---------------------------------------------------------------------------
 // Guion de prueba: pasos separados por '|', uno cada ~1,2 s.
-//   type:<texto> enter splitR splitD tab close-pane left right up down swap-<dir> shot:<fichero.bmp> wait quit
+//   type:<texto> enter splitR splitD tab close-pane left right up down swap-<dir> rename:<nombre>
+//   zoom:<%> shot:<fichero.bmp> wait quit
 
 static void RunScriptStep() {
   if (g_scriptPos >= g_script.size()) return;
@@ -1434,6 +1544,13 @@ static void RunScriptStep() {
     int dx = d == L"left" ? -1 : d == L"right" ? 1 : 0, dy = d == L"up" ? -1 : d == L"down" ? 1 : 0;
     if (Pane* n = Neighbor(p, dx, dy)) SwapPanes(p, n);
     delay = 300;
+  } else if (s.rfind(L"rename:", 0) == 0) {
+    BeginRename(g_activeTab);
+    g_renameText = s.substr(7);
+    EndRename(true);
+  } else if (s.rfind(L"zoom:", 0) == 0) {
+    SetZoom(_wtoi(s.substr(5).c_str()));
+    delay = 600;
   } else if (s.rfind(L"shot:", 0) == 0) SaveScreenshot(s.substr(5)), delay = 200;
   else if (s == L"quit") {
     PostMessage(g_hwnd, WM_CLOSE, 0, 0);
@@ -1535,7 +1652,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     }
     case WM_TIMER:
-      if (wp == TIMER_SCRIPT) {
+      if (wp == TIMER_TOAST) {
+        KillTimer(hwnd, TIMER_TOAST);
+        g_toast.clear();
+        InvalidateRect(hwnd, nullptr, FALSE);
+      } else if (wp == TIMER_SCRIPT) {
         KillTimer(hwnd, TIMER_SCRIPT);
         RunScriptStep();
       } else if (wp == TIMER_RESTORE) {
@@ -1576,6 +1697,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CHAR:
     case WM_SYSCHAR: {
       if (g_tabs.empty()) return 0;
+      if (g_renameTab >= 0) {
+        if (wp >= 0x20 && msg == WM_CHAR && g_renameText.size() < 60) g_renameText += (wchar_t)wp;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
       static wchar_t high = 0;
       uint32_t cp = (uint32_t)wp;
       if (cp >= 0xD800 && cp < 0xDC00) {
@@ -1593,8 +1719,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL: {
       POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
       ScreenToClient(hwnd, &pt);
-      if (!g_tabs.empty()) OnMouseWheel(pt.x, pt.y, GET_WHEEL_DELTA_WPARAM(wp));
+      if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) SetZoom(g_zoom + (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 10 : -10));
+      else if (!g_tabs.empty()) OnMouseWheel(pt.x, pt.y, GET_WHEEL_DELTA_WPARAM(wp));
       return 0;
+    }
+    case WM_LBUTTONDBLCLK: {
+      int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp), i;
+      if (!g_tabs.empty() && y < TabBarH() && TitleHit(x, y, &i) == HIT_TAB) {
+        ActivateTab(i);
+        BeginRename(i);
+        return 0;
+      }
+      return WndProc(hwnd, WM_LBUTTONDOWN, wp, lp);
     }
     case WM_LBUTTONDOWN:
     case WM_MBUTTONDOWN:
@@ -1602,6 +1738,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
       if (g_tabs.empty()) return 0;
       SetFocus(hwnd);
+      if (g_renameTab >= 0) EndRename(true);  // clic fuera: guarda el nombre
       if (y < TabBarH()) {
         int i;
         int hit = TitleHit(x, y, &i);
@@ -1789,9 +1926,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   }
   LocalFree(argv);
   g_sessionPath = SessionPath();
+  struct { const unsigned char *a, *b; } fonts[] = {{hack_regular, hack_regular_end},
+                                                     {hack_bold, hack_bold_end},
+                                                     {hack_italic, hack_italic_end},
+                                                     {hack_bolditalic, hack_bolditalic_end}};
+  for (auto& f : fonts) {
+    DWORD n = 0;
+    AddFontMemResourceEx((void*)f.a, (DWORD)(f.b - f.a), nullptr, &n);
+  }
 
   WNDCLASSEXW wc{sizeof wc};
-  wc.style = CS_HREDRAW | CS_VREDRAW;
+  wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
   wc.lpfnWndProc = WndProc;
   wc.hInstance = inst;
   wc.hCursor = LoadCursor(nullptr, IDC_IBEAM);
@@ -1807,6 +1952,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
   MSG m;
   while (GetMessageW(&m, nullptr, 0, 0)) {
+    if (g_renameTab >= 0 && (m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN)) {
+      if (!RenameKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
+      continue;
+    }
     if ((m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN) && m.hwnd == g_hwnd &&
         HandleKeyDown(m.wParam, m.lParam)) {
       InvalidateRect(g_hwnd, nullptr, FALSE);

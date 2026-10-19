@@ -21,12 +21,16 @@ de cada panel escrita en el prompt, sin ejecutarla** (pulsa Enter para lanzarla)
 | Ctrl+1 … Ctrl+8, Ctrl+9 | Ir a la pestaña N / a la última |
 | Ctrl+Shift+C, Ctrl+C con selección | Copiar |
 | Ctrl+Shift+V, Ctrl+V | Pegar |
-| Ctrl+= / Ctrl+- / Ctrl+0 | Tamaño de letra |
+| Ctrl + `+` / `-` / `0`, Ctrl + rueda | Escala de toda la interfaz (se guarda) |
+| Ctrl+Shift + `+` / `-` | Tamaño de letra (se guarda) |
+| Doble clic en una pestaña | Renombrarla (Enter guarda, Esc cancela, vacío = título automático) |
 | Shift+PgUp / PgDn, rueda | Historial de pantalla |
 | **Ctrl+Alt+Shift+← → ↑ ↓** | **Mover el panel** (intercambiarlo con el de ese lado). No es de Warp: allí se arrastra. |
 
 Aspecto: tema «Dark» de Warp (fondo casi negro y su paleta ANSI), pestañas en la barra de título y una
 cabecera con título y ✕ en cada panel cuando la pestaña está dividida.
+
+Fuente: Hack a 13 px, la de Warp por defecto, incluida en el `.exe` (`third_party/hack`, licencia MIT/Bitstream Vera).
 
 Al dividir o cerrar, los paneles de una misma fila o columna se reparten el espacio a partes iguales, como en Warp.
 
