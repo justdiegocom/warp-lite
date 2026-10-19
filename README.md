@@ -44,20 +44,11 @@ selección) o pega, clic central en una pestaña la cierra, `+` abre otra.
 `tools/build.sh` (copia al Mac y compila con `zig c++ -target x86_64-windows-gnu`; ~3 s) → `dist/better-warp.exe`.
 `tools/wintest.ps1` es la prueba de humo en Windows (dos arranques con guion y capturas).
 
-## Dictado por voz
+## Dictado por voz (pendiente)
 
-Mismo motor que Warp: **Wispr Flow**. Warp graba a 16 kHz mono, lo manda en WAV/base64 a su servidor
-(`/ai/transcribe`, `provider: wispr`) y este llama a Wispr. Aquí se llama a la API de Wispr directamente
-(`platform-api.wisprflow.ai/api/v1/dash/api`) con tu propia clave, sin cuenta de Warp.
-
-- **Mantén Alt Gr** (Alt derecho, la tecla por defecto de Warp en Windows), habla y suelta; o pulsa el
-  micrófono de la barra de título para empezar y otra vez para terminar. El texto queda escrito en el
-  prompt, sin ejecutarse. Alt Gr + otra tecla sigue escribiendo @, #, etc.
-- Claves en `%APPDATA%\BetterWarp\config.ini` (se crea solo la primera vez):
-  `wispr_api_key=…` (de https://platform.wisprflow.ai, API Keys; Wispr da acceso a su API por solicitud).
-  Sin clave de Wispr se usa `openai_api_key=…` con Whisper (`whisper-1`), el otro proveedor de Warp.
-  `voice_language=es` (vacío = detección automática). También valen `WISPR_API_KEY`/`OPENAI_API_KEY`.
-- `tools/wintest-voice.ps1` prueba la petición contra un servidor que imita a Wispr.
+Warp no usa Whisper en local: graba el audio y lo manda a su servidor (`app/src/ai/voice/transcribe`),
+que lo pasa a Wispr Flow (por defecto) u OpenAI Whisper; necesita cuenta de Warp. Para tenerlo aquí hay
+que elegir motor local (whisper.cpp, como Handy) o API de OpenAI.
 
 ## Licencias
 

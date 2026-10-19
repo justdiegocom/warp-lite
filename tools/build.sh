@@ -21,7 +21,7 @@ build_here() {
     -c src/main.cpp -o build/main.o &
   wait
   "$ZIG" c++ -target $T -O2 -municode -mwindows build/main.o "${objs[@]}" \
-    -lgdi32 -luser32 -lkernel32 -lshell32 -lwinmm -lwinhttp -static -o dist/better-warp.exe
+    -lgdi32 -luser32 -lkernel32 -lshell32 -static -o dist/better-warp.exe
   ls -l dist/better-warp.exe
 }
 
