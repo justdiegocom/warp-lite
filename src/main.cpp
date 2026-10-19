@@ -16,12 +16,15 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <mmsystem.h>
+#include <winhttp.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cwctype>
 #include <deque>
 #include <set>
 #include <sstream>
@@ -64,8 +67,8 @@ static const int kGap = 1;           // separación entre paneles (px)
 static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
-enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT };
-enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2 };
+enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_VOICE };
+enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_VOICE = 3, TIMER_HOLD = 4 };
 
 // ---------------------------------------------------------------------------
 // Modelo: pestañas -> árbol de paneles
@@ -141,7 +144,7 @@ static Pane* g_dragPane = nullptr;
 static Pane* g_dropTarget = nullptr;
 static bool g_layoutHeaders = false;
 // Barra de título propia.
-enum { HIT_NONE, HIT_TAB, HIT_TABCLOSE, HIT_PLUS, HIT_MIN, HIT_MAX, HIT_CLOSE };
+enum { HIT_NONE, HIT_TAB, HIT_TABCLOSE, HIT_PLUS, HIT_MIN, HIT_MAX, HIT_CLOSE, HIT_MIC };
 static int g_hoverHit = HIT_NONE, g_hoverTab = -1, g_pressedHit = HIT_NONE;
 
 // Guion de prueba (--script) para capturas automáticas.
@@ -837,14 +840,8 @@ static void CopySelection() {
   CloseClipboard();
 }
 
-static void Paste(Pane* p) {
-  if (!OpenClipboard(g_hwnd)) return;
-  std::wstring w;
-  if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
-    w = (const wchar_t*)GlobalLock(h);
-    GlobalUnlock(h);
-  }
-  CloseClipboard();
+// Escribe texto en el prompt como un pegado (sin Enter).
+static void PasteText(Pane* p, const std::wstring& w) {
   // Sin ESC ni otros controles: un "\e[201~" pegado no puede salirse del pegado protegido.
   std::wstring norm;
   for (size_t i = 0; i < w.size(); i++) {
@@ -864,6 +861,417 @@ static void Paste(Pane* p) {
   vterm_keyboard_end_paste(p->vt);
   LeaveCriticalSection(&p->cs);
   FlushOut(p);
+}
+
+static void Paste(Pane* p) {
+  if (!OpenClipboard(g_hwnd)) return;
+  std::wstring w;
+  if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+    w = (const wchar_t*)GlobalLock(h);
+    GlobalUnlock(h);
+  }
+  CloseClipboard();
+  PasteText(p, w);
+}
+
+// ---------------------------------------------------------------------------
+// Dictado por voz, como en Warp: audio a 16 kHz mono en WAV/base64 a Wispr Flow
+// (su proveedor por defecto). Si no hay clave de Wispr, OpenAI Whisper (whisper-1),
+// el otro proveedor de Warp. Mantener Alt Gr o pulsar el micrófono.
+
+struct VoiceConfig {
+  std::string wisprKey, openaiKey, language = "es";
+  std::wstring wisprUrl = L"https://platform-api.wisprflow.ai/api/v1/dash/api";
+  std::wstring openaiUrl = L"https://api.openai.com/v1/audio/transcriptions";
+};
+
+struct VoiceJob {
+  std::vector<int16_t> pcm;
+  VoiceConfig cfg;
+};
+
+struct VoiceResult {
+  std::string text;
+  std::wstring error;
+};
+
+enum VoiceState { VOICE_IDLE, VOICE_REC, VOICE_BUSY };
+static VoiceConfig g_voiceCfg;
+static VoiceState g_voice = VOICE_IDLE;
+static HWAVEIN g_waveIn;
+static WAVEHDR g_waveHdr[4];
+static std::vector<char> g_waveBuf[4];
+static int g_waveNext = 0;
+static std::vector<int16_t> g_pcm;
+static Pane* g_voicePane;
+static std::wstring g_status;
+static DWORD g_statusUntil;
+// Alt Gr mantenido: graba si no se pulsa otra tecla a la vez.
+static bool g_altGrDown, g_altGrOther, g_holdRec;
+
+static const DWORD kVoiceMaxMs = 350000;  // Wispr admite hasta 6 min
+
+static void SetStatus(const std::wstring& s, DWORD ms = 5000) {
+  g_status = s;
+  g_statusUntil = GetTickCount() + ms;
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static std::wstring ConfigPath() {
+  wchar_t buf[MAX_PATH];
+  if (GetEnvironmentVariableW(L"BETTERWARP_CONFIG", buf, MAX_PATH)) return buf;
+  if (!GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) return L"better-warp-config.ini";
+  std::wstring dir = std::wstring(buf) + L"\\BetterWarp";
+  CreateDirectoryW(dir.c_str(), nullptr);
+  return dir + L"\\config.ini";
+}
+
+static const char kConfigTemplate[] =
+    "\xEF\xBB\xBF# better-warp\r\n"
+    "# Dictado por voz: mantén Alt Gr (o pulsa el micrófono de arriba), habla y suelta.\r\n"
+    "# Mismo motor que Warp: Wispr Flow. Clave en https://platform.wisprflow.ai (API Keys).\r\n"
+    "wispr_api_key=\r\n"
+    "# Opcional: sin clave de Wispr se usa OpenAI Whisper (el otro proveedor de Warp).\r\n"
+    "openai_api_key=\r\n"
+    "# Idioma (ISO 639-1). Vacío = detección automática.\r\n"
+    "voice_language=es\r\n";
+
+static void LoadConfig() {
+  VoiceConfig c;
+  char env[512];
+  if (GetEnvironmentVariableA("WISPR_API_KEY", env, sizeof env)) c.wisprKey = env;
+  if (GetEnvironmentVariableA("OPENAI_API_KEY", env, sizeof env)) c.openaiKey = env;
+  std::wstring path = ConfigPath();
+  HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) {
+    f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+      DWORD w;
+      WriteFile(f, kConfigTemplate, sizeof kConfigTemplate - 1, &w, nullptr);
+      CloseHandle(f);
+    }
+    g_voiceCfg = c;
+    return;
+  }
+  std::string data(GetFileSize(f, nullptr), 0);
+  DWORD r = 0;
+  ReadFile(f, data.data(), (DWORD)data.size(), &r, nullptr);
+  CloseHandle(f);
+  if (data.rfind("\xEF\xBB\xBF", 0) == 0) data.erase(0, 3);  // BOM de UTF-8
+  std::istringstream in(data);
+  std::string line;
+  auto trim = [](std::string v) {
+    size_t a = v.find_first_not_of(" \t\r\n"), b = v.find_last_not_of(" \t\r\n");
+    return a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+  };
+  while (std::getline(in, line)) {
+    line = trim(line);
+    size_t eq = line.find('=');
+    if (line.empty() || line[0] == '#' || eq == std::string::npos) continue;
+    std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
+    if (k == "wispr_api_key" && !v.empty()) c.wisprKey = v;
+    else if (k == "openai_api_key" && !v.empty()) c.openaiKey = v;
+    else if (k == "voice_language") c.language = v;
+    else if (k == "wispr_url" && !v.empty()) c.wisprUrl = ToWide(v);  // solo para pruebas
+    else if (k == "openai_url" && !v.empty()) c.openaiUrl = ToWide(v);
+  }
+  g_voiceCfg = c;
+}
+
+static std::string Base64(const std::string& in) {
+  static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string o;
+  o.reserve((in.size() + 2) / 3 * 4);
+  size_t i = 0;
+  for (; i + 2 < in.size(); i += 3) {
+    uint32_t v = (uint8_t)in[i] << 16 | (uint8_t)in[i + 1] << 8 | (uint8_t)in[i + 2];
+    o += t[v >> 18], o += t[(v >> 12) & 63], o += t[(v >> 6) & 63], o += t[v & 63];
+  }
+  if (i < in.size()) {
+    uint32_t v = (uint8_t)in[i] << 16 | (i + 1 < in.size() ? (uint8_t)in[i + 1] << 8 : 0);
+    o += t[v >> 18], o += t[(v >> 12) & 63];
+    o += i + 1 < in.size() ? t[(v >> 6) & 63] : '=';
+    o += '=';
+  }
+  return o;
+}
+
+static std::string MakeWav(const std::vector<int16_t>& pcm) {
+  uint32_t data = (uint32_t)pcm.size() * 2;
+  std::string w;
+  auto u32 = [&](uint32_t v) { w.append((const char*)&v, 4); };
+  auto u16 = [&](uint16_t v) { w.append((const char*)&v, 2); };
+  w += "RIFF";
+  u32(36 + data);
+  w += "WAVEfmt ";
+  u32(16), u16(1), u16(1), u32(16000), u32(32000), u16(2), u16(16);
+  w += "data";
+  u32(data);
+  w.append((const char*)pcm.data(), data);
+  return w;
+}
+
+static std::string JsonEscape(const std::string& s) {
+  std::string o;
+  for (char c : s) {
+    if (c == '"' || c == '\\') o += '\\', o += c;
+    else if ((unsigned char)c < 0x20) o += ' ';
+    else o += c;
+  }
+  return o;
+}
+
+// Valor de cadena de "key" en un JSON plano (suficiente para las respuestas de Wispr/OpenAI).
+static bool JsonString(const std::string& j, const char* key, std::string& out) {
+  std::string pat = std::string("\"") + key + "\"";
+  size_t p = j.find(pat);
+  if (p == std::string::npos) return false;
+  p = j.find(':', p + pat.size());
+  if (p == std::string::npos) return false;
+  p = j.find('"', p);
+  if (p == std::string::npos) return false;
+  out.clear();
+  for (size_t i = p + 1; i < j.size(); i++) {
+    char c = j[i];
+    if (c == '"') return true;
+    if (c != '\\' || i + 1 >= j.size()) {
+      out += c;
+      continue;
+    }
+    char e = j[++i];
+    if (e == 'n') out += '\n';
+    else if (e == 't') out += '\t';
+    else if (e == 'r') out += '\r';
+    else if (e == 'u' && i + 4 < j.size()) {
+      uint32_t cp = strtoul(j.substr(i + 1, 4).c_str(), nullptr, 16);
+      i += 4;
+      if (cp >= 0xD800 && cp < 0xDC00 && i + 6 < j.size() && j[i + 1] == '\\' && j[i + 2] == 'u') {
+        uint32_t lo = strtoul(j.substr(i + 3, 4).c_str(), nullptr, 16);
+        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+        i += 6;
+      }
+      AppendUtf8(out, cp);
+    } else out += e;
+  }
+  return false;
+}
+
+static bool HttpPost(const std::wstring& url, const std::wstring& headers, const std::string& body,
+                     DWORD& status, std::string& resp, std::wstring& err) {
+  wchar_t host[256], path[2048], extra[1024];
+  URL_COMPONENTS uc{};
+  uc.dwStructSize = sizeof uc;
+  uc.lpszHostName = host, uc.dwHostNameLength = 256;
+  uc.lpszUrlPath = path, uc.dwUrlPathLength = 2048;
+  uc.lpszExtraInfo = extra, uc.dwExtraInfoLength = 1024;
+  if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
+    err = L"URL no válida";
+    return false;
+  }
+  std::wstring fullPath = std::wstring(path) + extra;
+  HINTERNET s = WinHttpOpen(L"better-warp/0.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+                            WINHTTP_NO_PROXY_BYPASS, 0);
+  if (!s) s = WinHttpOpen(L"better-warp/0.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+                          WINHTTP_NO_PROXY_BYPASS, 0);
+  HINTERNET c = s ? WinHttpConnect(s, host, uc.nPort, 0) : nullptr;
+  HINTERNET r = c ? WinHttpOpenRequest(c, L"POST", fullPath.c_str(), nullptr, WINHTTP_NO_REFERER,
+                                       WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                       uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0)
+                  : nullptr;
+  bool ok = false;
+  if (r) {
+    WinHttpSetTimeouts(r, 10000, 10000, 90000, 90000);
+    ok = WinHttpSendRequest(r, headers.c_str(), (DWORD)-1L, (LPVOID)body.data(), (DWORD)body.size(),
+                            (DWORD)body.size(), 0) &&
+         WinHttpReceiveResponse(r, nullptr);
+  }
+  if (ok) {
+    DWORD len = sizeof status;
+    WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                        &status, &len, WINHTTP_NO_HEADER_INDEX);
+    char buf[8192];
+    DWORD n;
+    while (WinHttpReadData(r, buf, sizeof buf, &n) && n) resp.append(buf, n);
+  } else {
+    err = L"sin conexión (error " + std::to_wstring(GetLastError()) + L")";
+  }
+  if (r) WinHttpCloseHandle(r);
+  if (c) WinHttpCloseHandle(c);
+  if (s) WinHttpCloseHandle(s);
+  return ok;
+}
+
+static VoiceResult Transcribe(const VoiceJob& job) {
+  VoiceResult res;
+  const VoiceConfig& c = job.cfg;
+  std::string wav = MakeWav(job.pcm);
+  bool wispr = !c.wisprKey.empty();
+  std::wstring headers;
+  std::string body;
+  if (wispr) {
+    headers = L"Content-Type: application/json\r\nAuthorization: Bearer " + ToWide(c.wisprKey) + L"\r\n";
+    body = "{\"audio\":\"" + Base64(wav) + "\"";
+    if (!c.language.empty()) body += ",\"language\":[\"" + JsonEscape(c.language) + "\"]";
+    body += ",\"context\":{\"app\":{\"type\":\"other\"}}}";
+  } else {
+    const std::string b = "----betterwarp7c1f";
+    headers = L"Content-Type: multipart/form-data; boundary=" + ToWide(b) + L"\r\nAuthorization: Bearer " +
+              ToWide(c.openaiKey) + L"\r\n";
+    auto field = [&](const char* name, const std::string& v) {
+      body += "--" + b + "\r\nContent-Disposition: form-data; name=\"" + name + "\"\r\n\r\n" + v + "\r\n";
+    };
+    field("model", "whisper-1");
+    field("response_format", "json");
+    if (!c.language.empty()) field("language", c.language);
+    body += "--" + b + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
+            "Content-Type: audio/wav\r\n\r\n" + wav + "\r\n--" + b + "--\r\n";
+  }
+  const wchar_t* who = wispr ? L"Wispr" : L"OpenAI";
+  DWORD status = 0;
+  std::string resp;
+  std::wstring err;
+  if (!HttpPost(wispr ? c.wisprUrl : c.openaiUrl, headers, body, status, resp, err)) {
+    res.error = std::wstring(who) + L": " + err;
+  } else if (status != 200) {
+    std::string msg;
+    if (!JsonString(resp, "message", msg) && !JsonString(resp, "detail", msg)) msg = resp.substr(0, 120);
+    res.error = std::wstring(who) + L" respondió " + std::to_wstring(status) + L": " + ToWide(msg);
+  } else if (!JsonString(resp, "text", res.text)) {
+    res.error = std::wstring(who) + L": respuesta sin texto";
+  }
+  return res;
+}
+
+static DWORD WINAPI VoiceThread(LPVOID arg) {
+  VoiceJob* job = (VoiceJob*)arg;
+  VoiceResult* res = new VoiceResult(Transcribe(*job));
+  delete job;
+  PostMessage(g_hwnd, WM_APP_VOICE, 0, (LPARAM)res);
+  return 0;
+}
+
+static void SendVoice(std::vector<int16_t> pcm) {
+  if (pcm.size() < 16000 * 3 / 10) {  // menos de 0,3 s: nada que transcribir
+    g_voice = VOICE_IDLE;
+    SetStatus(L"Dictado: demasiado corto", 2000);
+    return;
+  }
+  g_voice = VOICE_BUSY;
+  SetStatus(L"Transcribiendo…", 120000);
+  VoiceJob* job = new VoiceJob{std::move(pcm), g_voiceCfg};
+  HANDLE t = CreateThread(nullptr, 0, VoiceThread, job, 0, nullptr);
+  if (t) CloseHandle(t);
+}
+
+// Recoge los búferes ya llenos, en orden; si requeue, los vuelve a poner a grabar.
+static void DrainWave(bool requeue) {
+  for (int k = 0; k < 4; k++) {
+    WAVEHDR& h = g_waveHdr[g_waveNext];
+    if (!(h.dwFlags & WHDR_DONE)) break;
+    const int16_t* s = (const int16_t*)h.lpData;
+    g_pcm.insert(g_pcm.end(), s, s + h.dwBytesRecorded / 2);
+    h.dwFlags &= ~WHDR_DONE;
+    h.dwBytesRecorded = 0;
+    if (requeue) waveInAddBuffer(g_waveIn, &h, sizeof h);
+    g_waveNext = (g_waveNext + 1) % 4;
+  }
+}
+
+static bool StartRecording() {
+  if (g_voice != VOICE_IDLE || g_tabs.empty()) return false;
+  LoadConfig();  // permite poner la clave sin reiniciar
+  if (g_voiceCfg.wisprKey.empty() && g_voiceCfg.openaiKey.empty()) {
+    SetStatus(L"Dictado: falta la clave de Wispr en " + ConfigPath(), 8000);
+    return false;
+  }
+  WAVEFORMATEX wf{WAVE_FORMAT_PCM, 1, 16000, 32000, 2, 16, 0};
+  if (waveInOpen(&g_waveIn, WAVE_MAPPER, &wf, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+    SetStatus(L"Dictado: no se puede abrir el micrófono");
+    return false;
+  }
+  g_pcm.clear();
+  g_waveNext = 0;
+  for (int i = 0; i < 4; i++) {
+    g_waveBuf[i].assign(6400, 0);  // 200 ms
+    g_waveHdr[i] = WAVEHDR{};
+    g_waveHdr[i].lpData = g_waveBuf[i].data();
+    g_waveHdr[i].dwBufferLength = (DWORD)g_waveBuf[i].size();
+    waveInPrepareHeader(g_waveIn, &g_waveHdr[i], sizeof(WAVEHDR));
+    waveInAddBuffer(g_waveIn, &g_waveHdr[i], sizeof(WAVEHDR));
+  }
+  waveInStart(g_waveIn);
+  g_voice = VOICE_REC;
+  g_voicePane = CurTab().active;
+  SetTimer(g_hwnd, TIMER_VOICE, 50, nullptr);
+  SetStatus(g_holdRec ? L"Escuchando… suelta Alt Gr para transcribir" : L"Escuchando… pulsa el micrófono para terminar",
+            kVoiceMaxMs);
+  return true;
+}
+
+static void StopRecording(bool send) {
+  if (g_voice != VOICE_REC) return;
+  KillTimer(g_hwnd, TIMER_VOICE);
+  waveInStop(g_waveIn);
+  waveInReset(g_waveIn);
+  DrainWave(false);
+  for (auto& h : g_waveHdr) waveInUnprepareHeader(g_waveIn, &h, sizeof h);
+  waveInClose(g_waveIn);
+  g_waveIn = nullptr;
+  g_holdRec = false;
+  if (send) {
+    SendVoice(std::move(g_pcm));
+  } else {
+    g_voice = VOICE_IDLE;
+    SetStatus(L"", 0);
+  }
+  g_pcm.clear();
+}
+
+static void OnVoiceResult(VoiceResult* r) {
+  g_voice = VOICE_IDLE;
+  if (!r->error.empty()) {
+    SetStatus(L"Dictado: " + r->error, 10000);
+  } else {
+    SetStatus(L"", 0);
+    std::wstring text = ToWide(r->text);
+    while (!text.empty() && iswspace(text.back())) text.pop_back();
+    size_t a = text.find_first_not_of(L" \t\r\n");
+    Pane* p = g_live.count(g_voicePane) ? g_voicePane : (g_tabs.empty() ? nullptr : CurTab().active);
+    if (p && a != std::wstring::npos) PasteText(p, text.substr(a));
+  }
+  delete r;
+}
+
+static void ToggleMic() {
+  if (g_voice == VOICE_REC) StopRecording(true);
+  else if (g_voice == VOICE_IDLE) g_holdRec = false, StartRecording();
+}
+
+// Alt Gr (Alt derecho), la tecla de dictado por defecto de Warp en Windows. Devuelve true
+// si el mensaje se consume.
+static bool HandleVoiceKey(UINT msg, WPARAM vk, LPARAM lp) {
+  bool rightAlt = vk == VK_MENU && (lp & (1 << 24));
+  bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+  if (rightAlt && down) {
+    if (!(lp & (1 << 30))) {  // primera pulsación, no autorrepetición
+      g_altGrDown = true;
+      g_altGrOther = false;
+      SetTimer(g_hwnd, TIMER_HOLD, 300, nullptr);
+    }
+    return true;
+  }
+  if (rightAlt && !down) {
+    g_altGrDown = false;
+    KillTimer(g_hwnd, TIMER_HOLD);
+    if (g_voice == VOICE_REC && g_holdRec) StopRecording(true);
+    return false;
+  }
+  if (down && g_altGrDown && vk != VK_CONTROL) {  // Alt Gr + tecla: es un carácter (@, #…)
+    g_altGrOther = true;
+    KillTimer(g_hwnd, TIMER_HOLD);
+    if (g_voice == VOICE_REC && g_holdRec) StopRecording(false);
+  }
+  return false;
 }
 
 static void MakeFonts();
@@ -1071,6 +1479,7 @@ static int TitleHit(int x, int y, int* tab) {
   if (x >= rc.right - bw) return HIT_CLOSE;
   if (x >= rc.right - 2 * bw) return HIT_MAX;
   if (x >= rc.right - 3 * bw) return HIT_MIN;
+  if (x >= rc.right - 4 * bw) return HIT_MIC;
   int n = (int)g_tabs.size(), tw = TabWidth(), x0 = TabsX0();
   if (x >= x0 && x < x0 + n * tw && y >= Px(6)) {
     *tab = (x - x0) / tw;
@@ -1311,9 +1720,23 @@ static void DrawTitleBar(HDC dc, int w) {
   RECT plus{px, Px(6), px + Px(34), th};
   if (g_hoverHit == HIT_PLUS) Fill(dc, plus, RGB(0x1a, 0x1a, 0x1a));
   Text(dc, L"+", plus, g_hoverHit == HIT_PLUS ? kFg : kTabText, DT_CENTER);
-  // Minimizar, maximizar/restaurar, cerrar
-  SelectObject(dc, g_iconFont);
   int bw = WinBtnW();
+  // Estado del dictado y botón de micrófono
+  std::wstring status = GetTickCount() < g_statusUntil ? g_status : L"";
+  if (!status.empty()) {
+    RECT sr{px + Px(44), 0, w - 4 * bw - Px(8), th};
+    Text(dc, status, sr, g_voice == VOICE_IDLE ? kTabText : kFg, DT_RIGHT | DT_END_ELLIPSIS);
+  }
+  SelectObject(dc, g_iconFont);
+  {
+    RECT r{w - 4 * bw, 0, w - 3 * bw, th};
+    bool hover = g_hoverHit == HIT_MIC;
+    if (g_voice == VOICE_REC) Fill(dc, r, kCloseHover);
+    else if (hover) Fill(dc, r, RGB(0x2a, 0x2a, 0x2a));
+    COLORREF c = g_voice == VOICE_REC ? kFg : g_voice == VOICE_BUSY ? kAccent : hover ? kFg : kTabText;
+    Text(dc, L"\uE720", r, c, DT_CENTER);
+  }
+  // Minimizar, maximizar/restaurar, cerrar
   const wchar_t* glyphs[3] = {L"\uE921", IsZoomed(g_hwnd) ? L"\uE923" : L"\uE922", L"\uE8BB"};
   for (int k = 0; k < 3; k++) {
     RECT r{w - (3 - k) * bw, 0, w - (2 - k) * bw, th};
@@ -1420,6 +1843,21 @@ static void RunScriptStep() {
     if (Pane* n = Neighbor(p, dx, dy)) SwapPanes(p, n);
     delay = 300;
   } else if (s.rfind(L"shot:", 0) == 0) SaveScreenshot(s.substr(5)), delay = 200;
+  else if (s.rfind(L"voice-wav:", 0) == 0) {  // envía un WAV de 16 kHz como si se hubiera dictado
+    HANDLE f = CreateFileW(s.substr(10).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+      std::string d(GetFileSize(f, nullptr), 0);
+      DWORD r;
+      ReadFile(f, d.data(), (DWORD)d.size(), &r, nullptr);
+      CloseHandle(f);
+      std::vector<int16_t> pcm(d.size() > 44 ? (d.size() - 44) / 2 : 0);
+      if (!pcm.empty()) memcpy(pcm.data(), d.data() + 44, pcm.size() * 2);
+      LoadConfig();
+      g_voicePane = p;
+      SendVoice(std::move(pcm));
+    }
+    delay = 4000;
+  } else if (s == L"mic") ToggleMic(), delay = 2500;
   else if (s == L"quit") {
     PostMessage(g_hwnd, WM_CLOSE, 0, 0);
     return;
@@ -1510,6 +1948,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       Relayout();
       return 0;
     }
+    case WM_APP_VOICE:
+      OnVoiceResult((VoiceResult*)lp);
+      return 0;
     case WM_APP_DIRTY:
       g_dirtyPosted = false;
       InvalidateRect(hwnd, nullptr, FALSE);
@@ -1520,7 +1961,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     }
     case WM_TIMER:
-      if (wp == TIMER_SCRIPT) {
+      if (wp == TIMER_VOICE) {
+        DrainWave(true);
+        if (g_pcm.size() >= kVoiceMaxMs / 1000 * 16000) StopRecording(true);
+      } else if (wp == TIMER_HOLD) {
+        KillTimer(hwnd, TIMER_HOLD);
+        if (g_altGrDown && !g_altGrOther && g_voice == VOICE_IDLE) {
+          g_holdRec = true;
+          if (!StartRecording()) g_holdRec = false;
+        }
+      } else if (wp == TIMER_SCRIPT) {
         KillTimer(hwnd, TIMER_SCRIPT);
         RunScriptStep();
       } else if (wp == TIMER_RESTORE) {
@@ -1597,6 +2047,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (msg == WM_LBUTTONDOWN) {
           if (hit == HIT_TAB) ActivateTab(i);
           else if (hit == HIT_PLUS) NewTab();
+          else if (hit == HIT_MIC) ToggleMic();
           else if (hit >= HIT_MIN) g_pressedHit = hit;  // se ejecuta al soltar
         }
         return 0;
@@ -1727,6 +2178,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       DestroyWindow(hwnd);
       return 0;
     case WM_DESTROY: {
+      StopRecording(false);
       std::vector<Pane*> all(g_live.begin(), g_live.end());
       for (Pane* p : all) DestroyPane(p);
       g_tabs.clear();
@@ -1771,6 +2223,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   }
   LocalFree(argv);
   g_sessionPath = SessionPath();
+  LoadConfig();
 
   WNDCLASSEXW wc{sizeof wc};
   wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1789,6 +2242,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
   MSG m;
   while (GetMessageW(&m, nullptr, 0, 0)) {
+    bool key = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN || m.message == WM_KEYUP ||
+               m.message == WM_SYSKEYUP;
+    if (key && m.hwnd == g_hwnd && HandleVoiceKey(m.message, m.wParam, m.lParam)) continue;
     if ((m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN) && m.hwnd == g_hwnd &&
         HandleKeyDown(m.wParam, m.lParam)) {
       InvalidateRect(g_hwnd, nullptr, FALSE);
