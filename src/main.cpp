@@ -148,6 +148,7 @@ static int g_dpi = 96;
 // Renombrado de pestaña en curso.
 static int g_renameTab = -1;
 static std::wstring g_renameText;
+static bool g_renameAll = false;  // texto entero seleccionado: lo que se escriba lo reemplaza
 // Aviso breve en la barra de título (p. ej. la escala).
 static std::wstring g_toast;
 static int g_cellW = 8, g_cellH = 16;
@@ -955,6 +956,7 @@ static void BeginRename(int i) {
   if (i < 0 || i >= (int)g_tabs.size()) return;
   g_renameTab = i;
   g_renameText = g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name;
+  g_renameAll = true;
   InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -974,7 +976,17 @@ static void EndRename(bool commit) {
 static bool RenameKey(WPARAM vk) {
   if (vk == VK_RETURN) EndRename(true);
   else if (vk == VK_ESCAPE) EndRename(false);
-  else if (vk == VK_BACK) {
+  else if (vk == 'A' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+    g_renameAll = true;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+  } else if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_HOME || vk == VK_END) {
+    g_renameAll = false;  // sin selección: se sigue escribiendo al final
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+  } else if (vk == VK_BACK && g_renameAll) {
+    g_renameText.clear();
+    g_renameAll = false;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+  } else if (vk == VK_BACK) {
     if (!g_renameText.empty()) g_renameText.pop_back();
     if (!g_renameText.empty() && g_renameText.back() >= 0xD800 && g_renameText.back() < 0xDC00)
       g_renameText.pop_back();
@@ -1444,6 +1456,8 @@ static void DrawTitleBar(HDC dc, int w) {
       SIZE sz{};
       GetTextExtentPoint32W(dc, g_renameText.c_str(), (int)g_renameText.size(), &sz);
       int cx = std::min((int)(tr.left + tr.right + sz.cx) / 2, (int)tr.right);
+      if (g_renameAll && sz.cx > 0)  // selección de todo el nombre
+        Fill(dc, RECT{std::max(cx - (int)sz.cx, (int)tr.left), r.top + Px(8), cx + 1, r.bottom - Px(8)}, kSelBg);
       Text(dc, g_renameText, tr, kFg, DT_CENTER);
       Fill(dc, RECT{cx + 1, r.top + Px(9), cx + 1 + std::max(1, Px(1)), r.bottom - Px(9)}, kFg);
       continue;
@@ -1575,6 +1589,10 @@ static void RunScriptStep() {
     int dx = d == L"left" ? -1 : d == L"right" ? 1 : 0, dy = d == L"up" ? -1 : d == L"down" ? 1 : 0;
     if (Pane* n = Neighbor(p, dx, dy)) SwapPanes(p, n);
     delay = 300;
+  } else if (s == L"rename-start") {
+    BeginRename(g_activeTab);
+  } else if (s.rfind(L"rename-type:", 0) == 0) {
+    for (wchar_t c : s.substr(12)) SendMessageW(g_hwnd, WM_CHAR, c, 0);
   } else if (s.rfind(L"rename:", 0) == 0) {
     BeginRename(g_activeTab);
     g_renameText = s.substr(7);
@@ -1731,7 +1749,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SYSCHAR: {
       if (g_tabs.empty()) return 0;
       if (g_renameTab >= 0) {
-        if (wp >= 0x20 && msg == WM_CHAR && g_renameText.size() < 60) g_renameText += (wchar_t)wp;
+        if (wp >= 0x20 && msg == WM_CHAR) {
+          if (g_renameAll) g_renameText.clear(), g_renameAll = false;
+          if (g_renameText.size() < 60) g_renameText += (wchar_t)wp;
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
