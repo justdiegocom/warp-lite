@@ -44,11 +44,10 @@ selección) o pega, clic central en una pestaña la cierra, `+` abre otra.
 `tools/build.sh` (copia al Mac y compila con `zig c++ -target x86_64-windows-gnu`; ~3 s) → `dist/better-warp.exe`.
 `tools/wintest.ps1` es la prueba de humo en Windows (dos arranques con guion y capturas).
 
-## Dictado por voz (pendiente)
+## Instalar en Windows
 
-Warp no usa Whisper en local: graba el audio y lo manda a su servidor (`app/src/ai/voice/transcribe`),
-que lo pasa a Wispr Flow (por defecto) u OpenAI Whisper; necesita cuenta de Warp. Para tenerlo aquí hay
-que elegir motor local (whisper.cpp, como Handy) o API de OpenAI.
+`tools/install.ps1` (junto a `better-warp.exe`): copia el programa a `%LOCALAPPDATA%\Programs\BetterWarp`
+y crea accesos directos en el menú Inicio y en el escritorio. Sin permisos de administrador.
 
 ## Licencias
 
