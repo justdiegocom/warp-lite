@@ -32,6 +32,8 @@ cabecera con título y ✕ en cada panel cuando la pestaña está dividida.
 
 Fuente: Hack a 13 px, la de Warp por defecto, incluida en el `.exe` (`third_party/hack`, licencia MIT/Bitstream Vera).
 
+La cabecera de cada panel (y su pestaña) muestra la orden en marcha mientras corre un programa, como en Warp (p. ej. `ssh frhm1`); al terminar vuelve al título de la shell.
+
 Al dividir o cerrar, los paneles de una misma fila o columna se reparten el espacio a partes iguales, como en Warp.
 
 Ratón: arrastrar la cabecera de un panel y soltarla sobre otro los intercambia, arrastrar los divisores para redimensionar, arrastrar para seleccionar, clic derecho copia (si hay

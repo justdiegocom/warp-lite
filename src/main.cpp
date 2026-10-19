@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <atomic>
@@ -121,6 +122,10 @@ struct Pane {
   int scrollOff = 0;
   // Última orden: dónde empezó a escribirse la línea actual.
   std::string lastCmd;  // UTF-8
+  // Proceso activo (como la cabecera de Warp): orden lanzada y si la shell tiene un hijo vivo.
+  DWORD pid = 0;
+  std::string submittedCmd;
+  std::wstring runningCmd;
   int lineRow = -1, lineCol = -1;
   // Restauración tras reiniciar.
   std::string restoreCmd;
@@ -413,6 +418,7 @@ static bool SpawnPane(Pane* p) {
   if (!ok) return false;
   CloseHandle(pi.hThread);
   p->proc = pi.hProcess;
+  p->pid = pi.dwProcessId;
   p->spawnTick = GetTickCount();
   p->reader = CreateThread(nullptr, 0, ReaderThread, p, 0, nullptr);
   RegisterWaitForSingleObject(&p->wait, p->proc, OnProcessExit, p, INFINITE, WT_EXECUTEONLYONCE);
@@ -843,6 +849,7 @@ static void SendKey(Pane* p, VTermKey key, VTermModifier mod) {
   if (key == VTERM_KEY_ENTER) {
     std::string cmd = ReadTypedLine(p);
     p->lineRow = p->lineCol = -1;
+    if (!cmd.empty()) p->submittedCmd = cmd;
     if (!cmd.empty() && cmd != "exit" && cmd != "logout") p->lastCmd = cmd;
     LeaveCriticalSection(&p->cs);
     if (!cmd.empty()) SaveSession();
@@ -1384,11 +1391,35 @@ static void DrawDividers(HDC dc, Node* n) {
 }
 
 static std::wstring ShortTitle(Pane* p) {
+  if (!p->runningCmd.empty()) return p->runningCmd;
   std::wstring t = p->title;
   if (t.empty()) t = L"Terminal";
   size_t slash = t.find_last_of(L"\\/");
   if (slash != std::wstring::npos && slash + 1 < t.size()) t = t.substr(slash + 1);
   return t;
+}
+
+// Cada panel cuyo shell tenga un proceso hijo vivo muestra la orden que lo lanzó
+// (o el nombre del programa); al terminar vuelve al título normal.
+static void UpdateRunning() {
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return;
+  std::vector<std::pair<DWORD, std::wstring>> children;  // (padre, exe)
+  PROCESSENTRY32W pe{sizeof pe};
+  for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+    if (_wcsicmp(pe.szExeFile, L"conhost.exe") != 0) children.push_back({pe.th32ParentProcessID, pe.szExeFile});
+  CloseHandle(snap);
+  bool changed = false;
+  for (Pane* p : g_live) {
+    if (!p->pid) continue;
+    const std::wstring* exe = nullptr;
+    for (auto& c : children)
+      if (c.first == p->pid) exe = &c.second;
+    std::wstring want;
+    if (exe) want = p->runningCmd.empty() ? (p->submittedCmd.empty() ? *exe : ToWide(p->submittedCmd)) : p->runningCmd;
+    if (want != p->runningCmd) p->runningCmd = want, changed = true;
+  }
+  if (changed) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
 static void Text(HDC dc, const std::wstring& s, RECT r, COLORREF c, UINT flags) {
@@ -1660,6 +1691,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, TIMER_SCRIPT);
         RunScriptStep();
       } else if (wp == TIMER_RESTORE) {
+        static int ticks = 0;
+        if (++ticks % 5 == 0) UpdateRunning();
         // Escribe la última orden en el prompt cuando la shell ha terminado de arrancar.
         DWORD now = GetTickCount();
         for (Pane* p : g_live) {
