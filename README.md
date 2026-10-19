@@ -1,4 +1,4 @@
-# better-warp
+# warp-lite
 
 Terminal mínima para Windows con pestañas y paneles al estilo de [Warp](https://github.com/warpdotdev/warp),
 sin nada más: ni IA, ni bloques, ni cuenta, ni telemetría. Un único `.exe` de ~1 MB (Win32 + ConPTY + libvterm + GDI).
@@ -28,6 +28,8 @@ de cada panel escrita en el prompt, sin ejecutarla** (pulsa Enter para lanzarla)
 Aspecto: tema «Dark» de Warp (fondo casi negro y su paleta ANSI), pestañas en la barra de título y una
 cabecera con título y ✕ en cada panel cuando la pestaña está dividida.
 
+Al dividir o cerrar, los paneles de una misma fila o columna se reparten el espacio a partes iguales, como en Warp.
+
 Ratón: arrastrar la cabecera de un panel y soltarla sobre otro los intercambia, arrastrar los divisores para redimensionar, arrastrar para seleccionar, clic derecho copia (si hay
 selección) o pega, clic central en una pestaña la cierra, `+` abre otra.
 
@@ -36,17 +38,17 @@ selección) o pega, clic central en una pestaña la cierra, `+` abre otra.
 - Se guarda al pulsar Enter: el texto escrito en el prompt (incluido lo que venga del historial o del
   autocompletado). No se guardan `exit`/`logout` ni lo que se escriba dentro de programas de pantalla
   completa (tmux, vim…), así que si entras con `frhm1` y dentro usas tmux, al reabrir verás `frhm1`.
-- Sesión en `%APPDATA%\BetterWarp\session.txt` (`BETTERWARP_SESSION` para cambiarla).
-- Shell: `pwsh` si está instalado, si no `powershell`. Se cambia con `BETTERWARP_SHELL` (p. ej. `cmd.exe`).
+- Sesión en `%APPDATA%\warp-lite\session.txt` (`WARPLITE_SESSION` para cambiarla).
+- Shell: `pwsh` si está instalado, si no `powershell`. Se cambia con `WARPLITE_SHELL` (p. ej. `cmd.exe`).
 
 ## Compilar
 
-`tools/build.sh` (copia al Mac y compila con `zig c++ -target x86_64-windows-gnu`; ~3 s) → `dist/better-warp.exe`.
+`tools/build.sh` (copia al Mac y compila con `zig c++ -target x86_64-windows-gnu`; ~3 s) → `dist/warp-lite.exe`.
 `tools/wintest.ps1` es la prueba de humo en Windows (dos arranques con guion y capturas).
 
 ## Instalar en Windows
 
-`tools/install.ps1` (junto a `better-warp.exe`): copia el programa a `%LOCALAPPDATA%\Programs\BetterWarp`
+`tools/install.ps1` (junto a `warp-lite.exe`): copia el programa a `%LOCALAPPDATA%\Programs\warp-lite`
 y crea accesos directos en el menú Inicio y en el escritorio. Sin permisos de administrador.
 
 ## Licencias

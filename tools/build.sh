@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Compila better-warp.exe (x86_64 Windows) con zig. Se ejecuta en el Mac:
-#   tools/build.sh            -> desde este box: copia al Mac, compila allí y trae dist/better-warp.exe
+# Compila warp-lite.exe (x86_64 Windows) con zig. Se ejecuta en el Mac:
+#   tools/build.sh            -> desde este box: copia al Mac, compila allí y trae dist/warp-lite.exe
 #   tools/build.sh --local    -> compila aquí mismo (necesita zig en el PATH)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REMOTE=mac
-RDIR='~/agent-work/better-warp-build'
+RDIR='~/agent-work/warp-lite-build'
 
 build_here() {
   ZIG=${ZIG:-$(command -v zig || echo /opt/homebrew/bin/zig)}
@@ -22,16 +22,16 @@ build_here() {
   wait
   # zig ignora -mwindows: sin --subsystem,windows el .exe abre una consola al arrancar.
   "$ZIG" c++ -target $T -O2 -municode -Wl,--subsystem,windows build/main.o "${objs[@]}" \
-    -lgdi32 -luser32 -lkernel32 -lshell32 -static -o dist/better-warp.exe
+    -lgdi32 -luser32 -lkernel32 -lshell32 -static -o dist/warp-lite.exe
   python3 - <<'PY'
 import struct, sys
-d = open('dist/better-warp.exe', 'rb').read()
+d = open('dist/warp-lite.exe', 'rb').read()
 pe = struct.unpack('<I', d[0x3c:0x40])[0]
 sub = struct.unpack('<H', d[pe + 24 + 68:pe + 24 + 70])[0]
 if sub != 2:
-    sys.exit(f'better-warp.exe no es una app de ventana (subsistema {sub})')
+    sys.exit(f'warp-lite.exe no es una app de ventana (subsistema {sub})')
 PY
-  ls -l dist/better-warp.exe
+  ls -l dist/warp-lite.exe
 }
 
 if [[ "${1:-}" == "--local" ]]; then build_here; exit; fi
@@ -39,4 +39,4 @@ ssh -o BatchMode=yes "$REMOTE" "mkdir -p $RDIR"
 rsync -az --delete --exclude .git --exclude dist --exclude build ./ "$REMOTE:$RDIR/"
 ssh -o BatchMode=yes "$REMOTE" "cd $RDIR && PATH=/opt/homebrew/bin:\$PATH bash tools/build.sh --local"
 mkdir -p dist
-rsync -az "$REMOTE:$RDIR/dist/better-warp.exe" dist/
+rsync -az "$REMOTE:$RDIR/dist/warp-lite.exe" dist/

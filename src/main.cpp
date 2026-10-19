@@ -1,4 +1,4 @@
-// better-warp: terminal mínima para Windows con pestañas y paneles al estilo Warp.
+// warp-lite: terminal mínima para Windows con pestañas y paneles al estilo Warp.
 // Win32 + ConPTY + libvterm + GDI. Sin IA, sin bloques, sin cuenta: solo terminal.
 // Extra respecto a Warp: al reabrir, cada panel recupera su última orden escrita
 // en el prompt (sin ejecutarla).
@@ -334,7 +334,7 @@ static Pane* NewPane() {
 
 static std::wstring ShellCommand() {
   wchar_t buf[MAX_PATH * 2];
-  DWORD n = GetEnvironmentVariableW(L"BETTERWARP_SHELL", buf, MAX_PATH * 2);
+  DWORD n = GetEnvironmentVariableW(L"WARPLITE_SHELL", buf, MAX_PATH * 2);
   if (n > 0 && n < MAX_PATH * 2) return buf;
   if (SearchPathW(nullptr, L"pwsh.exe", nullptr, MAX_PATH, buf, nullptr)) return L"pwsh.exe -NoLogo";
   return L"powershell.exe -NoLogo";
@@ -479,6 +479,20 @@ static void Leaves(Node* n, std::vector<Pane*>& out) {
   }
 }
 
+// Como Warp: los paneles de una misma fila o columna se reparten el espacio a partes iguales.
+static int Units(Node* n, bool vertical) {
+  if (n->leaf() || n->vertical != vertical) return 1;
+  return Units(n->a, vertical) + Units(n->b, vertical);
+}
+
+static void Equalize(Node* n) {
+  if (n->leaf()) return;
+  int a = Units(n->a, n->vertical), b = Units(n->b, n->vertical);
+  n->ratio = (float)a / (a + b);
+  Equalize(n->a);
+  Equalize(n->b);
+}
+
 static Node* RootOf(Node* n) {
   while (n->parent) n = n->parent;
   return n;
@@ -513,8 +527,8 @@ static Pane* SplitActive(bool vertical) {
   leaf->a = old;
   leaf->b = nn;
   leaf->vertical = vertical;
-  leaf->ratio = 0.5f;
   t.active = np;
+  Equalize(t.root);
   Relayout();
   SpawnPane(np);
   return np;
@@ -568,6 +582,7 @@ static void ClosePane(Pane* p) {
       Leaves(par, ls);
       t.active = ls.front();
     }
+    Equalize(t.root);
     DestroyPane(p);
   }
   Relayout();
@@ -1739,11 +1754,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 static std::wstring SessionPath() {
   wchar_t buf[MAX_PATH];
-  if (GetEnvironmentVariableW(L"BETTERWARP_SESSION", buf, MAX_PATH)) return buf;
-  if (!GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) return L"better-warp-session.txt";
-  std::wstring dir = std::wstring(buf) + L"\\BetterWarp";
+  if (GetEnvironmentVariableW(L"WARPLITE_SESSION", buf, MAX_PATH)) return buf;
+  if (!GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) return L"warp-lite-session.txt";
+  std::wstring dir = std::wstring(buf) + L"\\warp-lite";
   CreateDirectoryW(dir.c_str(), nullptr);
-  return dir + L"\\session.txt";
+  std::wstring path = dir + L"\\session.txt";
+  // Se llamaba better-warp: conserva la sesión anterior.
+  CopyFileW((std::wstring(buf) + L"\\BetterWarp\\session.txt").c_str(), path.c_str(), TRUE);
+  return path;
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
@@ -1752,7 +1770,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   pResizePseudoConsole = (PFN_ResizePseudoConsole)GetProcAddress(k32, "ResizePseudoConsole");
   pClosePseudoConsole = (PFN_ClosePseudoConsole)GetProcAddress(k32, "ClosePseudoConsole");
   if (!pCreatePseudoConsole) {
-    MessageBoxW(nullptr, L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"better-warp", MB_ICONERROR);
+    MessageBoxW(nullptr, L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"warp-lite", MB_ICONERROR);
     return 1;
   }
   typedef BOOL(WINAPI * PFN_Dpi)(HANDLE);
@@ -1778,9 +1796,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   wc.hInstance = inst;
   wc.hCursor = LoadCursor(nullptr, IDC_IBEAM);
   wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-  wc.lpszClassName = L"BetterWarp";
+  wc.lpszClassName = L"WarpLite";
   RegisterClassExW(&wc);
-  HWND hwnd = CreateWindowExW(0, L"BetterWarp", L"better-warp", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+  HWND hwnd = CreateWindowExW(0, L"WarpLite", L"warp-lite", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                               1280, 760, nullptr, nullptr, inst, nullptr);
   if (!hwnd) return 1;
   SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
