@@ -151,6 +151,9 @@ static std::wstring g_renameText;
 static bool g_renameAll = false;  // texto entero seleccionado: lo que se escriba lo reemplaza
 // Aviso breve en la barra de título (p. ej. la escala).
 static std::wstring g_toast;
+// Posición y tamaño de la ventana de la última vez (se guardan en la sesión).
+static bool g_hasWinPos = false, g_winMax = false;
+static RECT g_winRect{};
 static int g_cellW = 8, g_cellH = 16;
 static std::wstring g_sessionPath;
 static bool g_focused = true;
@@ -677,6 +680,13 @@ static void SaveSession() {
   if (g_tabs.empty() || g_sessionPath.empty()) return;
   std::ostringstream o;
   o << "BW1\nactive " << g_activeTab << "\nui " << g_zoom << " " << g_fontPx << "\n";
+  WINDOWPLACEMENT wp{sizeof wp};
+  if (g_hwnd && GetWindowPlacement(g_hwnd, &wp)) {
+    RECT& r = wp.rcNormalPosition;
+    bool max = wp.showCmd == SW_SHOWMAXIMIZED ||
+               (wp.showCmd == SW_SHOWMINIMIZED && (wp.flags & WPF_RESTORETOMAXIMIZED));
+    o << "win " << r.left << " " << r.top << " " << r.right << " " << r.bottom << " " << (max ? 1 : 0) << "\n";
+  }
   for (auto& t : g_tabs) {
     std::vector<Pane*> ls;
     Leaves(t.root, ls);
@@ -738,6 +748,13 @@ static bool LoadSession() {
       in >> g_zoom >> g_fontPx;
       g_zoom = std::clamp(g_zoom, 50, 300);
       g_fontPx = std::clamp(g_fontPx, 6, 48);
+      continue;
+    }
+    if (word == "win") {
+      int m = 0;
+      in >> g_winRect.left >> g_winRect.top >> g_winRect.right >> g_winRect.bottom >> m;
+      g_winMax = m != 0;
+      g_hasWinPos = g_winRect.right - g_winRect.left > 100 && g_winRect.bottom - g_winRect.top > 100;
       continue;
     }
     if (word != "tab") break;
@@ -1567,7 +1584,7 @@ static bool SaveScreenshot(const std::wstring& path) {
 // ---------------------------------------------------------------------------
 // Guion de prueba: pasos separados por '|', uno cada ~1,2 s.
 //   type:<texto> enter splitR splitD tab close-pane left right up down swap-<dir> rename:<nombre>
-//   zoom:<%> shot:<fichero.bmp> wait quit
+//   zoom:<%> move:x,y,w,h maximize rename-start rename-type:<texto> shot:<fichero.bmp> wait quit
 
 static void RunScriptStep() {
   if (g_scriptPos >= g_script.size()) return;
@@ -1589,6 +1606,13 @@ static void RunScriptStep() {
     int dx = d == L"left" ? -1 : d == L"right" ? 1 : 0, dy = d == L"up" ? -1 : d == L"down" ? 1 : 0;
     if (Pane* n = Neighbor(p, dx, dy)) SwapPanes(p, n);
     delay = 300;
+  } else if (s.rfind(L"move:", 0) == 0) {  // move:x,y,ancho,alto
+    int x = 0, y = 0, w = 0, h = 0;
+    swscanf(s.c_str() + 5, L"%d,%d,%d,%d", &x, &y, &w, &h);
+    ShowWindow(g_hwnd, SW_RESTORE);
+    SetWindowPos(g_hwnd, nullptr, x, y, w, h, SWP_NOZORDER);
+  } else if (s == L"maximize") {
+    ShowWindow(g_hwnd, SW_MAXIMIZE);
   } else if (s == L"rename-start") {
     BeginRename(g_activeTab);
   } else if (s.rfind(L"rename-type:", 0) == 0) {
@@ -2001,7 +2025,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
                               1280, 760, nullptr, nullptr, inst, nullptr);
   if (!hwnd) return 1;
   SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
-  ShowWindow(hwnd, show);
+  // Mismo tamaño y estado (maximizada o en ventana) que la última vez, si ese sitio sigue en pantalla.
+  if (g_hasWinPos && MonitorFromRect(&g_winRect, MONITOR_DEFAULTTONULL)) {
+    WINDOWPLACEMENT wp{sizeof wp};
+    wp.rcNormalPosition = g_winRect;
+    wp.showCmd = g_winMax ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+    if (show == SW_SHOWMINNOACTIVE || show == SW_SHOWMINIMIZED || show == SW_MINIMIZE) wp.showCmd = show;
+    SetWindowPlacement(hwnd, &wp);
+  } else {
+    ShowWindow(hwnd, show);
+  }
   UpdateWindow(hwnd);
 
   MSG m;
