@@ -819,10 +819,14 @@ static void Paste(Pane* p) {
     GlobalUnlock(h);
   }
   CloseClipboard();
+  // Sin ESC ni otros controles: un "\e[201~" pegado no puede salirse del pegado protegido.
   std::wstring norm;
   for (size_t i = 0; i < w.size(); i++) {
-    if (w[i] == L'\r' && i + 1 < w.size() && w[i + 1] == L'\n') continue;
-    norm += w[i] == L'\n' ? L'\r' : w[i];
+    wchar_t ch = w[i];
+    if (ch == L'\r' && i + 1 < w.size() && w[i + 1] == L'\n') continue;
+    if (ch == L'\n') ch = L'\r';
+    if ((ch < 0x20 && ch != L'\t' && ch != L'\r') || ch == 0x7f || (ch >= 0x80 && ch < 0xa0)) continue;
+    norm += ch;
   }
   if (norm.empty()) return;
   std::string u = ToUtf8(norm);
