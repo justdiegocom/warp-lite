@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <array>
 #include <functional>
 #include <map>
 #include <unordered_map>
@@ -231,8 +232,9 @@ static Node* g_dragNode = nullptr;
 // Enlace bajo el ratón con Ctrl pulsado (Ctrl+clic lo abre).
 struct LinkHit {
   Pane* p = nullptr;
-  int row = -1, c0 = 0, c1 = 0;
+  int row = -1, c0 = 0, c1 = 0;  // trozo bajo el ratón
   std::wstring url;
+  std::vector<std::array<int, 3>> segs;  // todos los trozos (fila, c0, c1) de una URL partida
 };
 static LinkHit g_link;
 
@@ -2207,6 +2209,7 @@ static LinkHit LinkAt(Pane* p, int x, int y) {
       for (auto& sg : u.segs)
         if (sg.row == pos.row && pos.col >= sg.c0 && pos.col < sg.c1) {
           h.p = p, h.row = pos.row, h.c0 = sg.c0, h.c1 = sg.c1, h.url = u.url;
+          for (auto& s2 : u.segs) h.segs.push_back({s2.row, s2.c0, s2.c1});
         }
   LeaveCriticalSection(&p->cs);
   return h;
@@ -2644,9 +2647,11 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
 
 static void DrawLinkUnderline(HDC dc, Pane* p) {
   if (g_link.p != p) return;
-  int y = p->content.top + kPad + (g_link.row + 1) * g_cellH - std::max(1, Px(1));
-  int x = p->content.left + kPad;
-  Fill(dc, RECT{x + g_link.c0 * g_cellW, y, x + g_link.c1 * g_cellW, y + std::max(1, Px(1))}, kAccent);
+  int x = p->content.left + kPad, t = std::max(1, Px(1));
+  for (auto& [row, c0, c1] : g_link.segs) {  // todos los trozos, también los de otras filas
+    int y = p->content.top + kPad + (row + 1) * g_cellH - t;
+    Fill(dc, RECT{x + c0 * g_cellW, y, x + c1 * g_cellW, y + t}, kAccent);
+  }
 }
 
 static void DrawDividers(HDC dc, Node* n) {
