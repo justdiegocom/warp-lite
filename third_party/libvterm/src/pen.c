@@ -172,6 +172,7 @@ INTERNAL void vterm_state_resetpen(VTermState *state)
   state->pen.bold = 0;      setpenattr_bool(state, VTERM_ATTR_BOLD, 0);
   state->pen.underline = 0; setpenattr_int (state, VTERM_ATTR_UNDERLINE, 0);
   state->pen.italic = 0;    setpenattr_bool(state, VTERM_ATTR_ITALIC, 0);
+  state->pen.dim = 0;       setpenattr_bool(state, VTERM_ATTR_DIM, 0);
   state->pen.blink = 0;     setpenattr_bool(state, VTERM_ATTR_BLINK, 0);
   state->pen.reverse = 0;   setpenattr_bool(state, VTERM_ATTR_REVERSE, 0);
   state->pen.conceal = 0;   setpenattr_bool(state, VTERM_ATTR_CONCEAL, 0);
@@ -195,6 +196,7 @@ INTERNAL void vterm_state_savepen(VTermState *state, int save)
     setpenattr_bool(state, VTERM_ATTR_BOLD,      state->pen.bold);
     setpenattr_int (state, VTERM_ATTR_UNDERLINE, state->pen.underline);
     setpenattr_bool(state, VTERM_ATTR_ITALIC,    state->pen.italic);
+    setpenattr_bool(state, VTERM_ATTR_DIM,       state->pen.dim);
     setpenattr_bool(state, VTERM_ATTR_BLINK,     state->pen.blink);
     setpenattr_bool(state, VTERM_ATTR_REVERSE,   state->pen.reverse);
     setpenattr_bool(state, VTERM_ATTR_CONCEAL,   state->pen.conceal);
@@ -301,6 +303,11 @@ INTERNAL void vterm_state_setpen(VTermState *state, const long args[], int argco
       break;
     }
 
+    case 2: // Faint
+      state->pen.dim = 1;
+      setpenattr_bool(state, VTERM_ATTR_DIM, 1);
+      break;
+
     case 3: // Italic on
       state->pen.italic = 1;
       setpenattr_bool(state, VTERM_ATTR_ITALIC, 1);
@@ -359,9 +366,11 @@ INTERNAL void vterm_state_setpen(VTermState *state, const long args[], int argco
       setpenattr_int(state, VTERM_ATTR_UNDERLINE, state->pen.underline);
       break;
 
-    case 22: // Bold off
+    case 22: // Bold and faint off
       state->pen.bold = 0;
       setpenattr_bool(state, VTERM_ATTR_BOLD, 0);
+      state->pen.dim = 0;
+      setpenattr_bool(state, VTERM_ATTR_DIM, 0);
       break;
 
     case 23: // Italic and Gothic (currently unsupported) off
@@ -508,6 +517,9 @@ INTERNAL int vterm_state_getpen(VTermState *state, long args[], int argcount)
   if(state->pen.bold)
     args[argi++] = 1;
 
+  if(state->pen.dim)
+    args[argi++] = 2;
+
   if(state->pen.italic)
     args[argi++] = 3;
 
@@ -561,6 +573,10 @@ int vterm_state_get_penattr(const VTermState *state, VTermAttr attr, VTermValue 
 
   case VTERM_ATTR_ITALIC:
     val->boolean = state->pen.italic;
+    return 1;
+
+  case VTERM_ATTR_DIM:
+    val->boolean = state->pen.dim;
     return 1;
 
   case VTERM_ATTR_BLINK:

@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -69,6 +70,8 @@ static const COLORREF kDivider = RGB(0x3a, 0x3a, 0x3a);
 static const COLORREF kSelBg = RGB(0x1d, 0x4f, 0x63);
 static const COLORREF kCloseHover = RGB(0xc4, 0x2b, 0x1c);
 static const COLORREF kChipBg = RGB(0x1c, 0x1c, 0x1c);
+static const COLORREF kCmdOk = RGB(0x4e, 0xd1, 0x8f);   // orden que existe
+static const COLORREF kCmdBad = RGB(0xf0, 0x55, 0x55);  // orden desconocida
 static const COLORREF kChipBorder = RGB(0x3a, 0x3a, 0x3a);
 static const uint32_t kAnsi[16] = {0x616161, 0xFF8272, 0xB4FA72, 0xFEFDC2, 0xA5D5FE, 0xFF8FFD,
                                    0xD0D1FE, 0xF1F1F1, 0x8E8E8E, 0xFFC4BD, 0xD6FCB9, 0xFEFDD5,
@@ -135,6 +138,10 @@ struct Pane {
   std::wstring cwd, edit;
   size_t caret = 0;
   std::vector<std::wstring> history;
+  // Órdenes que conoce la shell (alias, funciones, cmdlets), para colorear la orden escrita.
+  std::set<std::wstring> cmds;
+  bool cmdsLoaded = false;
+  std::map<std::wstring, bool> existsMemo;
   int histPos = -1;
   RECT input{};
   int lineRow = -1, lineCol = -1;
@@ -162,6 +169,25 @@ static std::wstring g_renameText;
 static bool g_renameAll = false;  // texto entero seleccionado: lo que se escriba lo reemplaza
 // Aviso breve en la barra de título (p. ej. la escala).
 static std::wstring g_toast;
+
+// Textos de la interfaz: inglés por defecto; se cambia con clic derecho en la barra de título.
+enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, S_COUNT };
+static const wchar_t* const kStrings[][S_COUNT] = {
+    {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
+     L"Windows 10 1809 or later is required (ConPTY).", L"Language"},
+    {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
+     L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma"},
+};
+static const wchar_t* const kLangNames[] = {L"English", L"Español"};
+static const char* const kLangCodes[] = {"en", "es"};
+static const int kLangCount = 2;
+static int g_lang = 0;
+static const wchar_t* T(Str s) { return kStrings[g_lang][s]; }
+static std::wstring Tf(Str s, int v) {
+  wchar_t b[128];
+  swprintf(b, 128, T(s), v);
+  return b;
+}
 // Posición y tamaño de la ventana de la última vez (se guardan en la sesión).
 static bool g_hasWinPos = false, g_winMax = false;
 static RECT g_winRect{};
@@ -175,6 +201,13 @@ static VTermPos g_selA{}, g_selB{};
 static bool g_selecting = false, g_hasSel = false;
 // Arrastre de divisores y de paneles (por su cabecera).
 static Node* g_dragNode = nullptr;
+// Enlace bajo el ratón con Ctrl pulsado (Ctrl+clic lo abre).
+struct LinkHit {
+  Pane* p = nullptr;
+  int row = -1, c0 = 0, c1 = 0;
+  std::wstring url;
+};
+static LinkHit g_link;
 static Pane* g_dragPane = nullptr;
 static Pane* g_dropTarget = nullptr;
 static bool g_layoutHeaders = false;
@@ -401,7 +434,12 @@ static std::wstring IntegrationArgs() {
   const wchar_t* script =
       L"function global:prompt { $e = [char]27; $b = [char]7; "
       L"$p = $executionContext.SessionState.Path.CurrentLocation.ProviderPath; "
-      L"\"$e]9;9;$p$b$e[90m> $e[0m\" }";
+      L"\"$e]9;9;$p$b$e[90m> $e[0m\" }; "
+      // Lista de órdenes para colorear la caja de entrada; se escribe en segundo plano.
+      L"$null = Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -MaxTriggerCount 1 -Action { "
+      L"try { $f = Join-Path $env:TEMP ('warp-lite-cmds-' + $PID + '.txt'); "
+      L"Get-Command -CommandType Alias,Function,Filter,Cmdlet | ForEach-Object Name | "
+      L"Set-Content -Encoding UTF8 ($f + '.tmp'); Move-Item -Force ($f + '.tmp') $f } catch {} }";
   std::string bytes((const char*)script, wcslen(script) * sizeof(wchar_t));  // UTF-16LE
   static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   std::wstring b64;
@@ -454,6 +492,24 @@ static const wchar_t* StartDir(Pane* p, const wchar_t* home) {
   return home[0] ? home : nullptr;
 }
 
+// Entorno de la shell con TERM/COLORTERM como Warp: ssh los pasa y tmux y compañía usan color.
+static std::wstring ShellEnvironment() {
+  std::wstring env;
+  wchar_t* block = GetEnvironmentStringsW();
+  for (wchar_t* v = block; *v; v += wcslen(v) + 1) {
+    if (!_wcsnicmp(v, L"TERM=", 5) || !_wcsnicmp(v, L"COLORTERM=", 10)) continue;
+    env.append(v);
+    env.push_back(L'\0');
+  }
+  FreeEnvironmentStringsW(block);
+  for (const wchar_t* v : {L"TERM=xterm-256color", L"COLORTERM=truecolor"}) {
+    env.append(v);
+    env.push_back(L'\0');
+  }
+  env.push_back(L'\0');
+  return env;
+}
+
 static bool SpawnPane(Pane* p) {
   HANDLE inR = nullptr, outW = nullptr;
   if (!CreatePipe(&inR, &p->inW, nullptr, 0)) return false;
@@ -475,11 +531,12 @@ static bool SpawnPane(Pane* p) {
   UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, p->hpc,
                             sizeof(p->hpc), nullptr, nullptr);
   std::wstring cmd = ShellCommand();
+  std::wstring env = ShellEnvironment();
   wchar_t home[MAX_PATH] = L"";
   GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH);
   PROCESS_INFORMATION pi{};
   BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
-                           EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT, nullptr,
+                           EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT, env.data(),
                            StartDir(p, home), &si.StartupInfo, &pi);
   DeleteProcThreadAttributeList(si.lpAttributeList);
   HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
@@ -497,6 +554,7 @@ static void DestroyPane(Pane* p) {
   g_live.erase(p);
   if (g_selPane == p) g_selPane = nullptr, g_hasSel = false;
   if (g_dragPane == p || g_dropTarget == p) g_dragPane = g_dropTarget = nullptr;
+  if (g_link.p == p) g_link = LinkHit{};
   if (p->wait) UnregisterWaitEx(p->wait, INVALID_HANDLE_VALUE);
   if (p->hpc) pClosePseudoConsole(p->hpc);
   if (p->proc) {
@@ -751,7 +809,7 @@ static void SaveNode(std::ostringstream& o, Node* n) {
 static void SaveSession() {
   if (g_tabs.empty() || g_sessionPath.empty()) return;
   std::ostringstream o;
-  o << "BW1\nactive " << g_activeTab << "\nui " << g_zoom << " " << g_fontPx << "\n";
+  o << "BW1\nactive " << g_activeTab << "\nui " << g_zoom << " " << g_fontPx << "\nlang " << kLangCodes[g_lang] << "\n";
   WINDOWPLACEMENT wp{sizeof wp};
   if (g_hwnd && GetWindowPlacement(g_hwnd, &wp)) {
     RECT& r = wp.rcNormalPosition;
@@ -825,6 +883,13 @@ static bool LoadSession() {
   if (!(in >> magic) || magic != "BW1" || !(in >> word >> active)) return false;
   std::vector<Pane*> created;
   while (in >> word) {
+    if (word == "lang") {
+      std::string code;
+      in >> code;
+      for (int i = 0; i < kLangCount; i++)
+        if (code == kLangCodes[i]) g_lang = i;
+      continue;
+    }
     if (word == "ui") {
       in >> g_zoom >> g_fontPx;
       g_zoom = std::clamp(g_zoom, 50, 300);
@@ -886,7 +951,7 @@ static void CellAt(Pane* p, int row, int col, VTermScreenCell* c) {
 
 static bool IsGhost(Pane* p, VTermScreenCell& c) {
   // Sugerencias en línea de PSReadLine: cursiva o gris.
-  if (c.attrs.italic) return true;
+  if (c.attrs.italic || c.attrs.dim) return true;
   if (VTERM_COLOR_IS_DEFAULT_FG(&c.fg)) return false;
   VTermColor col = c.fg;
   vterm_screen_convert_color_to_rgb(p->scr, &col);
@@ -1051,7 +1116,7 @@ static void SetZoom(int z) {
   g_zoom = std::clamp(z, 50, 300);
   MakeFonts();
   Relayout();
-  Toast(L"Escala " + std::to_wstring(g_zoom) + L" %");
+  Toast(Tf(S_ZOOM, g_zoom));
   SaveSession();
 }
 
@@ -1059,7 +1124,7 @@ static void SetFontSize(int px) {
   g_fontPx = std::clamp(px, 6, 48);
   MakeFonts();
   Relayout();
-  Toast(L"Letra " + std::to_wstring(g_fontPx) + L" px");
+  Toast(Tf(S_FONT, g_fontPx));
   SaveSession();
 }
 
@@ -1226,6 +1291,68 @@ static void SubmitEditor(Pane* p) {
   LeaveCriticalSection(&p->cs);
   FlushOut(p);
   if (!cmd.empty()) SaveSession();
+}
+
+static std::wstring Lower(std::wstring s) {
+  for (auto& c : s) c = towlower(c);
+  return s;
+}
+
+// Lee la lista de órdenes que la shell deja en %TEMP% cuando está libre.
+static void LoadShellCommands(Pane* p) {
+  if (p->cmdsLoaded || !p->integrated || !p->pid) return;
+  wchar_t tmp[MAX_PATH];
+  GetTempPathW(MAX_PATH, tmp);
+  std::wstring path = std::wstring(tmp) + L"warp-lite-cmds-" + std::to_wstring(p->pid) + L".txt";
+  HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return;
+  std::string data(GetFileSize(f, nullptr), 0);
+  DWORD r = 0;
+  ReadFile(f, data.data(), (DWORD)data.size(), &r, nullptr);
+  CloseHandle(f);
+  DeleteFileW(path.c_str());
+  if (data.rfind("\xEF\xBB\xBF", 0) == 0) data.erase(0, 3);
+  std::istringstream in(data);
+  std::string line;
+  while (std::getline(in, line)) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+    if (!line.empty()) p->cmds.insert(Lower(ToWide(line)));
+  }
+  p->cmdsLoaded = true;
+  p->existsMemo.clear();
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// ¿Existe la orden? true/false, o -1 si aún no se puede saber (lista sin cargar).
+static int CommandExists(Pane* p, const std::wstring& tok) {
+  std::wstring low = Lower(tok);
+  auto it = p->existsMemo.find(low);
+  if (it != p->existsMemo.end()) return it->second;
+  static const wchar_t* const kKeywords[] = {
+      L"if", L"else", L"elseif", L"for", L"foreach", L"while", L"do", L"until", L"switch", L"function",
+      L"filter", L"return", L"break", L"continue", L"try", L"catch", L"finally", L"throw", L"trap",
+      L"param", L"begin", L"process", L"end", L"exit", L"class", L"enum", L"using", L"data", L"workflow"};
+  bool ok = false;
+  for (auto k : kKeywords) ok = ok || low == k;
+  ok = ok || p->cmds.count(low);
+  wchar_t buf[MAX_PATH];
+  if (!ok && tok.find_first_of(L"\\/:") != std::wstring::npos) {  // ruta a un fichero
+    std::wstring full = tok.find(L':') == std::wstring::npos && tok[0] != L'\\' ? p->cwd + L"\\" + tok : tok;
+    DWORD a = GetFileAttributesW(full.c_str());
+    ok = a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+  } else if (!ok) {  // programa en el PATH
+    ok = tok.find(L'.') != std::wstring::npos && SearchPathW(nullptr, tok.c_str(), nullptr, MAX_PATH, buf, nullptr);
+    wchar_t exts[1024];
+    if (!ok && GetEnvironmentVariableW(L"PATHEXT", exts, 1024)) {
+      std::wstringstream ss(exts);
+      std::wstring ext;
+      while (!ok && std::getline(ss, ext, L';'))
+        if (!ext.empty()) ok = SearchPathW(nullptr, tok.c_str(), ext.c_str(), MAX_PATH, buf, nullptr) != 0;
+    }
+  }
+  if (!ok && !p->cmdsLoaded) return -1;
+  p->existsMemo[low] = ok;
+  return ok;
 }
 
 static bool IsWordChar(wchar_t c) { return iswalnum(c) || c == L'_' || c == L'-'; }
@@ -1408,6 +1535,49 @@ static std::wstring SelectionText() {
   return out;
 }
 
+// Texto de una fila de la vista, una letra por columna (los anchos dejan un hueco).
+static std::wstring RowText(Pane* p, int row) {
+  std::wstring t(p->cols, L' ');
+  for (int c = 0; c < p->cols; c++) {
+    VTermScreenCell cell;
+    CellAt(p, row, c, &cell);
+    uint32_t ch = cell.chars[0];
+    if (ch && ch != (uint32_t)-1) t[c] = ch < 0x10000 ? (wchar_t)ch : L'?';
+  }
+  return t;
+}
+
+// URL http(s) en la celda bajo el punto; si llega al final de la fila, sigue en las siguientes.
+static LinkHit LinkAt(Pane* p, int x, int y) {
+  LinkHit h;
+  POINT pt{x, y};
+  if (!PtInRect(&p->content, pt)) return h;
+  VTermPos pos = CellFromPoint(p, x, y);
+  static const std::wstring kStop = L" \t\"'<>`|";
+  EnterCriticalSection(&p->cs);
+  std::wstring row = RowText(p, pos.row);
+  for (size_t at = 0; (at = row.find(L"http", at)) != std::wstring::npos; at++) {
+    if (row.compare(at, 7, L"http://") && row.compare(at, 8, L"https://")) continue;
+    size_t end = row.find_first_of(kStop, at);
+    if (end == std::wstring::npos) end = row.size();
+    if ((int)at > pos.col || (int)end <= pos.col) continue;
+    h.p = p, h.row = pos.row, h.c0 = (int)at, h.c1 = (int)end;
+    h.url = row.substr(at, end - at);
+    for (int r = pos.row + 1; end == row.size() && r < p->rows; r++) {  // URL partida en varias filas
+      std::wstring next = RowText(p, r);
+      end = next.find_first_of(kStop);
+      if (end == 0) break;
+      if (end == std::wstring::npos) end = next.size();
+      h.url += next.substr(0, end);
+      row = next;
+    }
+    while (!h.url.empty() && wcschr(L".,;:!?)]}'\"", h.url.back())) h.url.pop_back();
+    break;
+  }
+  LeaveCriticalSection(&p->cs);
+  return h;
+}
+
 static int TabWidth() { return Px(200); }
 static int TabsX0() { return Px(8); }
 static int WinBtnW() { return Px(46); }
@@ -1577,9 +1747,9 @@ static void DrawInput(HDC dc, Pane* p, bool active, bool focus) {
   bool ready = EditorActive(p);
   int cx = x;
   if (!ready) {
-    Text(dc, L"Ejecutando… las teclas van al programa", er, kTabText, DT_LEFT | DT_END_ELLIPSIS);
+    Text(dc, T(S_RUNNING), er, kTabText, DT_LEFT | DT_END_ELLIPSIS);
   } else if (p->edit.empty()) {
-    Text(dc, L"Escribe una orden", er, RGB(0x6a, 0x6a, 0x6a), DT_LEFT);
+    Text(dc, T(S_TYPE_COMMAND), er, RGB(0x6a, 0x6a, 0x6a), DT_LEFT);
   } else {
     size_t cols = std::max(1, (int)(er.right - er.left) / g_cellW);
     size_t off = p->caret >= cols ? p->caret - cols + 1 : 0;
@@ -1588,10 +1758,31 @@ static void DrawInput(HDC dc, Pane* p, bool active, bool focus) {
     SetTextColor(dc, kFg);
     ExtTextOutW(dc, x, ey, ETO_CLIPPED, &er, vis.c_str(), (UINT)vis.size(), dx.data());
     cx = x + (int)(p->caret - off) * g_cellW;
+    // Como Warp: la orden en verde si existe; subrayado rojo discontinuo si no.
+    size_t a = p->edit.find_first_not_of(L' ');
+    size_t b = a == std::wstring::npos ? a : p->edit.find_first_of(L" \t|;", a);
+    if (b == std::wstring::npos) b = p->edit.size();
+    static const std::wstring kNeutral = L"$(\"'@&[{0123456789";
+    if (a != std::wstring::npos && kNeutral.find(p->edit[a]) == std::wstring::npos && !(p->edit[a] == L'.' && b - a == 1)) {
+      int ex = CommandExists(p, p->edit.substr(a, b - a));
+      size_t va = std::max(a, off), vb = std::min(b, off + cols);
+      if (va < vb) {
+        int x0 = x + (int)(va - off) * g_cellW, x1 = x + (int)(vb - off) * g_cellW;
+        if (ex == 1) {
+          SetTextColor(dc, kCmdOk);
+          ExtTextOutW(dc, x0, ey, ETO_CLIPPED, &er, vis.c_str() + (va - off), (UINT)(vb - va), dx.data());
+        } else if (ex == 0) {
+          int uy = ey + g_cellH - std::max(1, Px(1));
+          for (int ux = x0; ux < x1; ux += Px(4)) Fill(dc, RECT{ux, uy, std::min(ux + Px(2), x1), uy + std::max(1, Px(1))}, kCmdBad);
+        }
+      }
+    }
   }
   if (ready && active && focus) Fill(dc, RECT{cx, ey, cx + std::max(2, Px(2)), ey + g_cellH}, kFg);
   SetBkMode(dc, OPAQUE);
 }
+
+static void DrawLinkUnderline(HDC dc, Pane* p);
 
 static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
   EnterCriticalSection(&p->cs);
@@ -1617,6 +1808,9 @@ static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
         Style s;
         s.fg = ResolveColor(p, c.fg, true);
         s.bg = ResolveColor(p, c.bg, false);
+        if (c.attrs.dim)  // atenuado (SGR 2): a medio camino entre texto y fondo
+          s.fg = RGB((GetRValue(s.fg) + GetRValue(s.bg)) / 2, (GetGValue(s.fg) + GetGValue(s.bg)) / 2,
+                     (GetBValue(s.fg) + GetBValue(s.bg)) / 2);
         if (c.attrs.reverse) std::swap(s.fg, s.bg);
         if (InSelection(p, row, col)) s.bg = kSelBg;
         s.font = (c.attrs.bold ? 1 : 0) | (c.attrs.italic ? 2 : 0);
@@ -1649,6 +1843,7 @@ static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
     }
   }
   DrawInput(dc, p, active, showFocus);
+  DrawLinkUnderline(dc, p);
   // Cursor (no se dibuja mientras se escribe en la caja de entrada)
   if (active && p->cursorVisible && p->scrollOff == 0 && !EditorActive(p)) {
     RECT cr{ox + p->cursor.col * g_cellW, oy + p->cursor.row * g_cellH, 0, 0};
@@ -1670,6 +1865,13 @@ static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
     }
   }
   LeaveCriticalSection(&p->cs);
+}
+
+static void DrawLinkUnderline(HDC dc, Pane* p) {
+  if (g_link.p != p) return;
+  int y = p->content.top + kPad + (g_link.row + 1) * g_cellH - std::max(1, Px(1));
+  int x = p->content.left + kPad;
+  Fill(dc, RECT{x + g_link.c0 * g_cellW, y, x + g_link.c1 * g_cellW, y + std::max(1, Px(1))}, kAccent);
 }
 
 static void DrawDividers(HDC dc, Node* n) {
@@ -1881,6 +2083,9 @@ static void RunScriptStep() {
   } else if (s == L"submit" && p) {
     if (EditorActive(p)) SubmitEditor(p);
     delay = 2000;
+  } else if (s.rfind(L"lang:", 0) == 0) {
+    for (int i = 0; i < kLangCount; i++)
+      if (ToUtf8(s.substr(5)) == kLangCodes[i]) g_lang = i;
   } else if (s == L"rename-start") {
     BeginRename(g_activeTab);
   } else if (s.rfind(L"rename-type:", 0) == 0) {
@@ -1962,6 +2167,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (pt.y < TabBarH() && TitleHit(pt.x, pt.y, &tab) == HIT_NONE) return HTCAPTION;
       return HTCLIENT;
     }
+    case WM_NCRBUTTONUP:
+      if (wp == HTCAPTION) {  // clic derecho en la barra de título: idioma
+        HMENU menu = CreatePopupMenu(), sub = CreatePopupMenu();
+        for (int i = 0; i < kLangCount; i++)
+          AppendMenuW(sub, MF_STRING | (i == g_lang ? MF_CHECKED : 0), 100 + i, kLangNames[i]);
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, T(S_LANGUAGE));
+        int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), 0, hwnd,
+                                 nullptr);
+        DestroyMenu(menu);
+        if (cmd >= 100 && cmd < 100 + kLangCount) {
+          g_lang = cmd - 100;
+          SaveSession();
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+      }
+      break;
     case WM_NCMOUSEMOVE:
     case WM_MOUSELEAVE:
       SetHover(HIT_NONE, -1);
@@ -2014,7 +2236,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RunScriptStep();
       } else if (wp == TIMER_RESTORE) {
         static int ticks = 0;
-        if (++ticks % 5 == 0) UpdateRunning();
+        if (++ticks % 5 == 0) {
+          UpdateRunning();
+          for (Pane* p : g_live) LoadShellCommands(p);
+        }
         // Escribe la última orden en el prompt cuando la shell ha terminado de arrancar.
         DWORD now = GetTickCount();
         for (Pane* p : g_live) {
@@ -2150,6 +2375,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
       }
       bool shift = GetKeyState(VK_SHIFT) & 0x8000;
+      if (msg == WM_LBUTTONDOWN && (wp & MK_CONTROL)) {  // Ctrl+clic en un enlace: abrirlo
+        LinkHit h = LinkAt(p, x, y);
+        if (!h.url.empty()) {
+          ShellExecuteW(nullptr, L"open", h.url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          return 0;
+        }
+      }
       if (p->mouseMode && !shift) {
         MouseToApp(p, x, y, msg == WM_LBUTTONDOWN ? 1 : msg == WM_MBUTTONDOWN ? 2 : 3, true);
       } else if (msg == WM_LBUTTONDOWN) {
@@ -2203,9 +2435,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (Pane* p = PaneAt(x, y); p && p->mouseMode >= VTERM_PROP_MOUSE_DRAG && (wp & MK_LBUTTON)) {
         MouseToApp(p, x, y, 0, false);
       }
+      {  // Ctrl sobre un enlace: subrayado y mano
+        LinkHit h;
+        if (wp & MK_CONTROL)
+          if (Pane* p = PaneAt(x, y)) h = LinkAt(p, x, y);
+        if (h.p != g_link.p || h.row != g_link.row || h.c0 != g_link.c0) InvalidateRect(hwnd, nullptr, FALSE);
+        g_link = h;
+      }
       Node* d = y >= TabBarH() ? DividerAt(CurTab().root, x, y) : nullptr;
       bool onHeader;
       LPCWSTR cur = d ? (d->vertical ? IDC_SIZEWE : IDC_SIZENS)
+                    : g_link.p ? IDC_HAND
                     : (y < TabBarH() || HeaderAt(x, y, &onHeader)) ? IDC_ARROW : IDC_IBEAM;
       SetCursor(LoadCursor(nullptr, cur));
       return 0;
@@ -2280,7 +2520,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   pResizePseudoConsole = (PFN_ResizePseudoConsole)GetProcAddress(k32, "ResizePseudoConsole");
   pClosePseudoConsole = (PFN_ClosePseudoConsole)GetProcAddress(k32, "ClosePseudoConsole");
   if (!pCreatePseudoConsole) {
-    MessageBoxW(nullptr, L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"warp-lite", MB_ICONERROR);
+    MessageBoxW(nullptr, T(S_NEED_WIN10), L"warp-lite", MB_ICONERROR);
     return 1;
   }
   typedef BOOL(WINAPI * PFN_Dpi)(HANDLE);
@@ -2313,7 +2553,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   wc.lpfnWndProc = WndProc;
   wc.hInstance = inst;
   wc.hCursor = LoadCursor(nullptr, IDC_IBEAM);
-  wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+  wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));  // assets/warp-lite.ico
+  wc.hIconSm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                 GetSystemMetrics(SM_CYSMICON), 0);
   wc.lpszClassName = L"WarpLite";
   RegisterClassExW(&wc);
   HWND hwnd = CreateWindowExW(0, L"WarpLite", L"warp-lite", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,

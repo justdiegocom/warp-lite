@@ -21,7 +21,7 @@ build_here() {
     -c src/main.cpp -o build/main.o &
   wait
   # zig ignora -mwindows: sin --subsystem,windows el .exe abre una consola al arrancar.
-  "$ZIG" c++ -target $T -O2 -municode -Wl,--subsystem,windows build/main.o "${objs[@]}" \
+  "$ZIG" c++ -target $T -O2 -municode -Wl,--subsystem,windows build/main.o "${objs[@]}" src/warp-lite.rc \
     -lgdi32 -luser32 -lkernel32 -lshell32 -static -o dist/warp-lite.exe
   python3 - <<'PY'
 import struct, sys
@@ -31,7 +31,10 @@ sub = struct.unpack('<H', d[pe + 24 + 68:pe + 24 + 70])[0]
 if sub != 2:
     sys.exit(f'warp-lite.exe no es una app de ventana (subsistema {sub})')
 PY
-  ls -l dist/warp-lite.exe
+  # Instalador: lleva dentro dist/warp-lite.exe (por eso va después).
+  "$ZIG" c++ -target $T -O2 -std=c++17 -municode -Wl,--subsystem,windows src/setup.cpp src/warp-lite.rc \
+    -lole32 -lshell32 -luuid -ladvapi32 -luser32 -static -o dist/warp-lite-setup.exe
+  ls -l dist/warp-lite.exe dist/warp-lite-setup.exe
 }
 
 if [[ "${1:-}" == "--local" ]]; then build_here; exit; fi
@@ -39,4 +42,4 @@ ssh -o BatchMode=yes "$REMOTE" "mkdir -p $RDIR"
 rsync -az --delete --exclude .git --exclude dist --exclude build ./ "$REMOTE:$RDIR/"
 ssh -o BatchMode=yes "$REMOTE" "cd $RDIR && PATH=/opt/homebrew/bin:\$PATH bash tools/build.sh --local"
 mkdir -p dist
-rsync -az "$REMOTE:$RDIR/dist/warp-lite.exe" dist/
+rsync -az "$REMOTE:$RDIR/dist/warp-lite.exe" "$REMOTE:$RDIR/dist/warp-lite-setup.exe" dist/

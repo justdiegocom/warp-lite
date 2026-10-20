@@ -20,6 +20,7 @@ typedef struct
   unsigned int bold      : 1;
   unsigned int underline : 2;
   unsigned int italic    : 1;
+  unsigned int dim       : 1;
   unsigned int blink     : 1;
   unsigned int reverse   : 1;
   unsigned int conceal   : 1;
@@ -431,6 +432,9 @@ static int setpenattr(VTermAttr attr, VTermValue *val, void *user)
   case VTERM_ATTR_ITALIC:
     screen->pen.italic = val->boolean;
     return 1;
+  case VTERM_ATTR_DIM:
+    screen->pen.dim = val->boolean;
+    return 1;
   case VTERM_ATTR_BLINK:
     screen->pen.blink = val->boolean;
     return 1;
@@ -709,6 +713,7 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
         dst->pen.bold      = src->attrs.bold;
         dst->pen.underline = src->attrs.underline;
         dst->pen.italic    = src->attrs.italic;
+        dst->pen.dim       = src->attrs.dim;
         dst->pen.blink     = src->attrs.blink;
         dst->pen.reverse   = src->attrs.reverse ^ screen->global_reverse;
         dst->pen.conceal   = src->attrs.conceal;
@@ -1001,6 +1006,7 @@ int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCe
   cell->attrs.bold      = intcell->pen.bold;
   cell->attrs.underline = intcell->pen.underline;
   cell->attrs.italic    = intcell->pen.italic;
+  cell->attrs.dim       = intcell->pen.dim;
   cell->attrs.blink     = intcell->pen.blink;
   cell->attrs.reverse   = intcell->pen.reverse ^ screen->global_reverse;
   cell->attrs.conceal   = intcell->pen.conceal;
@@ -1124,6 +1130,8 @@ static int attrs_differ(VTermAttrMask attrs, ScreenCell *a, ScreenCell *b)
   if((attrs & VTERM_ATTR_UNDERLINE_MASK)  && (a->pen.underline != b->pen.underline))
     return 1;
   if((attrs & VTERM_ATTR_ITALIC_MASK)     && (a->pen.italic != b->pen.italic))
+    return 1;
+  if((attrs & VTERM_ATTR_DIM_MASK)        && (a->pen.dim != b->pen.dim))
     return 1;
   if((attrs & VTERM_ATTR_BLINK_MASK)      && (a->pen.blink != b->pen.blink))
     return 1;

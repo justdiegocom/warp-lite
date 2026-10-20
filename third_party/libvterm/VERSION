@@ -1,1 +1,2 @@
 934bc2fbf21800ac3458a499df8820ca5fb45fd3 Thu Nov 20 21:22:27 2025 -0800
+- Parche local: atributo dim (SGR 2/22) en pen.c, screen.c, vterm.h y vterm_internal.h.
