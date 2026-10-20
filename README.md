@@ -39,6 +39,15 @@ Al dividir o cerrar, los paneles de una misma fila o columna se reparten el espa
 Ratón: arrastrar la cabecera de un panel y soltarla sobre otro los intercambia, arrastrar los divisores para redimensionar, arrastrar para seleccionar, clic derecho copia (si hay
 selección) o pega, clic central en una pestaña la cierra, `+` abre otra.
 
+## Caja de entrada (como Warp)
+
+Con PowerShell (lo normal), la orden se escribe en una caja al pie de cada panel, con la carpeta actual
+en un apartado encima. warp-lite arranca PowerShell con un prompt propio que, cada vez que espera una
+orden, avisa en silencio (`OSC 9;9;<ruta>`); el resto del tiempo (ssh, tmux, un «¿seguro? [s/n]»…) las
+teclas van directas al programa. En la caja: ←/→ (con Ctrl, por palabras), Inicio/Fin, Retroceso y
+Supr (con Ctrl, palabra entera), ↑/↓ historial, Esc o Ctrl+C borran, Ctrl+V pega. Aún sin autocompletado
+con Tab. Cada panel recuerda su carpeta al reabrir. Con `WARPLITE_SHELL` (otra shell) no hay caja.
+
 ## Última orden
 
 - Se guarda al pulsar Enter: el texto escrito en el prompt (incluido lo que venga del historial o del
