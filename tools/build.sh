@@ -22,7 +22,7 @@ build_here() {
   wait
   # zig ignora -mwindows: sin --subsystem,windows el .exe abre una consola al arrancar.
   "$ZIG" c++ -target $T -O2 -municode -Wl,--subsystem,windows build/main.o "${objs[@]}" src/warp-lite.rc \
-    -lgdi32 -luser32 -lkernel32 -lshell32 -lole32 -luuid -lwindowscodecs -ladvapi32 -lwinhttp -lbcrypt -static -o dist/warp-lite.exe
+    -lgdi32 -luser32 -lkernel32 -lshell32 -lole32 -luuid -lwindowscodecs -ladvapi32 -lwinhttp -lbcrypt -lrstrtmgr -static -o dist/warp-lite.exe
   python3 - <<'PY'
 import struct, sys
 d = open('dist/warp-lite.exe', 'rb').read()

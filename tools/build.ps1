@@ -14,7 +14,7 @@ foreach ($c in Get-ChildItem third_party\libvterm\src\*.c) {
 & $zig c++ -target $T -O2 -std=c++17 -municode -Ithird_party/libvterm/include -c src/main.cpp -o build/main.o
 if ($LASTEXITCODE) { throw 'falló main.cpp' }
 & $zig c++ -target $T -O2 -municode '-Wl,--subsystem,windows' build/main.o @objs src/warp-lite.rc `
-  -lgdi32 -luser32 -lkernel32 -lshell32 -lole32 -luuid -lwindowscodecs -ladvapi32 -lwinhttp -lbcrypt -static -o dist/warp-lite.exe
+  -lgdi32 -luser32 -lkernel32 -lshell32 -lole32 -luuid -lwindowscodecs -ladvapi32 -lwinhttp -lbcrypt -lrstrtmgr -static -o dist/warp-lite.exe
 if ($LASTEXITCODE) { throw 'falló el enlace de warp-lite.exe' }
 # La huella del .exe entra en la clave de caché de zig (que no sigue el .incbin).
 $stamp = (Get-FileHash dist\warp-lite.exe -Algorithm SHA1).Hash.Substring(0, 16)

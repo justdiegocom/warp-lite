@@ -22,6 +22,7 @@
 #include <wincodec.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#include <restartmanager.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1049,7 +1050,9 @@ static bool PicksSession(const std::string& cmd) {
   bool claude = AgentKind(cmd) == AGENT_CLAUDE;
   for (const std::string& t : SplitArgs(cmd)) {
     std::string name = t.substr(0, t.find('='));
-    if (claude ? name == "-c" || name == "--continue" || name == "-r" || name == "--resume" : name == "resume") return true;
+    if (claude ? name == "-c" || name == "--continue" || name == "-r" || name == "--resume" || name == "--session-id"
+               : name == "resume")
+      return true;
   }
   return false;
 }
@@ -1057,6 +1060,7 @@ static bool PicksSession(const std::string& cmd) {
 struct AgentSession {
   std::string id;
   FILETIME mtime;
+  std::wstring path;
 };
 
 static bool NewerFirst(const AgentSession& x, const AgentSession& y) { return CompareFileTime(&x.mtime, &y.mtime) > 0; }
@@ -1084,7 +1088,7 @@ static std::vector<AgentSession> ClaudeSessions(const std::wstring& cwd) {
   do {
     std::wstring f = fd.cFileName;
     if (f.size() == 36 + 6 && f[8] == L'-' && f[13] == L'-')  // <uuid>.jsonl
-      out.push_back({ToUtf8(f.substr(0, 36)), fd.ftLastWriteTime});
+      out.push_back({ToUtf8(f.substr(0, 36)), fd.ftLastWriteTime, L""});
   } while (FindNextFileW(h, &fd));
   FindClose(h);
   std::sort(out.begin(), out.end(), NewerFirst);
@@ -1128,7 +1132,7 @@ static std::vector<AgentSession> CodexSessions(const std::wstring& cwd) {
       std::string dir8 = JsonStr(head, "cwd", 0), id = JsonStr(head, "id", 0);
       for (size_t k = 0; (k = dir8.find("\\\\", k)) != std::string::npos; k++) dir8.erase(k, 1);
       if (id.empty() || _wcsicmp(ToWide(dir8).c_str(), cwd.c_str()) != 0) continue;
-      out.push_back({id, fd.ftLastWriteTime});
+      out.push_back({id, fd.ftLastWriteTime, dir + fd.cFileName});
     } while (FindNextFileW(h, &fd));
     FindClose(h);
   }
@@ -1136,13 +1140,77 @@ static std::vector<AgentSession> CodexSessions(const std::wstring& cwd) {
   return out;
 }
 
-// Para cada panel con Claude Code o Codex en marcha, la orden que lo reanuda. Si hay varios en la
-// misma carpeta, el que escribió hace menos se queda con la conversación tocada hace menos.
+// Procesos que cuelgan (a cualquier profundidad) de la shell de cada panel.
+static std::map<DWORD, std::vector<DWORD>> ChildrenByParent() {
+  std::map<DWORD, std::vector<DWORD>> kids;
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return kids;
+  PROCESSENTRY32W pe{sizeof pe};
+  for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+    if (pe.th32ProcessID != pe.th32ParentProcessID) kids[pe.th32ParentProcessID].push_back(pe.th32ProcessID);
+  CloseHandle(snap);
+  return kids;
+}
+
+static std::vector<DWORD> Descendants(const std::map<DWORD, std::vector<DWORD>>& kids, DWORD root) {
+  std::vector<DWORD> out, todo{root};
+  std::set<DWORD> seen{root};
+  while (!todo.empty()) {
+    auto it = kids.find(todo.back());
+    todo.pop_back();
+    if (it == kids.end()) continue;
+    for (DWORD c : it->second)
+      if (seen.insert(c).second) out.push_back(c), todo.push_back(c);
+  }
+  return out;
+}
+
+// Claude Code apunta en %USERPROFILE%\.claude\sessions\<pid>.json la conversación de cada proceso
+// (también tras /clear o /resume): con eso cada panel sabe exactamente cuál es la suya.
+static std::string ClaudeSessionOfPid(DWORD pid) {
+  std::wstring root = EnvDir(L"CLAUDE_CONFIG_DIR", L"\\.claude");
+  FILE* f = root.empty() ? nullptr : _wfopen((root + L"\\sessions\\" + std::to_wstring(pid) + L".json").c_str(), L"rb");
+  if (!f) return "";
+  std::string j(8192, '\0');
+  j.resize(fread(j.data(), 1, j.size(), f));
+  fclose(f);
+  return JsonStr(j, "sessionId", 0);
+}
+
+// Codex tiene abierto el archivo de su conversación mientras corre: el Restart Manager de Windows
+// dice qué procesos lo tienen abierto.
+static std::vector<DWORD> PidsWithFileOpen(const std::wstring& path) {
+  std::vector<DWORD> out;
+  DWORD h;
+  WCHAR key[CCH_RM_SESSION_KEY + 1] = {};
+  if (RmStartSession(&h, 0, key) != ERROR_SUCCESS) return out;
+  LPCWSTR files[] = {path.c_str()};
+  if (RmRegisterResources(h, 1, files, 0, nullptr, 0, nullptr) == ERROR_SUCCESS) {
+    UINT need = 0, count = 0;
+    DWORD reasons = 0;
+    std::vector<RM_PROCESS_INFO> info;
+    DWORD r = RmGetList(h, &need, &count, nullptr, &reasons);
+    if (r == ERROR_MORE_DATA && need) {
+      info.resize(need);
+      count = need;
+      if (RmGetList(h, &need, &count, info.data(), &reasons) == ERROR_SUCCESS)
+        for (UINT i = 0; i < count; i++) out.push_back(info[i].Process.dwProcessId);
+    }
+  }
+  RmEndSession(h);
+  return out;
+}
+
+// Para cada panel con Claude Code o Codex en marcha, la orden que lo reanuda. Primero lo exacto
+// (la conversación del proceso que corre en ese panel); los que queden, por carpeta: el que
+// escribió hace menos se queda con la conversación tocada hace menos.
 static std::map<Pane*, std::string> g_resumeCmd;
 
 static void ComputeResumes() {
   g_resumeCmd.clear();
   std::map<std::pair<int, std::wstring>, std::vector<Pane*>> groups;
+  std::map<DWORD, std::vector<DWORD>> kids;
+  bool haveKids = false;
   for (auto& t : g_tabs) {
     std::vector<Pane*> ls;
     Leaves(t.root, ls);
@@ -1151,13 +1219,44 @@ static void ComputeResumes() {
         std::wstring key = p->cwd;
         std::transform(key.begin(), key.end(), key.begin(), towlower);
         groups[{AgentKind(p->lastCmd), key}].push_back(p);
+        if (!haveKids) kids = ChildrenByParent(), haveKids = true;
       }
   }
   for (auto& [key, panes] : groups) {
     std::sort(panes.begin(), panes.end(), [](Pane* x, Pane* y) { return (int)(x->lastOut - y->lastOut) > 0; });
     std::wstring cwd = panes[0]->cwd;
     std::vector<AgentSession> s = key.first == AGENT_CLAUDE ? ClaudeSessions(cwd) : CodexSessions(cwd);
-    for (size_t k = 0; k < panes.size(); k++) g_resumeCmd[panes[k]] = ResumeCommand(panes[k]->lastCmd, k < s.size() ? s[k].id : "");
+    std::map<DWORD, std::string> codexByPid;
+    if (key.first == AGENT_CODEX)
+      for (size_t k = 0; k < s.size() && k < 30; k++)
+        for (DWORD pid : PidsWithFileOpen(s[k].path)) codexByPid[pid] = s[k].id;
+    std::set<std::string> taken;
+    std::vector<Pane*> rest;
+    for (Pane* p : panes) {
+      std::string id;
+      for (DWORD pid : Descendants(kids, p->pid)) {
+        if (key.first == AGENT_CLAUDE) id = ClaudeSessionOfPid(pid);
+        else if (codexByPid.count(pid)) id = codexByPid[pid];
+        if (!id.empty()) break;
+      }
+      if (id.empty() || !taken.insert(id).second) {
+        rest.push_back(p);
+        continue;
+      }
+      std::string cmd = ResumeCommand(p->lastCmd, id);
+      // Claude abierto sin escribirle nada: esa conversación no existe todavía y --resume fallaría.
+      bool exists = key.first != AGENT_CLAUDE ||
+                    std::any_of(s.begin(), s.end(), [&](const AgentSession& a) { return a.id == id; });
+      if (!exists) cmd = cmd.substr(0, cmd.size() - id.size() - 10) + " --session-id " + id;
+      g_resumeCmd[p] = cmd;
+    }
+    size_t k = 0;
+    for (Pane* p : rest) {
+      while (k < s.size() && taken.count(s[k].id)) k++;
+      std::string id = k < s.size() ? s[k++].id : "";
+      if (!id.empty()) taken.insert(id);
+      g_resumeCmd[p] = ResumeCommand(p->lastCmd, id);
+    }
   }
 }
 

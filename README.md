@@ -9,7 +9,7 @@ A small, fast terminal for Windows with the look and shortcuts of [Warp](https:/
 - **Tabs and split panes** with Warp's shortcuts: `Ctrl+Shift+D` split right, `Ctrl+Shift+E` split down, `Ctrl+Alt+Arrows` move between panes, `Ctrl+Shift+T` new tab, `Ctrl+Shift+W` close.
 - **Input box** at the bottom with the current folder (click it to switch folders), history, and the command coloured green if it exists or underlined in red if not.
 - **Tab completion** like Warp's menu: commands, `-parameters` and paths (`↑/↓` or `Tab` to move, `Enter` to pick).
-- **Picks up where you left off**: tabs, splits, folders and windows come back after a restart. Your last command is waiting in the input box, and anything that was still running (e.g. `ssh … tmux`) is relaunched. Claude Code and Codex resume the same conversation each pane had (`claude --resume <id>`, `codex resume <id>`) instead of starting a new one.
+- **Picks up where you left off**: tabs, splits, folders and windows come back after a restart. Your last command is waiting in the input box, and anything that was still running (e.g. `ssh … tmux`) is relaunched. Claude Code and Codex resume the exact conversation each pane had (`claude --resume <id>`, `codex resume <id>`), even with several of them open in the same folder, instead of starting a new one.
 - **Vertical tabs**, renamable and hideable tabs, drag tabs to reorder them, several windows (drag a tab out to open it in a new one).
 - `Ctrl+F` search, `Ctrl+click` links (also when wrapped over two lines), drop files to paste their path, `Ctrl +/-` zoom.
 - `Ctrl+C` copies the selection; text copied inside tmux/vim over SSH reaches the Windows clipboard (OSC 52).
