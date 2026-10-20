@@ -4598,6 +4598,7 @@ static std::wstring FontFileName(const wchar_t* path) {
 // Can GDI use this family in this process (installed, embedded or loaded from the cache)?
 static bool FontInstalled(const std::wstring& face) {
   if (face.empty() || face.size() >= LF_FACESIZE) return false;
+  if (!_wcsicmp(face.c_str(), L"Hack")) return true;  // embedded (AddFontMemResourceEx fonts are not enumerated)
   LOGFONTW lf{};
   lf.lfCharSet = DEFAULT_CHARSET;
   wcscpy(lf.lfFaceName, face.c_str());
