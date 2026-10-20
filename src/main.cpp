@@ -2462,7 +2462,8 @@ static std::wstring RowText(Pane* p, int row) {
 // Partida = acaba a ≤3 columnas del borde (solo espacios detrás) y la fila siguiente sigue con una
 // sangría entre la de la fila donde empieza y la propia URL (Claude Code parte así: «…/warp-li» +
 // «  te», y en listas «- https://…/z» + «  as/…»). No sigue si la fila de abajo empieza por «(» o
-// es una palabra normal con más texto detrás («…:8680/» + «(sirve la…»).
+// es una palabra normal con más texto detrás («…:8680/» + «(sirve la…»). El borde es el del panel
+// de tmux si lo hay (columnas separadas por «│»), y también vale partir el esquema: «https» + «://…».
 struct UrlSeg {
   int row, c0, c1;
 };
@@ -2471,44 +2472,55 @@ struct UrlSpan {
   std::vector<UrlSeg> segs;
 };
 
+static bool IsColumnBorder(wchar_t c) { return c == L'\u2502' || c == L'|'; }
+
+static bool IsUrlStart(const std::wstring& s) { return !s.compare(0, 7, L"http://") || !s.compare(0, 8, L"https://"); }
+
 static std::vector<UrlSpan> UrlsFrom(Pane* p, int r0, const std::function<const std::wstring&(int)>& text) {
-  static const std::wstring kStop = L" \t\"'<>`|";
+  static const std::wstring kStop = L" \t\"'<>`|\u2502";
+  static const wchar_t* const kHeads[] = {L"http", L"https", L"http:", L"https:", L"http:/", L"https:/"};
   std::vector<UrlSpan> out;
   const std::wstring& t = text(r0);
-  size_t indent = t.find_first_not_of(L' ');
-  for (size_t at = 0; (at = t.find(L"http", at)) != std::wstring::npos;) {
-    if (t.compare(at, 7, L"http://") && t.compare(at, 8, L"https://")) {
-      at += 4;
-      continue;
-    }
-    size_t end = t.find_first_of(kStop, at);
-    if (end == std::wstring::npos) end = t.size();
+  size_t skip = 0;  // no buscar otra URL dentro de la anterior
+  for (size_t at = 0; (at = t.find(L"http", at)) != std::wstring::npos; at += 4) {
+    if (at < skip) continue;
+    size_t L = at, R = at;  // tramo de la columna (panel de tmux) donde está
+    while (L > 0 && !IsColumnBorder(t[L - 1])) L--;
+    while (R < t.size() && !IsColumnBorder(t[R])) R++;
+    size_t end = std::min(t.find_first_of(kStop, at), R);
     UrlSpan u;
     u.url = t.substr(at, end - at);
+    bool full = IsUrlStart(u.url);
+    if (!full) {  // solo el principio del esquema, al final del tramo: puede seguir abajo
+      bool head = false;
+      for (auto h : kHeads) head = head || u.url == h;
+      if (!head || t.find_first_not_of(L' ', end) < R) continue;
+    }
     u.segs.push_back({r0, (int)at, (int)end});
+    size_t indent = t.find_first_not_of(L' ', L);
     int r = r0;
     size_t curEnd = end;
     const std::wstring* cur = &t;
-    while (r + 1 < p->rows && curEnd + 3 >= cur->size() && cur->find_first_not_of(L' ', curEnd) == std::wstring::npos) {
+    while (r + 1 < p->rows && curEnd + 3 >= R && cur->find_first_not_of(L' ', curEnd) >= R) {
       const std::wstring& next = text(r + 1);
-      size_t s0 = next.find_first_not_of(L' ');
-      if (s0 == std::wstring::npos || s0 < (indent == std::wstring::npos ? 0 : indent) || s0 > at) break;
+      size_t s0 = next.find_first_not_of(L' ', L);
+      if (s0 >= R || s0 < (indent == std::wstring::npos ? L : indent) || s0 > at) break;
       if (wcschr(L"([{<", next[s0])) break;
-      size_t e = next.find_first_of(kStop, s0);
-      if (e == std::wstring::npos) e = next.size();
+      size_t e = std::min(next.find_first_of(kStop, s0), R);
       if (e == s0) break;
       bool urlish = next.find_first_of(L"/.?=&#%:_~+0123456789", s0) < e;
-      if (!urlish && next.find_first_not_of(L' ', e) != std::wstring::npos) break;
+      if (!urlish && next.find_first_not_of(L' ', e) < R) break;
       u.url += next.substr(s0, e - s0);
       u.segs.push_back({r + 1, (int)s0, (int)e});
       r++, cur = &next, curEnd = e;
     }
+    if (!full && !IsUrlStart(u.url)) continue;
     while (!u.url.empty() && wcschr(L".,;:!?)]}'\"", u.url.back())) {  // puntuación final fuera
       u.url.pop_back();
       if (u.segs.back().c1 > u.segs.back().c0) u.segs.back().c1--;
     }
     out.push_back(u);
-    at = end;
+    skip = end;
   }
   return out;
 }
