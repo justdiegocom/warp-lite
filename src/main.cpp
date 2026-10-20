@@ -1170,6 +1170,12 @@ static void Paste(Pane* p) {
     GlobalUnlock(h);
   }
   CloseClipboard();
+  if (w.empty()) {
+    // Sin texto (p. ej. una imagen): Ctrl+V tal cual al programa, para que tmux u otros puedan
+    // pegarla a su manera (el Ctrl+V de tmux de Diego trae la imagen del portapapeles).
+    if (!EditorActive(p)) SendChar(p, 0x16, VTERM_MOD_NONE);
+    return;
+  }
   if (EditorActive(p)) {  // en la caja de entrada: una sola línea
     std::wstring t;
     for (wchar_t ch : w) {
