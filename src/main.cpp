@@ -93,7 +93,7 @@ static const int kGap = 1;           // separación entre paneles (px)
 static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
-enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP };
+enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS };
 enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4 };
 
 // ---------------------------------------------------------------------------
@@ -157,6 +157,7 @@ struct Pane {
   std::vector<std::wstring> history;
   // Órdenes que conoce la shell (alias, funciones, cmdlets), para colorear la orden escrita.
   std::set<std::wstring> cmds;
+  std::vector<std::wstring> cmdNames;  // las mismas, con sus mayúsculas (para el autocompletado)
   bool cmdsLoaded = false;
   std::map<std::wstring, bool> existsMemo;
   int histPos = -1;
@@ -194,16 +195,18 @@ static std::wstring g_toast;
 
 // Textos de la interfaz: inglés por defecto; se cambia con clic derecho en la barra de título.
 enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, S_FIND, S_NO_RESULTS,
-           S_SEARCH_DIRS, S_PARENT_DIR, S_RENAME, S_HIDE, S_CLOSE_TAB, S_SHOW_ALL, S_HIDDEN_N, S_STARTUP, S_COUNT };
+           S_SEARCH_DIRS, S_PARENT_DIR, S_RENAME, S_HIDE, S_CLOSE_TAB, S_SHOW_ALL, S_HIDDEN_N, S_STARTUP,
+           S_LOADING, S_KIND_CMD, S_KIND_DIR, S_KIND_FILE, S_KIND_PARAM, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
      L"Search directories…", L".. (Parent directory)", L"Rename", L"Hide tab", L"Close tab", L"Show all",
-     L"%d hidden", L"Start with Windows"},
+     L"%d hidden", L"Start with Windows", L"Loading…", L"Command", L"Folder", L"File", L"Parameter"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
-     L"Mostrar todas", L"%d ocultas", L"Iniciar con Windows"},
+     L"Mostrar todas", L"%d ocultas", L"Iniciar con Windows", L"Cargando…", L"Orden", L"Carpeta", L"Archivo",
+     L"Parámetro"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -1943,7 +1946,9 @@ static void LoadShellCommands(Pane* p) {
   std::string line;
   while (std::getline(in, line)) {
     while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-    if (!line.empty()) p->cmds.insert(Lower(ToWide(line)));
+    if (line.empty()) continue;
+    std::wstring w = ToWide(line);
+    if (p->cmds.insert(Lower(w)).second) p->cmdNames.push_back(w);
   }
   p->cmdsLoaded = true;
   p->existsMemo.clear();
@@ -1980,6 +1985,259 @@ static int CommandExists(Pane* p, const std::wstring& tok) {
   if (!ok && !p->cmdsLoaded) return -1;
   p->existsMemo[low] = ok;
   return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Autocompletado con Tab, como el menú de Warp: órdenes en la primera palabra, parámetros tras
+// un «-» y rutas en el resto. Una sola opción se escribe directamente; varias abren el menú.
+
+enum { COMP_CMD, COMP_DIR, COMP_FILE, COMP_PARAM };
+struct CompItem {
+  std::wstring label, insert;
+  int kind;
+};
+struct CompState {
+  bool open = false;
+  Pane* p = nullptr;
+  size_t start = 0;            // dónde empieza la palabra que se completa
+  std::vector<CompItem> items;
+  int sel = 0, top = 0;
+  std::wstring loading;        // orden cuyos parámetros se están pidiendo a PowerShell
+  bool autoAccept = false;     // abierto con Tab y sin escribir nada más: si queda una, se escribe
+  RECT rc{};
+};
+static CompState g_comp;
+static const int kCompRows = 9;
+// Parámetros por orden (en minúsculas), pedidos una vez a un PowerShell aparte.
+static std::map<std::wstring, std::vector<std::wstring>> g_params;
+static std::set<std::wstring> g_paramsPending;
+
+struct ParamsReply {
+  std::wstring cmd;
+  std::vector<std::wstring> names;
+};
+
+static DWORD WINAPI ParamsThread(LPVOID arg) {
+  std::unique_ptr<std::wstring> cmd((std::wstring*)arg);
+  auto* reply = new ParamsReply{*cmd, {}};
+  wchar_t buf[MAX_PATH];
+  std::wstring exe = SearchPathW(nullptr, L"pwsh.exe", nullptr, MAX_PATH, buf, nullptr) ? L"pwsh.exe" : L"powershell.exe";
+  // El nombre solo lleva letras, cifras, «-», «_» y «.» (lo comprueba quien llama): no hay inyección.
+  std::wstring line = exe + L" -NoLogo -NoProfile -NonInteractive -Command \"$c = Get-Command -Name '" + *cmd +
+                      L"' -ErrorAction SilentlyContinue | Select-Object -First 1; "
+                      L"if ($c -and $c.Parameters) { $c.Parameters.Keys }\"";
+  SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+  HANDLE rd = nullptr, wr = nullptr;
+  if (CreatePipe(&rd, &wr, &sa, 0)) {
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si{sizeof si};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = si.hStdError = wr;
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, line.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+      CloseHandle(wr);
+      wr = nullptr;
+      std::string out;
+      char chunk[4096];
+      DWORD n;
+      while (ReadFile(rd, chunk, sizeof chunk, &n, nullptr) && n) out.append(chunk, n);
+      WaitForSingleObject(pi.hProcess, 15000);
+      CloseHandle(pi.hProcess);
+      CloseHandle(pi.hThread);
+      std::istringstream in(out);
+      std::string l;
+      while (std::getline(in, l)) {
+        while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
+        if (!l.empty()) reply->names.push_back(L"-" + ToWide(l));
+      }
+    }
+    if (wr) CloseHandle(wr);
+    CloseHandle(rd);
+  }
+  if (!PostMessage(g_hwnd, WM_APP_PARAMS, 0, (LPARAM)reply)) delete reply;
+  return 0;
+}
+
+static void RequestParams(const std::wstring& cmd) {
+  std::wstring low = Lower(cmd);
+  if (g_params.count(low) || g_paramsPending.count(low)) return;
+  g_paramsPending.insert(low);
+  HANDLE t = CreateThread(nullptr, 0, ParamsThread, new std::wstring(cmd), 0, nullptr);
+  if (t) CloseHandle(t);
+  else g_paramsPending.erase(low);
+}
+
+static bool StartsWithI(const std::wstring& s, const std::wstring& pre) {
+  return s.size() >= pre.size() && !_wcsnicmp(s.c_str(), pre.c_str(), pre.size());
+}
+
+// Ruta como cadena literal de PowerShell si hace falta (espacios, comillas, etc.).
+static std::wstring QuoteIfNeeded(const std::wstring& s, bool force) {
+  if (!force && s.find_first_of(L" '\"`$&()[]{};,@#") == std::wstring::npos) return s;
+  std::wstring q = L"'";
+  for (wchar_t c : s) {
+    q += c;
+    if (c == L'\'' || c == 0x2018 || c == 0x2019 || c == 0x201A || c == 0x201B) q += c;
+  }
+  return q + L"'";
+}
+
+static void PathCandidates(Pane* p, std::wstring tok, std::vector<CompItem>& out) {
+  bool quoted = !tok.empty() && (tok[0] == L'\'' || tok[0] == L'"');
+  if (quoted) {
+    wchar_t q = tok[0];
+    tok.erase(0, 1);
+    if (!tok.empty() && tok.back() == q) tok.pop_back();
+  }
+  size_t k = tok.find_last_of(L"\\/");
+  std::wstring dirPart = k == std::wstring::npos ? L"" : tok.substr(0, k + 1), pre = tok.substr(dirPart.size());
+  std::wstring base;
+  if (dirPart.rfind(L"\\\\", 0) == 0 || dirPart.rfind(L"//", 0) == 0) return;  // red: nunca
+  if (dirPart.empty()) base = p->cwd;
+  else if (dirPart[0] == L'~') {
+    wchar_t home[MAX_PATH] = L"";
+    GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH);
+    base = home + dirPart.substr(1);
+  } else if (dirPart.size() >= 2 && dirPart[1] == L':') base = dirPart;
+  else if (dirPart[0] == L'\\' || dirPart[0] == L'/') base = p->cwd.substr(0, 2) + dirPart;
+  else base = p->cwd + L"\\" + dirPart;
+  if (!IsLocalDir(base) || base.size() > 1000) return;
+  if (base.back() != L'\\' && base.back() != L'/') base += L'\\';
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((base + L"*").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  std::vector<CompItem> dirs, files;
+  do {
+    std::wstring n = fd.cFileName;
+    if (n == L"." || n == L"..") continue;
+    if ((fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) && pre.empty()) continue;
+    if (!StartsWithI(n, pre)) continue;
+    bool dir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
+    std::wstring ins = dirPart + n + (dir ? L"\\" : L"");
+    (dir ? dirs : files).push_back({n + (dir ? L"\\" : L""), QuoteIfNeeded(ins, quoted), dir ? COMP_DIR : COMP_FILE});
+  } while (FindNextFileW(h, &fd) && dirs.size() + files.size() < 2000);
+  FindClose(h);
+  auto byName = [](const CompItem& a, const CompItem& b) { return _wcsicmp(a.label.c_str(), b.label.c_str()) < 0; };
+  std::sort(dirs.begin(), dirs.end(), byName);
+  std::sort(files.begin(), files.end(), byName);
+  out.insert(out.end(), dirs.begin(), dirs.end());
+  out.insert(out.end(), files.begin(), files.end());
+}
+
+// Calcula las opciones para la palabra que acaba en el cursor.
+static void CompCompute(Pane* p) {
+  const std::wstring& e = p->edit;
+  size_t c = std::min(p->caret, e.size());
+  size_t start = 0, segStart = 0;
+  wchar_t q = 0;
+  for (size_t i = 0; i < c; i++) {
+    wchar_t ch = e[i];
+    if (q) {
+      if (ch == q) q = 0;
+    } else if (ch == L'\'' || ch == L'"') {
+      q = ch;
+    } else if (ch == L' ' || ch == L'\t') {
+      start = i + 1;
+    } else if (ch == L'|' || ch == L';' || ch == L'(' || ch == L'{') {
+      start = segStart = i + 1;
+    }
+  }
+  std::wstring tok = e.substr(start, c - start);
+  size_t first = e.find_first_not_of(L" \t", segStart);
+  bool cmdPos = first == std::wstring::npos || first >= start;
+  g_comp.start = start;
+  g_comp.items.clear();
+  g_comp.loading.clear();
+  if (!cmdPos && !tok.empty() && tok[0] == L'-') {  // parámetro de la orden del tramo
+    size_t ce = e.find_first_of(L" \t", first);
+    std::wstring cmd = e.substr(first, ce - first);
+    if (cmd.empty() || cmd.size() > 100 ||
+        cmd.find_first_not_of(L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") != std::wstring::npos)
+      return;
+    auto it = g_params.find(Lower(cmd));
+    if (it == g_params.end()) {
+      RequestParams(cmd);
+      g_comp.loading = Lower(cmd);
+      return;
+    }
+    for (auto& n : it->second)
+      if (StartsWithI(n, tok)) g_comp.items.push_back({n, n, COMP_PARAM});
+    return;
+  }
+  if (cmdPos && !tok.empty() && tok.find_first_of(L"\\/:'\"~") == std::wstring::npos) {
+    for (auto& n : p->cmdNames)
+      if (StartsWithI(n, tok) && g_comp.items.size() < 500) g_comp.items.push_back({n, n, COMP_CMD});
+    std::sort(g_comp.items.begin(), g_comp.items.end(),
+              [](const CompItem& a, const CompItem& b) { return _wcsicmp(a.label.c_str(), b.label.c_str()) < 0; });
+  }
+  PathCandidates(p, tok, g_comp.items);
+}
+
+static void CompClose() {
+  if (!g_comp.open) return;
+  g_comp.open = false;
+  g_comp.autoAccept = false;
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void CompAccept(int i) {
+  Pane* p = g_comp.p;
+  if (i < 0 || i >= (int)g_comp.items.size() || !g_live.count(p)) return CompClose();
+  const CompItem& it = g_comp.items[i];
+  size_t c = std::min(p->caret, p->edit.size()), s = std::min(g_comp.start, c);
+  // Órdenes y parámetros llevan un espacio detrás (si no lo hay ya); las rutas no.
+  bool space = (it.kind == COMP_CMD || it.kind == COMP_PARAM) && (c >= p->edit.size() || p->edit[c] != L' ');
+  std::wstring ins = it.insert + (space ? L" " : L"");
+  p->edit.replace(s, c - s, ins);
+  p->caret = s + ins.size();
+  p->histPos = -1;
+  CompClose();
+}
+
+// Tras escribir o mover el cursor con el menú abierto: se vuelve a filtrar.
+static void CompRefresh() {
+  Pane* p = g_comp.p;
+  if (!g_comp.open || !g_live.count(p) || !EditorActive(p)) return CompClose();
+  CompCompute(p);
+  g_comp.sel = g_comp.top = 0;
+  if (g_comp.autoAccept && g_comp.loading.empty() && g_comp.items.size() == 1) return CompAccept(0);
+  if (g_comp.items.empty() && g_comp.loading.empty()) return CompClose();
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void CompStart(Pane* p) {
+  LoadShellCommands(p);
+  g_comp = CompState{};
+  g_comp.p = p;
+  g_comp.open = true;
+  g_comp.autoAccept = true;
+  CompRefresh();
+}
+
+static bool CompKey(WPARAM vk) {
+  int n = (int)g_comp.items.size();
+  bool shift = GetKeyState(VK_SHIFT) & 0x8000;
+  switch (vk) {
+    case VK_ESCAPE: CompClose(); return true;
+    case VK_RETURN:
+      if (n) CompAccept(g_comp.sel);
+      else CompClose();
+      return true;
+    case VK_TAB:
+      if (n) g_comp.sel = (g_comp.sel + (shift ? n - 1 : 1)) % n;
+      break;
+    case VK_UP: g_comp.sel = std::max(0, g_comp.sel - 1); break;
+    case VK_DOWN: g_comp.sel = std::min(n - 1, g_comp.sel + 1); break;
+    case VK_PRIOR: g_comp.sel = std::max(0, g_comp.sel - kCompRows); break;
+    case VK_NEXT: g_comp.sel = std::min(n - 1, g_comp.sel + kCompRows); break;
+    default: g_comp.autoAccept = false; return false;  // al editor; luego se vuelve a filtrar
+  }
+  g_comp.autoAccept = false;
+  g_comp.sel = std::max(0, g_comp.sel);
+  if (g_comp.sel < g_comp.top) g_comp.top = g_comp.sel;
+  if (g_comp.sel >= g_comp.top + kCompRows) g_comp.top = g_comp.sel - kCompRows + 1;
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+  return true;
 }
 
 static bool IsWordChar(wchar_t c) { return iswalnum(c) || c == L'_' || c == L'-'; }
@@ -2020,7 +2278,7 @@ static bool EditorKey(Pane* p, WPARAM vk) {
     case VK_HOME: c = 0; break;
     case VK_END: c = e.size(); break;
     case VK_ESCAPE: e.clear(), c = 0, p->histPos = -1; break;
-    case VK_TAB: break;  // sin autocompletado por ahora
+    case VK_TAB: CompStart(p); return true;
     case VK_UP:
       if (!p->history.empty()) {
         if (p->histPos < 0) p->histPos = (int)p->history.size();
@@ -2051,6 +2309,7 @@ static bool EditorKey(Pane* p, WPARAM vk) {
       break;
     default: return false;
   }
+  if (g_comp.open && g_comp.p == p) CompRefresh();
   InvalidateRect(g_hwnd, nullptr, FALSE);
   return true;
 }
@@ -2911,6 +3170,46 @@ static void DrawPicker(HDC dc) {
   SetBkMode(dc, OPAQUE);
 }
 
+static void DrawCompletion(HDC dc) {
+  Pane* p = g_comp.p;
+  if (!g_comp.open || !p || !g_live.count(p) || g_tabs.empty() || p != CurTab().active || !EditorActive(p)) {
+    g_comp.rc = RECT{};
+    return;
+  }
+  int rowH = Px(30), n = std::min<int>(kCompRows, (int)g_comp.items.size());
+  int h = std::max(1, n) * rowH + Px(8);
+  int w = std::min<int>(Px(480), p->rc.right - p->rc.left - Px(16));
+  int left = p->chip.left, bottom = p->chip.top - Px(6);
+  RECT r{left, std::max<int>(TabBarH() + Px(4), bottom - h), left + w, bottom};
+  g_comp.rc = r;
+  Panel(dc, r);
+  SetBkMode(dc, TRANSPARENT);
+  SelectObject(dc, g_uiFont);
+  if (!n) {
+    RECT tr{r.left + Px(14), r.top + Px(4), r.right - Px(14), r.top + Px(4) + rowH};
+    Text(dc, T(S_LOADING), tr, RGB(0x8a, 0x8a, 0x8a), DT_LEFT);
+  }
+  static const Str kKind[] = {S_KIND_CMD, S_KIND_DIR, S_KIND_FILE, S_KIND_PARAM};
+  for (int i = 0; i < n; i++) {
+    int idx = g_comp.top + i;
+    if (idx >= (int)g_comp.items.size()) break;
+    const CompItem& it = g_comp.items[idx];
+    RECT ir{r.left + Px(4), r.top + Px(4) + i * rowH, r.right - Px(4), r.top + Px(4) + (i + 1) * rowH};
+    bool sel = idx == g_comp.sel;
+    if (sel) Fill(dc, ir, kAccent);
+    RECT kr{ir.right - Px(110), ir.top, ir.right - Px(10), ir.bottom};
+    Text(dc, T(kKind[it.kind]), kr, sel ? kFg : RGB(0x8a, 0x8a, 0x8a), DT_RIGHT);
+    RECT tr{ir.left + Px(10), ir.top, kr.left - Px(8), ir.bottom};
+    Text(dc, it.label, tr, sel ? kFg : RGB(0xd0, 0xd0, 0xd0), DT_LEFT | DT_END_ELLIPSIS);
+  }
+  if ((int)g_comp.items.size() > kCompRows) {  // barra de desplazamiento fina
+    int total = (int)g_comp.items.size(), ih = r.bottom - r.top - Px(8);
+    int th = std::max(Px(12), ih * kCompRows / total), ty = r.top + Px(4) + (ih - th) * g_comp.top / std::max(1, total - kCompRows);
+    Fill(dc, RECT{r.right - Px(4), ty, r.right - Px(2), ty + th}, kTabText);
+  }
+  SetBkMode(dc, OPAQUE);
+}
+
 static void Render(HDC dc, int w, int h) {
   RECT all{0, 0, w, h};
   Fill(dc, all, kBg);
@@ -2926,6 +3225,7 @@ static void Render(HDC dc, int w, int h) {
   DrawDividers(dc, t.root);
   DrawFindBar(dc);
   DrawPicker(dc);
+  DrawCompletion(dc);
   if (g_dropTarget) {  // destino al arrastrar un panel por su cabecera
     HBRUSH b = CreateSolidBrush(kAccent);
     RECT r = g_dropTarget->rc;
@@ -2958,7 +3258,7 @@ static void PaintDirty() {
   DWORD now = GetTickCount();
   g_lastFrame = now;
   if (!g_backDC || g_tabs.empty() || IsIconic(g_hwnd)) return;
-  bool overlay = g_find.open || g_pick.open || g_dragPane || g_link.p || g_renameTab >= 0;
+  bool overlay = g_find.open || g_pick.open || g_comp.open || g_dragPane || g_link.p || g_renameTab >= 0;
   if (overlay || (g_titleDirty && now - g_lastFull >= 250)) {  // títulos: como mucho 4 veces por segundo
     g_titleDirty = false;
     InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -3092,7 +3392,7 @@ static bool SaveScreenshot(const std::wstring& path) {
 // Guion de prueba: pasos separados por '|', uno cada ~1,2 s.
 //   type:<texto> enter splitR splitD tab close-pane left right up down swap-<dir> rename:<nombre>
 //   zoom:<%> move:x,y,w,h maximize rename-start rename-type:<texto> shot:<fichero.bmp> wait quit
-//   drag-tab:<de>,<a> tabs clipboard (estos y hover/hover-text dejan el resultado en <sesión>.bench)
+//   key:<tab|down|up|enter|esc> edit-text comp drag-tab:<de>,<a> tabs clipboard (estos y hover/hover-text dejan el resultado en <sesión>.bench)
 
 static void SetStartWithWindows(bool on);
 
@@ -3152,6 +3452,7 @@ static void RunScriptStep() {
     GlobalUnlock(hg);
     SendMessageW(g_hwnd, WM_DROPFILES, (WPARAM)hg, 0);
   } else if (s == L"clear" && p) {
+    CompClose();
     p->edit.clear();
     p->caret = 0;
   } else if (s == L"submit" && p) {
@@ -3197,6 +3498,19 @@ static void RunScriptStep() {
       SendMessageW(g_hwnd, WM_MOUSEMOVE, MK_LBUTTON, at(q));
     }
     SendMessageW(g_hwnd, WM_LBUTTONUP, 0, at(b));
+  } else if (s.rfind(L"key:", 0) == 0) {  // key:tab|down|up|enter|esc — por el bucle de mensajes, como una tecla
+    std::wstring k = s.substr(4);
+    WPARAM vk = k == L"tab" ? VK_TAB : k == L"down" ? VK_DOWN : k == L"up" ? VK_UP : k == L"enter" ? VK_RETURN : VK_ESCAPE;
+    PostMessageW(g_hwnd, WM_KEYDOWN, vk, 0);
+    delay = 600;
+  } else if (s == L"edit-text" && p) {
+    ScriptLog(L"edit: [" + p->edit + L"]");
+  } else if (s == L"comp") {
+    std::wstring r = L"comp:";
+    if (!g_comp.open) r += L" (cerrado)";
+    else if (!g_comp.loading.empty()) r += L" (cargando)";
+    for (size_t i = 0; g_comp.open && i < g_comp.items.size() && i < 6; i++) r += L" " + g_comp.items[i].label;
+    ScriptLog(r);
   } else if (s == L"tabs") {  // orden de las pestañas (por su nombre) y cuál está activa
     std::wstring r = L"tabs:";
     for (int i = 0; i < (int)g_tabs.size(); i++) r += L" " + (i == g_activeTab ? L"*" + g_tabs[i].name : g_tabs[i].name);
@@ -3399,6 +3713,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       Relayout();
       return 0;
     }
+    case WM_APP_PARAMS: {  // parámetros de una orden, de ParamsThread
+      std::unique_ptr<ParamsReply> r((ParamsReply*)lp);
+      std::wstring low = Lower(r->cmd);
+      g_paramsPending.erase(low);
+      g_params[low] = r->names;
+      if (g_comp.open && g_comp.loading == low) CompRefresh();
+      return 0;
+    }
     case WM_APP_CLIP: {  // OSC 52: texto copiado en tmux → portapapeles de Windows (con \r\n)
       std::unique_ptr<std::wstring> t((std::wstring*)lp);
       std::wstring w;
@@ -3521,6 +3843,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           std::wstring t;
           AppendUtf16(t, cp);
           EditorInsert(CurTab().active, t);
+          if (g_comp.open && g_comp.p == CurTab().active) g_comp.autoAccept = false, CompRefresh();
           InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -3581,6 +3904,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_tabs.empty()) return 0;
       SetFocus(hwnd);
       if (g_renameTab >= 0) EndRename(true);  // clic fuera: guarda el nombre
+      if (g_comp.open) {  // menú de autocompletado: clic en una opción la elige; fuera, se cierra
+        POINT pt{x, y};
+        if (PtInRect(&g_comp.rc, pt)) {
+          if (msg == WM_LBUTTONDOWN) CompAccept(g_comp.top + (y - g_comp.rc.top - Px(4)) / Px(30));
+          return 0;
+        }
+        CompClose();
+      }
       if (g_pick.open) {  // selector de carpetas abierto: elegir o cerrar
         POINT pt{x, y};
         int row = (y - g_pick.rc.top - Px(40)) / Px(30);
@@ -3666,7 +3997,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
       if (g_tabs.empty()) return 0;
       {
-        int tab;
+        int tab = -1;
         int hit = y < TabBarH() || x < SidebarW() ? TitleHit(x, y, &tab) : HIT_NONE;
         SetHover(hit, tab);
         TRACKMOUSEEVENT tme{sizeof tme, TME_LEAVE, hwnd, 0};
@@ -3966,6 +4297,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (g_pick.open && keyDown) {
       if (!PickKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
       continue;
+    }
+    if (g_comp.open && keyDown) {
+      if (g_tabs.empty() || g_comp.p != CurTab().active || !EditorActive(g_comp.p)) CompClose();
+      else if (CompKey(m.wParam)) continue;
     }
     if (g_find.open && keyDown && g_renameTab < 0) {
       if (!FindKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);

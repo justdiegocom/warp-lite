@@ -8,9 +8,11 @@ A small, fast terminal for Windows with the look and shortcuts of [Warp](https:/
 
 - **Tabs and split panes** with Warp's shortcuts: `Ctrl+Shift+D` split right, `Ctrl+Shift+E` split down, `Ctrl+Alt+Arrows` move between panes, `Ctrl+Shift+T` new tab, `Ctrl+Shift+W` close.
 - **Input box** at the bottom with the current folder (click it to switch folders), history, and the command coloured green if it exists or underlined in red if not.
+- **Tab completion** like Warp's menu: commands, `-parameters` and paths (`↑/↓` or `Tab` to move, `Enter` to pick).
 - **Picks up where you left off**: tabs, splits, folders and windows come back after a restart. Your last command is waiting in the input box, and anything that was still running (e.g. `ssh … tmux`) is relaunched.
-- **Vertical tabs**, renamable and hideable tabs, several windows (drag a tab out to open it in a new one).
-- `Ctrl+F` search, `Ctrl+click` links, drop files to paste their path, `Ctrl +/-` zoom.
+- **Vertical tabs**, renamable and hideable tabs, drag tabs to reorder them, several windows (drag a tab out to open it in a new one).
+- `Ctrl+F` search, `Ctrl+click` links (also when wrapped over two lines), drop files to paste their path, `Ctrl +/-` zoom.
+- `Ctrl+C` copies the selection; text copied inside tmux/vim over SSH reaches the Windows clipboard (OSC 52).
 - Warp's dark theme and font (Hack 13 px), with Nerd Font icons and symbol fallback built in.
 - Light on CPU: only the rows that change are redrawn.
 
@@ -18,7 +20,7 @@ A small, fast terminal for Windows with the look and shortcuts of [Warp](https:/
 
 ## Install
 
-Run `warp-lite-setup.exe` (per-user, no admin). It shows up as **Warp** in the Start menu and in *Installed apps*. Right-click the title bar for the language and *Start with Windows*.
+Download `warp-lite-setup.exe` from [Releases](https://github.com/justdiegocom/warp-lite/releases/latest) and run it (per-user, no admin). It shows up as **Warp** in the Start menu and in *Installed apps*. Right-click the title bar for the language and *Start with Windows*.
 
 ## Build
 
