@@ -1,6 +1,6 @@
 # warp-lite
 
-A small, fast terminal for Windows with the look and shortcuts of [Warp](https://github.com/warpdotdev/warp) — and nothing else. No AI, no account, no telemetry. One ~5 MB `.exe` (Win32 + ConPTY + libvterm + GDI).
+A small, fast terminal for Windows with the look and shortcuts of [Warp](https://github.com/warpdotdev/warp) — and nothing else. No AI, no account, no telemetry. One ~5 MB `.exe` (Win32 + ConPTY + libvterm + GDI + DirectWrite).
 
 ![Split panes](docs/screenshot-panes.png)
 

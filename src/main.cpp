@@ -23,6 +23,7 @@
 #include <winhttp.h>
 #include <bcrypt.h>
 #include <restartmanager.h>
+#include <dwrite_3.h>
 
 #include <algorithm>
 #include <atomic>
@@ -74,6 +75,7 @@ static PFN_ClosePseudoConsole pClosePseudoConsole;
 
 static const COLORREF kBg = RGB(0x05, 0x05, 0x05);
 static const COLORREF kFg = RGB(0xff, 0xff, 0xff);
+static const COLORREF kTermFg = RGB(0xcc, 0xcc, 0xcc);  // default terminal text, as in Windows Terminal / cmd
 static const COLORREF kTitleBg = RGB(0x11, 0x11, 0x11);
 static const COLORREF kTabActiveBg = RGB(0x24, 0x24, 0x24);
 static const COLORREF kTabText = RGB(0x9b, 0x9b, 0x9b);
@@ -574,7 +576,7 @@ static Pane* NewPane() {
   vterm_screen_enable_reflow(p->scr, true);
   VTermState* st = vterm_obtain_state(p->vt);
   VTermColor fg, bg;
-  vterm_color_rgb(&fg, GetRValue(kFg), GetGValue(kFg), GetBValue(kFg));
+  vterm_color_rgb(&fg, GetRValue(kTermFg), GetGValue(kTermFg), GetBValue(kTermFg));
   vterm_color_rgb(&bg, GetRValue(kBg), GetGValue(kBg), GetBValue(kBg));
   vterm_state_set_default_colors(st, &fg, &bg);
   for (int i = 0; i < 16; i++) {
@@ -3279,6 +3281,156 @@ static int FallbackFor(uint32_t cp) {
   return r;
 }
 
+// Terminal text through DirectWrite, like Windows Terminal: grayscale antialiasing, natural measuring and
+// the system's rendering params (gamma, contrast, and the rendering mode DirectWrite picks for the font:
+// natural symmetric for most fonts and sizes). Each row is composed in the DIB of a bitmap render target
+// and copied to the destination DC in one BitBlt, so the GDI back buffer, row painting and screenshots
+// work as before. Without DirectWrite (or with WARPLITE_GDI_TEXT set) the text goes through GDI.
+struct DwState {
+  IDWriteFactory1* factory = nullptr;
+  IDWriteGdiInterop* interop = nullptr;
+  IDWriteRenderingParams* params = nullptr;
+  IDWriteRenderingParams* boxParams = nullptr;  // box drawing and blocks: aliased (hinted, one crisp pixel)
+  IDWriteBitmapRenderTarget* rt = nullptr;
+  HDC dc = nullptr;  // the render target's memory DC: a 32-bit top-down DIB
+  uint32_t* bits = nullptr;
+  int stride = 0, w = 0, h = 0;
+  RECT strip{};  // destination rectangle being composed
+  IDWriteFontFace* faces[4] = {};
+  IDWriteFontFace* fallback[kFallbackCount] = {};
+  float em = 0;
+  int ascent = 0;   // baseline below the top of the text
+  bool on = false;  // fonts bridged: the terminal text goes through DirectWrite
+};
+static DwState g_dw;
+
+// Grows the render target to at least w x h.
+static bool DwTarget(int w, int h) {
+  if (w <= g_dw.w && h <= g_dw.h) return true;
+  w = std::max(w, g_dw.w), h = std::max(h, g_dw.h);
+  if (FAILED(g_dw.rt->Resize(w, h))) return false;
+  g_dw.dc = g_dw.rt->GetMemoryDC();
+  DIBSECTION ds{};
+  if (!GetObjectW(GetCurrentObject(g_dw.dc, OBJ_BITMAP), sizeof ds, &ds) || !ds.dsBm.bmBits) return false;
+  g_dw.bits = (uint32_t*)ds.dsBm.bmBits;
+  g_dw.stride = ds.dsBm.bmWidthBytes / 4;
+  g_dw.w = w, g_dw.h = h;
+  return true;
+}
+
+static bool DwInit() {
+  static bool tried = false;
+  if (tried) return g_dw.rt != nullptr;
+  tried = true;
+  if (GetEnvironmentVariableW(L"WARPLITE_GDI_TEXT", nullptr, 0)) return false;  // the old GDI text (tests)
+  typedef HRESULT(WINAPI * PFN)(DWRITE_FACTORY_TYPE, REFIID, IUnknown**);
+  HMODULE m = LoadLibraryExW(L"dwrite.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  PFN create = m ? (PFN)GetProcAddress(m, "DWriteCreateFactory") : nullptr;
+  IDWriteBitmapRenderTarget* rt = nullptr;
+  IDWriteBitmapRenderTarget1* rt1 = nullptr;
+  if (!create || FAILED(create(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory1), (IUnknown**)&g_dw.factory)) ||
+      FAILED(g_dw.factory->GetGdiInterop(&g_dw.interop)) || FAILED(g_dw.factory->CreateRenderingParams(&g_dw.params)) ||
+      FAILED(((IDWriteFactory*)g_dw.factory)
+                 ->CreateCustomRenderingParams(g_dw.params->GetGamma(), g_dw.params->GetEnhancedContrast(),
+                                               g_dw.params->GetClearTypeLevel(), g_dw.params->GetPixelGeometry(),
+                                               DWRITE_RENDERING_MODE_ALIASED, &g_dw.boxParams)) ||
+      FAILED(g_dw.interop->CreateBitmapRenderTarget(nullptr, 1, 1, &rt)) ||
+      FAILED(rt->QueryInterface(__uuidof(IDWriteBitmapRenderTarget1), (void**)&rt1)) ||
+      FAILED(rt1->SetTextAntialiasMode(DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE))) {
+    if (rt1) rt1->Release();
+    if (rt) rt->Release();
+    return false;
+  }
+  rt1->Release();
+  rt->SetPixelsPerDip(1.0f);  // em sizes are already in pixels
+  g_dw.rt = rt;
+  if (!DwTarget(1, 1)) g_dw.rt = nullptr, rt->Release();
+  return g_dw.rt != nullptr;
+}
+
+// DirectWrite faces of the GDI fonts just made: CreateFontFaceFromHdc also sees the embedded and private
+// fonts, which DirectWrite's system collection doesn't. If one fails, the text stays on GDI.
+static void DwMakeFaces(int em, int ascent) {
+  for (auto& f : g_dw.faces)
+    if (f) f->Release(), f = nullptr;
+  for (auto& f : g_dw.fallback)
+    if (f) f->Release(), f = nullptr;
+  g_dw.on = false;
+  if (!DwInit()) return;
+  bool ok = true;
+  auto make = [&](HFONT font, IDWriteFontFace** out) {
+    SelectObject(g_measureDC, font);
+    ok = SUCCEEDED(g_dw.interop->CreateFontFaceFromHdc(g_measureDC, out)) && ok;
+  };
+  for (int i = 0; i < 4; i++) make(g_fonts[i], &g_dw.faces[i]);
+  for (int i = 0; i < kFallbackCount; i++) make(g_fallback[i], &g_dw.fallback[i]);
+  g_dw.em = (float)em, g_dw.ascent = ascent;
+  g_dw.on = ok;
+}
+
+// Fills r (destination coordinates) in the strip being composed.
+static void DwFill(RECT r, COLORREF c) {
+  const RECT& s = g_dw.strip;
+  int x0 = std::max(r.left, s.left) - s.left, x1 = std::min(r.right, s.right) - s.left;
+  int y0 = std::max(r.top, s.top) - s.top, y1 = std::min(r.bottom, s.bottom) - s.top;
+  uint32_t px = (GetRValue(c) << 16) | (GetGValue(c) << 8) | GetBValue(c);
+  for (int y = y0; x0 < x1 && y < y1; y++) std::fill_n(g_dw.bits + (size_t)y * g_dw.stride + x0, x1 - x0, px);
+}
+
+// Starts composing the destination rectangle r, filled with bg. False: draw it with GDI instead.
+static bool DwBegin(RECT r, COLORREF bg) {
+  if (!g_dw.on || r.right <= r.left || r.bottom <= r.top || !DwTarget(r.right - r.left, r.bottom - r.top)) return false;
+  GdiFlush();  // GDI batches its calls: none may touch the DIB once it is written directly
+  g_dw.strip = r;
+  DwFill(r, bg);
+  return true;
+}
+
+// One glyph per code point with its advance in px (0 for combining marks), the top of the text at y. Box
+// drawing and block elements go aliased: antialiased, a vertical stroke would be smeared over two gray
+// pixels (Windows Terminal draws them itself, crisp).
+static void DwGlyphs(int x, int y, IDWriteFontFace* face, COLORREF fg, const uint32_t* cps, const float* adv, size_t n) {
+  static std::vector<UINT16> idx;
+  float ox = (float)(x - g_dw.strip.left);
+  size_t a = 0;
+  while (n > a && cps[n - 1] == L' ') n--;  // blanks draw nothing
+  while (a < n && cps[a] == L' ') ox += adv[a++];
+  if (a == n) return;
+  idx.resize(n - a);
+  if (FAILED(face->GetGlyphIndices(cps + a, (UINT32)(n - a), idx.data()))) return;
+  for (size_t k = 0; k < n - a; k++)
+    if (!idx[k] && !adv[a + k]) {  // zero-width character the face lacks (variation selector, ZWJ): no .notdef box
+      UINT32 sp = L' ';
+      face->GetGlyphIndices(&sp, 1, &idx[k]);
+    }
+  auto box = [](uint32_t c) { return c >= 0x2500 && c < 0x25A0; };
+  for (size_t i = a, j; i < n; i = j) {
+    float w = 0;
+    for (j = i; j < n && box(cps[j]) == box(cps[i]); j++) w += adv[j];
+    DWRITE_GLYPH_RUN run{face, g_dw.em, (UINT32)(j - i), idx.data() + (i - a), adv + i, nullptr, FALSE, 0};
+    g_dw.rt->DrawGlyphRun(ox, (float)(y - g_dw.strip.top + g_dw.ascent), DWRITE_MEASURING_MODE_NATURAL, &run,
+                          box(cps[i]) ? g_dw.boxParams : g_dw.params, fg, nullptr);
+    ox += w;
+  }
+}
+
+// Like DwGlyphs with a style of the terminal font; what it lacks goes to its fallback face.
+static void DwText(int x, int y, int font, COLORREF fg, const uint32_t* cps, const float* adv, size_t n) {
+  for (size_t i = 0, j; i < n; i = j) {
+    int fb = FallbackFor(cps[i]);
+    float w = adv[i];
+    for (j = i + 1; j < n && FallbackFor(cps[j]) == fb; j++) w += adv[j];
+    DwGlyphs(x, y, fb ? g_dw.fallback[fb - 1] : g_dw.faces[font], fg, cps + i, adv + i, j - i);
+    x += (int)w;
+  }
+}
+
+// Copies the composed strip to dc.
+static void DwEnd(HDC dc) {
+  const RECT& s = g_dw.strip;
+  BitBlt(dc, s.left, s.top, s.right - s.left, s.bottom - s.top, g_dw.dc, 0, 0, SRCCOPY);
+}
+
 static void MakeFonts() {
   for (auto& f : g_fonts)
     if (f) DeleteObject(f), f = nullptr;
@@ -3322,13 +3474,24 @@ static void MakeFonts() {
     g_fallback[i] = CreateFontW(h, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
                                 CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, kFallbackFaces[i]);
   }
+  DwMakeFaces(-h, (int)tm.tmAscent);
+  if (g_dw.on) {  // unhinted glyphs: the cell is the advance of "0" rounded, as in Windows Terminal
+    DWRITE_FONT_METRICS fm{};
+    g_dw.faces[0]->GetMetrics(&fm);
+    UINT32 zero = L'0';
+    UINT16 gi = 0;
+    DWRITE_GLYPH_METRICS gm{};
+    if (fm.designUnitsPerEm && SUCCEEDED(g_dw.faces[0]->GetGlyphIndices(&zero, 1, &gi)) && gi &&
+        SUCCEEDED(g_dw.faces[0]->GetDesignGlyphMetrics(&gi, 1, &gm, FALSE)))
+      g_cellW = std::max(1, (int)(gm.advanceWidth * g_dw.em / fm.designUnitsPerEm + 0.5f));
+  }
   // Altura de línea de Warp: 1,2 × tamaño de letra (DEFAULT_UI_LINE_HEIGHT_RATIO).
   g_cellH = std::max((int)tm.tmHeight, (int)(MulDiv(g_fontPx, ScaledDpi(), 96) * 1.2 + 0.5));
   g_textDy = (g_cellH - (int)tm.tmHeight) / 2;
 }
 
 static COLORREF ResolveColor(Pane* p, VTermColor c, bool fg) {
-  if (fg && VTERM_COLOR_IS_DEFAULT_FG(&c)) return kFg;
+  if (fg && VTERM_COLOR_IS_DEFAULT_FG(&c)) return kTermFg;
   if (!fg && VTERM_COLOR_IS_DEFAULT_BG(&c)) return kBg;
   vterm_screen_convert_color_to_rgb(p->scr, &c);
   return RGB(c.rgb.red, c.rgb.green, c.rgb.blue);
@@ -3415,27 +3578,50 @@ static void DrawInput(HDC dc, Pane* p, bool active, bool focus) {
     size_t off = p->caret >= cols ? p->caret - cols + 1 : 0;
     std::wstring vis = p->edit.substr(off, cols);
     std::vector<INT> dx(vis.size(), g_cellW);
-    SetTextColor(dc, kFg);
-    ExtTextOutW(dc, x, ey, ETO_CLIPPED, &er, vis.c_str(), (UINT)vis.size(), dx.data());
     cx = x + (int)(p->caret - off) * g_cellW;
     // Como Warp: la orden en verde si existe; subrayado rojo discontinuo si no.
     size_t a = p->edit.find_first_not_of(L' ');
     size_t b = a == std::wstring::npos ? a : p->edit.find_first_of(L" \t|;", a);
     if (b == std::wstring::npos) b = p->edit.size();
     static const std::wstring kNeutral = L"$(\"'@&[{0123456789";
+    int ex = -1;
+    size_t va = 0, vb = 0;
     if (a != std::wstring::npos && kNeutral.find(p->edit[a]) == std::wstring::npos && !(p->edit[a] == L'.' && b - a == 1)) {
-      int ex = CommandExists(p, p->edit.substr(a, b - a));
-      size_t va = std::max(a, off), vb = std::min(b, off + cols);
-      if (va < vb) {
-        int x0 = x + (int)(va - off) * g_cellW, x1 = x + (int)(vb - off) * g_cellW;
-        if (ex == 1) {
-          SetTextColor(dc, kCmdOk);
-          ExtTextOutW(dc, x0, ey, ETO_CLIPPED, &er, vis.c_str() + (va - off), (UINT)(vb - va), dx.data());
-        } else if (ex == 0) {
-          int uy = ey + g_cellH - std::max(1, Px(1));
-          for (int ux = x0; ux < x1; ux += Px(4)) Fill(dc, RECT{ux, uy, std::min(ux + Px(2), x1), uy + std::max(1, Px(1))}, kCmdBad);
-        }
+      ex = CommandExists(p, p->edit.substr(a, b - a));
+      va = std::max(a, off), vb = std::min(b, off + cols);
+    }
+    if (DwBegin(er, kBg)) {  // each UTF-16 unit is a cell, as with GDI; the command in green, the rest in white
+      std::vector<uint32_t> cps;
+      std::vector<float> adv;
+      std::vector<char> green;
+      for (size_t i = 0; i < vis.size(); i++) {
+        uint32_t c = vis[i];
+        bool pair = c >= 0xD800 && c < 0xDC00 && i + 1 < vis.size() && vis[i + 1] >= 0xDC00 && vis[i + 1] < 0xE000;
+        green.push_back(ex == 1 && off + i >= va && off + i < vb);
+        if (pair) c = 0x10000 + ((c - 0xD800) << 10) + (vis[++i] - 0xDC00);
+        cps.push_back(c);
+        adv.push_back((float)(g_cellW * (pair ? 2 : 1)));
       }
+      int sx = x;
+      for (size_t i = 0, j; i < cps.size(); i = j) {
+        float w = 0;
+        for (j = i; j < cps.size() && green[j] == green[i]; j++) w += adv[j];
+        DwText(sx, ey, 0, green[i] ? kCmdOk : kFg, &cps[i], &adv[i], j - i);
+        sx += (int)w;
+      }
+      DwEnd(dc);
+    } else {
+      SetTextColor(dc, kFg);
+      ExtTextOutW(dc, x, ey, ETO_CLIPPED, &er, vis.c_str(), (UINT)vis.size(), dx.data());
+      if (ex == 1 && va < vb) {
+        SetTextColor(dc, kCmdOk);
+        ExtTextOutW(dc, x + (int)(va - off) * g_cellW, ey, ETO_CLIPPED, &er, vis.c_str() + (va - off), (UINT)(vb - va), dx.data());
+      }
+    }
+    if (ex == 0 && va < vb) {
+      int x0 = x + (int)(va - off) * g_cellW, x1 = x + (int)(vb - off) * g_cellW;
+      int uy = ey + g_cellH - std::max(1, Px(1));
+      for (int ux = x0; ux < x1; ux += Px(4)) Fill(dc, RECT{ux, uy, std::min(ux + Px(2), x1), uy + std::max(1, Px(1))}, kCmdBad);
     }
   }
   if (ready && active && focus) Fill(dc, RECT{cx, ey, cx + std::max(2, Px(2)), ey + g_cellH}, kFg);
@@ -3454,6 +3640,8 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
   int ox = p->content.left + kPad, oy = p->content.top + kPad;
   std::wstring txt;
   std::vector<INT> dx;
+  std::vector<uint32_t> cps;  // DirectWrite: code points and advances of the run
+  std::vector<float> adv;
   std::map<int, std::wstring> rowCache;  // textos de fila para detectar URLs
   auto rowText = [&](int r) -> const std::wstring& {
     auto it = rowCache.find(r);
@@ -3468,6 +3656,8 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
       if (drawn.right == drawn.left) drawn = rr;
       else UnionRect(&drawn, &drawn, &rr);
     }
+    // DirectWrite: the whole row (padding included) is composed off-screen and copied at the end.
+    bool comp = DwBegin(RECT{p->content.left, y, p->content.right, y + g_cellH}, kBg);
     std::vector<char> url = UrlMask(p, row, rowText);
     int col = 0;
     while (col < p->cols) {
@@ -3475,6 +3665,8 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
       Style st{};
       txt.clear();
       dx.clear();
+      cps.clear();
+      adv.clear();
       while (col < p->cols) {
         VTermScreenCell c;
         CellAt(p, row, col, &c);
@@ -3498,7 +3690,12 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
         if (col != start && s != st) break;
         st = s;
         int w = std::max(1, (int)c.width);
-        if (!c.chars[0]) {
+        if (comp) {
+          cps.push_back(c.chars[0] ? c.chars[0] : L' ');
+          adv.push_back((float)(g_cellW * w));
+          for (int i = 1; i < VTERM_MAX_CHARS_PER_CELL && c.chars[0] && c.chars[i]; i++)
+            cps.push_back(c.chars[i]), adv.push_back(0);
+        } else if (!c.chars[0]) {
           txt += L' ';
           dx.push_back(g_cellW * w);
         } else {
@@ -3511,15 +3708,23 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
         col += w;
       }
       RECT r{ox + start * g_cellW, y, ox + col * g_cellW, y + g_cellH};
-      SelectObject(dc, st.fb ? g_fallback[st.fb - 1] : g_fonts[st.font]);
-      SetTextColor(dc, st.fg);
-      SetBkColor(dc, st.bg);
-      ExtTextOutW(dc, r.left, y + g_textDy, ETO_OPAQUE | ETO_CLIPPED, &r, txt.c_str(), (UINT)txt.size(), dx.data());
+      if (comp) {
+        if (st.bg != kBg) DwFill(r, st.bg);
+        DwGlyphs(r.left, y + g_textDy, st.fb ? g_dw.fallback[st.fb - 1] : g_dw.faces[st.font], st.fg, cps.data(),
+                 adv.data(), cps.size());
+      } else {
+        SelectObject(dc, st.fb ? g_fallback[st.fb - 1] : g_fonts[st.font]);
+        SetTextColor(dc, st.fg);
+        SetBkColor(dc, st.bg);
+        ExtTextOutW(dc, r.left, y + g_textDy, ETO_OPAQUE | ETO_CLIPPED, &r, txt.c_str(), (UINT)txt.size(), dx.data());
+      }
       if (st.underline || st.strike) {
         int ly = st.strike ? y + g_cellH / 2 : y + g_cellH - 2;
-        Fill(dc, RECT{r.left, ly, r.right, ly + 1}, st.fg);
+        if (comp) DwFill(RECT{r.left, ly, r.right, ly + 1}, st.fg);
+        else Fill(dc, RECT{r.left, ly, r.right, ly + 1}, st.fg);
       }
     }
+    if (comp) DwEnd(dc);
   }
   if (full) {
     DrawInput(dc, p, active, showFocus);
@@ -3536,12 +3741,20 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
     if (showFocus) {
       VTermScreenCell c;
       CellAt(p, p->cursor.row, p->cursor.col, &c);
-      std::wstring ch;
-      if (c.chars[0] && c.chars[0] != (uint32_t)-1) AppendUtf16(ch, c.chars[0]);
-      SetBkColor(dc, kFg);
-      SetTextColor(dc, kBg);
-      SelectObject(dc, g_fonts[0]);
-      ExtTextOutW(dc, cr.left, cr.top + g_textDy, ETO_OPAQUE | ETO_CLIPPED, &cr, ch.c_str(), (UINT)ch.size(), nullptr);
+      bool glyph = c.chars[0] && c.chars[0] != (uint32_t)-1;
+      if (DwBegin(cr, kFg)) {
+        uint32_t cp = glyph ? c.chars[0] : L' ';
+        float a = (float)g_cellW;
+        DwText(cr.left, cr.top + g_textDy, 0, kBg, &cp, &a, 1);
+        DwEnd(dc);
+      } else {
+        std::wstring ch;
+        if (glyph) AppendUtf16(ch, c.chars[0]);
+        SetBkColor(dc, kFg);
+        SetTextColor(dc, kBg);
+        SelectObject(dc, g_fonts[0]);
+        ExtTextOutW(dc, cr.left, cr.top + g_textDy, ETO_OPAQUE | ETO_CLIPPED, &cr, ch.c_str(), (UINT)ch.size(), nullptr);
+      }
     } else {
       HBRUSH b = CreateSolidBrush(kFg);
       FrameRect(dc, &cr, b);
@@ -4783,6 +4996,49 @@ static std::vector<std::wstring> OtherMonoFonts() {
   return out;
 }
 
+// Tests: the rendering mode DirectWrite picks and the face it really draws each style with (family, weight
+// —the wght axis of a variable font— and simulations). No brackets: the GDI part above is parsed by them.
+static std::wstring DwReport() {
+  if (!g_dw.on) return L" dwrite: off";
+  static const wchar_t* kMode[] = {L"default", L"aliased", L"gdi_classic", L"gdi_natural", L"natural", L"natural_symmetric", L"outline"};
+  DWRITE_RENDERING_MODE m = DWRITE_RENDERING_MODE_DEFAULT;
+  g_dw.faces[0]->GetRecommendedRenderingMode(g_dw.em, 1.0f, DWRITE_MEASURING_MODE_NATURAL, g_dw.params, &m);
+  std::wstring r = L" dwrite: " + std::wstring((unsigned)m < 7 ? kMode[m] : L"?");
+  for (IDWriteFontFace* f : g_dw.faces) {
+    std::wstring name = L"?";
+    int weight = 0;
+    IDWriteFontFace3* f3 = nullptr;
+    if (SUCCEEDED(f->QueryInterface(__uuidof(IDWriteFontFace3), (void**)&f3))) {
+      IDWriteLocalizedStrings* s = nullptr;
+      UINT32 i = 0, len = 0;
+      BOOL en = FALSE;
+      if (SUCCEEDED(f3->GetFamilyNames(&s)) && SUCCEEDED(s->FindLocaleName(L"en-us", &i, &en)) &&
+          SUCCEEDED(s->GetStringLength(en ? i : 0, &len))) {
+        name.assign(len + 1, L'\0');
+        s->GetString(en ? i : 0, &name[0], len + 1);
+        name.resize(len);
+      }
+      if (s) s->Release();
+      weight = f3->GetWeight();
+      if (f3->GetStyle() != DWRITE_FONT_STYLE_NORMAL) name += L" italic";
+      f3->Release();
+    }
+    IDWriteFontFace5* f5 = nullptr;
+    if (SUCCEEDED(f->QueryInterface(__uuidof(IDWriteFontFace5), (void**)&f5))) {
+      DWRITE_FONT_AXIS_VALUE v[8];
+      UINT32 n = std::min<UINT32>(f5->GetFontAxisValueCount(), 8);
+      if (f5->HasVariations() && SUCCEEDED(f5->GetFontAxisValues(v, n)))
+        for (UINT32 k = 0; k < n; k++)
+          if (v[k].axisTag == DWRITE_FONT_AXIS_TAG_WEIGHT) weight = (int)v[k].value;
+      f5->Release();
+    }
+    r += L" / " + name + L" " + std::to_wstring(weight);
+    if (f->GetSimulations() & DWRITE_FONT_SIMULATIONS_BOLD) r += L" +bold";
+    if (f->GetSimulations() & DWRITE_FONT_SIMULATIONS_OBLIQUE) r += L" +oblique";
+  }
+  return r;
+}
+
 // Tests: the face GDI really uses for each style («X Bold» is a real bold; «X Regular» with weight
 // 700 would be a synthesized one) and the cell size.
 static std::wstring FontReport() {
@@ -4800,6 +5056,7 @@ static std::wstring FontReport() {
       r += L" " + std::wstring(kStyle[i]) + L"=[" + (const wchar_t*)(buf.data() + (size_t)otm->otmpFullName) + L" " +
            std::to_wstring(otm->otmTextMetrics.tmWeight) + L"]";
   }
+  r += DwReport();
   if (!g_fontError.empty()) r += L" error=[" + g_fontError + L"]";
   return r;
 }
