@@ -55,6 +55,20 @@ for ($i = 0; $i -lt [math]::Max($want.Count, $got.Count); $i++) {
   if (-not $ok) { $fail++ }
   "{0} {1}" -f $(if ($ok) { 'OK  ' } else { 'FALLO' }), $(if ($i -lt $got.Count) { $got[$i] } else { "(falta) $($want[$i])" })
 }
+# Sesión guardada por una versión anterior (sin conversación): `claude` / `codex` a secas también reanudan.
+function Hex([string]$t) { -join ([Text.Encoding]::UTF8.GetBytes($t) | ForEach-Object { $_.ToString('x2') }) }
+Remove-Item "$dir\args.txt" -ErrorAction SilentlyContinue
+$old = "BW1`nactive 0`ntab 0 S 0 0.5`nL $(Hex 'claude --dangerously-skip-permissions') $(Hex $proj.FullName) run`nL $(Hex 'codex -c model=x') $(Hex $proj.FullName) run`n"
+[IO.File]::WriteAllText($env:WARPLITE_SESSION, $old)
+$p = Start-Process -FilePath "$dir\warp-lite.exe" -ArgumentList "--script `"wait|wait|wait|wait|wait|wait|wait|quit`"" -PassThru
+if (-not $p.WaitForExit(60000)) { $p.Kill(); "TIMEOUT 3" }
+$got3 = @(Get-Content "$dir\args.txt" -ErrorAction SilentlyContinue | Sort-Object)
+$want3 = @('claude --dangerously-skip-permissions --continue', 'codex -c model=x resume --last')
+for ($i = 0; $i -lt 2; $i++) {
+  $ok = $i -lt $got3.Count -and $got3[$i] -ceq $want3[$i]
+  if (-not $ok) { $fail++ }
+  "{0} antigua: {1}" -f $(if ($ok) { 'OK  ' } else { 'FALLO' }), $(if ($i -lt $got3.Count) { $got3[$i] } else { "(falta) $($want3[$i])" })
+}
 # Lo que lanzó la prueba (cmd de los falsos y sus ping) no se queda vivo.
 Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" | Where-Object { $_.CommandLine -like "*$dir\bin*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$dir\fake-*", "$dir\bin"

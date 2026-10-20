@@ -1044,6 +1044,16 @@ static std::string ResumeCommand(const std::string& cmd, const std::string& sess
   return head + opts + (session.empty() ? " resume --last" : " resume " + session);
 }
 
+// ¿Ya elige conversación? (claude --resume/--continue, codex resume)
+static bool PicksSession(const std::string& cmd) {
+  bool claude = AgentKind(cmd) == AGENT_CLAUDE;
+  for (const std::string& t : SplitArgs(cmd)) {
+    std::string name = t.substr(0, t.find('='));
+    if (claude ? name == "-c" || name == "--continue" || name == "-r" || name == "--resume" : name == "resume") return true;
+  }
+  return false;
+}
+
 struct AgentSession {
   std::string id;
   FILETIME mtime;
@@ -1245,6 +1255,12 @@ static Node* LoadNode(std::istringstream& in, std::vector<Pane*>& created) {
     } else {
       in.clear();
       in.seekg(pos2);
+    }
+    // Guardada sin conversación (por una versión anterior o sin encontrar su id): `claude` a secas
+    // también reanuda, la última de esa carpeta.
+    if (p->resumeRun && AgentKind(p->lastCmd) != AGENT_NONE && !PicksSession(p->lastCmd)) {
+      std::string r = ResumeCommand(p->lastCmd, "");
+      if (!r.empty()) p->lastCmd = r;
     }
     p->restoreCmd = p->lastCmd;
     p->node = n;

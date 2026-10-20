@@ -29,7 +29,7 @@ __asm__(".section .rdata,\"dr\"\n.balign 4\n"
 extern "C" const unsigned char warp_lite_exe[], warp_lite_exe_end[];
 
 static const wchar_t* kUninstallKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\warp-lite";
-static const wchar_t* kVersion = L"0.3.4";
+static const wchar_t* kVersion = L"0.3.5";
 // Nombre visible (se llamó warp-lite; la carpeta de instalación y la clave del registro lo conservan).
 static const wchar_t* kAppName = L"Warp";
 static bool g_silent = false;
