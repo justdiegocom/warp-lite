@@ -96,7 +96,7 @@ static const int kGap = 1;           // separación entre paneles (px)
 static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
-enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG };
+enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT };
 enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6 };
 
 // ---------------------------------------------------------------------------
@@ -185,6 +185,10 @@ static int g_activeTab = 0;
 static std::set<Pane*> g_live;
 static std::atomic<bool> g_dirtyPosted{false};
 static HFONT g_fonts[4];  // normal, negrita, cursiva, negrita+cursiva
+static std::wstring g_fontFace = L"Hack";  // terminal font family (title-bar menu → Font)
+static std::wstring g_fontLoading;          // font being downloaded (its progress replaces the toast)
+static std::atomic<int> g_fontPct{-1}, g_fontFile{0};  // download progress: % of file number g_fontFile
+static int g_fontFiles = 0;                 // files in that download
 static HFONT g_uiFont;
 static HFONT g_iconFont;  // Segoe MDL2 Assets: botones de ventana
 static const int kDefaultFontPx = 13;  // DEFAULT_MONOSPACE_FONT_SIZE de Warp
@@ -220,7 +224,7 @@ enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, 
            S_SEARCH_DIRS, S_PARENT_DIR, S_RENAME, S_HIDE, S_CLOSE_TAB, S_SHOW_ALL, S_HIDDEN_N, S_STARTUP,
            S_LOADING, S_KIND_CMD, S_KIND_DIR, S_KIND_FILE, S_KIND_PARAM, S_UPD_AVAIL, S_UPD_INSTALLING, S_UPD_READY,
            S_UPD_FAILED, S_UPD_INSTALL, S_UPD_RESTART, S_UPD_RETRY, S_UPD_CHECK, S_UPD_AUTO, S_UPD_LATEST, S_UPD_CHECKING,
-           S_UPD_OFFLINE, S_UPD_DOWNLOADING, S_SWITCH, S_OTHER_WINDOW, S_COUNT };
+           S_UPD_OFFLINE, S_UPD_DOWNLOADING, S_SWITCH, S_OTHER_WINDOW, S_FONT_MENU, S_OTHER_FONTS, S_FONT_FAILED, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
@@ -228,7 +232,8 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"%d hidden", L"Start with Windows", L"Loading…", L"Command", L"Folder", L"File", L"Parameter",
      L"Warp %s is available", L"Installing %s…", L"Updated to %s", L"Couldn't update to %s", L"Install", L"Restart",
      L"Retry", L"Check for updates", L"Update automatically", L"Warp is up to date", L"Checking for updates…",
-     L"Couldn't check for updates", L"Downloading %s…", L"Search terminals…", L"other window"},
+     L"Couldn't check for updates", L"Downloading %s…", L"Search terminals…", L"other window", L"Font",
+     L"Other installed", L"Couldn't download %s"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
@@ -236,7 +241,8 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Parámetro", L"Warp %s disponible", L"Instalando %s…", L"Actualizado a %s", L"No se pudo actualizar a %s",
      L"Instalar", L"Reiniciar", L"Reintentar", L"Buscar actualizaciones", L"Actualizar automáticamente",
      L"Warp está al día", L"Buscando actualizaciones…", L"No se pudo comprobar si hay actualizaciones",
-     L"Descargando %s…", L"Buscar terminales…", L"otra ventana"},
+     L"Descargando %s…", L"Buscar terminales…", L"otra ventana", L"Fuente", L"Otras instaladas",
+     L"No se pudo descargar %s"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -3276,20 +3282,20 @@ static void MakeFonts() {
     if (f) DeleteObject(f), f = nullptr;
   if (g_uiFont) DeleteObject(g_uiFont);
   int h = -MulDiv(g_fontPx, ScaledDpi(), 96);
-  const wchar_t* face = L"Hack";
+  std::wstring face = g_fontFace;
   HDC dc = GetDC(nullptr);
   for (int i = 0; i < 4; i++) {
     g_fonts[i] = CreateFontW(h, 0, 0, 0, (i & 1) ? FW_BOLD : FW_NORMAL, (i & 2) ? TRUE : FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                             FIXED_PITCH | FF_MODERN, face);
+                             FIXED_PITCH | FF_MODERN, face.c_str());
     if (i == 0) {
       HGDIOBJ old = SelectObject(dc, g_fonts[0]);
       wchar_t got[64];
       GetTextFaceW(dc, 64, got);
       SelectObject(dc, old);
-      if (_wcsicmp(got, face) != 0) {  // si Hack no cargara: Consolas
+      if (_wcsicmp(got, face.c_str()) != 0 && face != L"Consolas") {  // face missing: Hack, then Consolas
         DeleteObject(g_fonts[0]);
-        face = L"Consolas";
+        face = face == L"Hack" ? L"Consolas" : L"Hack";
         i = -1;
         continue;
       }
@@ -3691,9 +3697,17 @@ static void DrawTitleBar(HDC dc, int w, int h) {
     if (g_hoverHit == HIT_HIDDEN) Fill(dc, L.hiddenBtn, RGB(0x1a, 0x1a, 0x1a));
     Text(dc, Tf(S_HIDDEN_N, HiddenCount()), L.hiddenBtn, g_hoverHit == HIT_HIDDEN ? kFg : kTabText, DT_CENTER);
   }
-  if (!g_toast.empty()) {
+  std::wstring toast = g_toast;
+  if (!g_fontLoading.empty()) {  // font download in progress
+    wchar_t b[160];
+    swprintf(b, 160, T(S_UPD_DOWNLOADING), g_fontLoading.c_str());
+    int pct = g_fontPct;
+    if (pct >= 0 && g_fontFiles) swprintf(b + wcslen(b), 160 - wcslen(b), L" %d %%", (g_fontFile * 100 + pct) / g_fontFiles);
+    toast = b;
+  }
+  if (!toast.empty()) {
     RECT tr{L.end + Px(10), 0, w - 3 * WinBtnW() - Px(12), th};
-    Text(dc, g_toast, tr, kFg, DT_RIGHT);
+    Text(dc, toast, tr, kFg, DT_RIGHT);
   }
   // Minimizar, maximizar/restaurar, cerrar
   SelectObject(dc, g_iconFont);
@@ -4129,6 +4143,7 @@ static bool SaveScreenshot(const std::wstring& path) {
 //   type:<texto> enter splitR splitD tab close-pane left right up down swap-<dir> rename:<nombre>
 //   zoom:<%> move:x,y,w,h maximize rename-start rename-type:<texto> shot:<fichero.bmp> wait quit
 //   auto-update:on|off update-check update-click update-state key:<tab|down|up|enter|esc> edit-text comp drag-tab:<de>,<a> tabs clipboard (estos y hover/hover-text dejan el resultado en <sesión>.bench)
+//   font:<family> font-wait font font-others toast (font, font-others and toast also write to <session>.bench)
 
 static void SetStartWithWindows(bool on);
 
@@ -4484,6 +4499,289 @@ static void UpdateAction() {
   else if (g_upd.stage == UPD_READY) RestartForUpdate();
 }
 
+// ---------------------------------------------------------------------------
+// Fonts (title-bar menu → Font). Hack is embedded and Consolas comes with Windows; the others are
+// downloaded on first use from the google/fonts repo (Cascadia Mono only if Windows lacks it) into
+// %LOCALAPPDATA%\warp-lite\fonts and loaded for this process only. The choice applies to every
+// window of this Warp and survives restarts.
+
+struct FontChoice {
+  const wchar_t* face;
+  const wchar_t* files[4];  // paths in google/fonts; the last segment is the cached file name
+};
+static const FontChoice kFonts[] = {
+    {L"Hack", {}},
+    {L"Cascadia Mono", {L"ofl/cascadiamono/CascadiaMono[wght].ttf", L"ofl/cascadiamono/CascadiaMono-Italic[wght].ttf"}},
+    {L"Consolas", {}},
+    {L"JetBrains Mono", {L"ofl/jetbrainsmono/JetBrainsMono[wght].ttf", L"ofl/jetbrainsmono/JetBrainsMono-Italic[wght].ttf"}},
+    {L"Fira Code", {L"ofl/firacode/FiraCode[wght].ttf"}},
+    {L"Source Code Pro", {L"ofl/sourcecodepro/SourceCodePro[wght].ttf", L"ofl/sourcecodepro/SourceCodePro-Italic[wght].ttf"}},
+    {L"Roboto Mono", {L"ofl/robotomono/RobotoMono[wght].ttf", L"ofl/robotomono/RobotoMono-Italic[wght].ttf"}},
+    {L"IBM Plex Mono", {L"ofl/ibmplexmono/IBMPlexMono-Regular.ttf", L"ofl/ibmplexmono/IBMPlexMono-Bold.ttf",
+                        L"ofl/ibmplexmono/IBMPlexMono-Italic.ttf", L"ofl/ibmplexmono/IBMPlexMono-BoldItalic.ttf"}},
+    {L"Ubuntu Mono", {L"ufl/ubuntumono/UbuntuMono-Regular.ttf", L"ufl/ubuntumono/UbuntuMono-Bold.ttf",
+                      L"ufl/ubuntumono/UbuntuMono-Italic.ttf", L"ufl/ubuntumono/UbuntuMono-BoldItalic.ttf"}},
+    {L"Inconsolata", {L"ofl/inconsolata/Inconsolata[wdth,wght].ttf"}},
+};
+static const int kFontCount = sizeof kFonts / sizeof kFonts[0];
+static const int kBuiltinFonts = 3;  // Hack, Cascadia Mono, Consolas; the downloaded ones go after a separator
+static const wchar_t* kFontUrl = L"https://raw.githubusercontent.com/google/fonts/main/";
+static UINT g_msgFont;              // another window changed the font: reload it from the settings
+static std::wstring g_fontWanted;   // switch to this font when its download finishes
+static std::wstring g_fontError;    // why the last download failed (tests)
+static std::set<std::wstring> g_fontFilesLoaded;  // cached files already added to this process
+
+// Tests (WARPLITE_SESSION / WARPLITE_DIR) keep their downloads next to their session.
+static std::wstring FontCacheDir() {
+  wchar_t buf[MAX_PATH];
+  if (g_windowDir.empty()) return g_sessionPath + L".fonts";
+  if (GetEnvironmentVariableW(L"WARPLITE_DIR", buf, MAX_PATH) || !GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH))
+    return g_windowDir + L"\\fonts";
+  return std::wstring(buf) + L"\\warp-lite\\fonts";
+}
+
+static std::wstring FontSettingsPath() {
+  return g_windowDir.empty() ? g_sessionPath + L".font" : g_windowDir + L"\\font.txt";
+}
+
+static std::wstring ReadFontSetting() {
+  std::string s;
+  if (FILE* f = _wfopen(FontSettingsPath().c_str(), L"rb")) {
+    char b[256];
+    s.assign(b, fread(b, 1, sizeof b, f));
+    fclose(f);
+  }
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+  return ToWide(s);
+}
+
+static void SaveFontSetting() {
+  if (FILE* f = _wfopen(FontSettingsPath().c_str(), L"wb")) {
+    std::string s = ToUtf8(g_fontFace) + "\n";
+    fwrite(s.data(), 1, s.size(), f);
+    fclose(f);
+  }
+}
+
+static const FontChoice* FindFont(const std::wstring& face) {
+  for (auto& f : kFonts)
+    if (!_wcsicmp(f.face, face.c_str())) return &f;
+  return nullptr;
+}
+
+static std::wstring FontFileName(const wchar_t* path) {
+  const wchar_t* s = wcsrchr(path, L'/');
+  return s ? s + 1 : path;
+}
+
+// Can GDI use this family in this process (installed, embedded or loaded from the cache)?
+static bool FontInstalled(const std::wstring& face) {
+  if (face.empty() || face.size() >= LF_FACESIZE) return false;
+  LOGFONTW lf{};
+  lf.lfCharSet = DEFAULT_CHARSET;
+  wcscpy(lf.lfFaceName, face.c_str());
+  bool found = false;
+  HDC dc = GetDC(nullptr);
+  EnumFontFamiliesExW(dc, &lf, [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM lp) -> int { return *(bool*)lp = true, 0; },
+                      (LPARAM)&found, 0);
+  ReleaseDC(nullptr, dc);
+  return found;
+}
+
+// Adds the cached files of a downloadable font to this process. False if one is missing or broken
+// (a broken one is deleted, so that the next try downloads it again).
+static bool LoadFontFiles(const std::wstring& face) {
+  const FontChoice* c = FindFont(face);
+  if (!c || !c->files[0]) return false;
+  for (const wchar_t* f : c->files) {
+    if (!f) break;
+    std::wstring path = FontCacheDir() + L"\\" + FontFileName(f);
+    if (g_fontFilesLoaded.count(path)) continue;
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+    if (!AddFontResourceExW(path.c_str(), FR_PRIVATE, nullptr)) {
+      DeleteFileW(path.c_str());
+      return false;
+    }
+    g_fontFilesLoaded.insert(path);
+  }
+  return FontInstalled(face);
+}
+
+struct FontJob {
+  std::wstring face, dir;
+  std::vector<std::wstring> urls, files;  // what to download and its name in dir
+  bool allowHttp = false;
+  bool ok = false;
+  std::wstring error;
+};
+
+static DWORD WINAPI FontDownloadThread(LPVOID arg) {
+  auto* job = (FontJob*)arg;
+  SHCreateDirectoryExW(nullptr, job->dir.c_str(), nullptr);
+  job->ok = true;
+  for (size_t i = 0; job->ok && i < job->urls.size(); i++) {
+    g_fontFile = (int)i, g_fontPct = -1;
+    std::string data;
+    std::wstring path = job->dir + L"\\" + job->files[i], tmp = path + L".tmp";
+    if (!HttpGet(job->urls[i], data, 32 << 20, job->allowHttp, &job->error, &g_fontPct)) {
+      job->ok = false;
+    } else if (data.size() < 12 || (data.compare(0, 4, std::string("\0\1\0\0", 4)) && data.compare(0, 4, "OTTO") &&
+                                    data.compare(0, 4, "true"))) {
+      job->ok = false, job->error = L"not a font";
+    } else {
+      HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+      DWORD w = 0;
+      bool written = f != INVALID_HANDLE_VALUE && WriteFile(f, data.data(), (DWORD)data.size(), &w, nullptr) && w == data.size();
+      if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+      // If another window has the file loaded already, it is complete: that one stays.
+      if (!written || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) job->ok = false, job->error = L"write";
+      }
+    }
+  }
+  if (!PostMessage(g_hwnd, WM_APP_FONT, 0, (LPARAM)job)) delete job;
+  return 0;
+}
+
+static void FontFailed(const std::wstring& face) {
+  wchar_t b[160];
+  swprintf(b, 160, T(S_FONT_FAILED), face.c_str());
+  Toast(b, 4000);
+}
+
+static void StartFontDownload(const FontChoice& c) {
+  auto* job = new FontJob;
+  job->face = c.face;
+  job->dir = FontCacheDir();
+  wchar_t buf[2048];
+  std::wstring base = GetEnvironmentVariableW(L"WARPLITE_FONT_URL", buf, 2048) ? buf : kFontUrl;  // tests: another server
+  job->allowHttp = base != kFontUrl;
+  for (const wchar_t* f : c.files) {
+    if (!f) break;
+    std::wstring name = FontFileName(f);
+    if (GetFileAttributesW((job->dir + L"\\" + name).c_str()) != INVALID_FILE_ATTRIBUTES) continue;  // from an earlier try
+    std::wstring url = base;
+    for (const wchar_t* p = f; *p; p++) {
+      if (*p == L'[') url += L"%5B";
+      else if (*p == L']') url += L"%5D";
+      else if (*p == L',') url += L"%2C";
+      else url += *p;
+    }
+    job->urls.push_back(url);
+    job->files.push_back(name);
+  }
+  g_fontWanted = g_fontLoading = c.face;
+  g_fontError.clear();
+  g_fontFiles = std::max(1, (int)job->urls.size());
+  g_fontFile = 0, g_fontPct = -1;
+  HANDLE t = CreateThread(nullptr, 0, FontDownloadThread, job, 0, nullptr);
+  if (t) CloseHandle(t);
+  else delete job, g_fontLoading.clear(), FontFailed(c.face);
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Switches this window to face: new fonts and cell size, and every terminal resized to it.
+static void ApplyTerminalFont(const std::wstring& face) {
+  g_fontFace = face;
+  g_fbCache.clear();  // which characters the main font lacks
+  MakeFonts();
+  Relayout();
+}
+
+// Chosen in this window: applied, saved and announced to the other windows of this Warp.
+static void UseFont(const std::wstring& face) {
+  ApplyTerminalFont(face);
+  SaveFontSetting();
+  for (HWND h : SiblingWindows()) PostMessageW(h, g_msgFont, 0, 0);
+  Toast(face);
+}
+
+static void OnFontDownloaded(FontJob* job) {
+  g_fontLoading.clear();
+  bool wanted = job->face == g_fontWanted;
+  g_fontWanted.clear();
+  if (job->ok && LoadFontFiles(job->face)) {
+    if (wanted && _wcsicmp(job->face.c_str(), g_fontFace.c_str())) UseFont(job->face);
+  } else {
+    g_fontError = job->ok ? L"load" : job->error;
+    FontFailed(job->face);  // the current font stays
+  }
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Title-bar menu: an available font applies at once; one from the list is downloaded first.
+static void SetTerminalFont(const std::wstring& face) {
+  if (FontInstalled(face) || LoadFontFiles(face)) {
+    g_fontWanted.clear();  // a download in progress no longer switches the font
+    if (_wcsicmp(face.c_str(), g_fontFace.c_str())) UseFont(face);
+    return;
+  }
+  const FontChoice* c = FindFont(face);
+  if (!c || !c->files[0]) return;
+  if (g_fontLoading.empty()) StartFontDownload(*c);
+  else if (face == g_fontLoading) g_fontWanted = face;  // one download at a time
+}
+
+// Saved font, before the window is created (after the embedded fonts: it may be Hack).
+static void LoadFontSetting() {
+  std::wstring face = ReadFontSetting();
+  if (!face.empty() && (FontInstalled(face) || LoadFontFiles(face))) g_fontFace = face;
+}
+
+// Other monospaced families installed in Windows (menu → Font → Other installed), sorted. Without
+// vertical (@) fonts, the ones already in the menu, and the weights of a family (Cascadia Mono SemiBold).
+static std::vector<std::wstring> OtherMonoFonts() {
+  std::set<std::wstring> all;
+  LOGFONTW lf{};
+  lf.lfCharSet = DEFAULT_CHARSET;
+  HDC dc = GetDC(nullptr);
+  EnumFontFamiliesExW(
+      dc, &lf,
+      [](const LOGFONTW* l, const TEXTMETRICW*, DWORD type, LPARAM lp) -> int {
+        if (!(type & RASTER_FONTTYPE) && (l->lfPitchAndFamily & 3) == FIXED_PITCH && l->lfFaceName[0] != L'@' &&
+            l->lfCharSet != SYMBOL_CHARSET)
+          ((std::set<std::wstring>*)lp)->insert(l->lfFaceName);
+        return 1;
+      },
+      (LPARAM)&all, 0);
+  ReleaseDC(nullptr, dc);
+  auto weightOf = [](const std::wstring& n, const wchar_t* family) {
+    size_t k = wcslen(family);
+    return n.size() > k + 1 && n[k] == L' ' && !_wcsnicmp(n.c_str(), family, k);
+  };
+  std::vector<std::wstring> out;
+  for (auto& n : all) {
+    bool skip = !_wcsicmp(n.c_str(), kFallbackFaces[0]);  // Symbols Nerd Font Mono: the embedded icons
+    for (auto& f : kFonts) skip = skip || !_wcsicmp(n.c_str(), f.face) || weightOf(n, f.face);
+    for (auto& k : all) skip = skip || weightOf(n, k.c_str());
+    if (!skip) out.push_back(n);
+  }
+  std::sort(out.begin(), out.end(), [](const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
+  return out;
+}
+
+// Tests: the face GDI really uses for each style («X Bold» is a real bold; «X Regular» with weight
+// 700 would be a synthesized one) and the cell size.
+static std::wstring FontReport() {
+  static const wchar_t* kStyle[] = {L"regular", L"bold", L"italic", L"bolditalic"};
+  wchar_t face[64] = L"";
+  SelectObject(g_measureDC, g_fonts[0]);
+  GetTextFaceW(g_measureDC, 64, face);
+  std::wstring r = L"font: [" + std::wstring(face) + L"] " + std::to_wstring(g_cellW) + L"x" + std::to_wstring(g_cellH);
+  if (_wcsicmp(face, g_fontFace.c_str())) r += L" (setting " + g_fontFace + L")";
+  for (int i = 0; i < 4; i++) {
+    SelectObject(g_measureDC, g_fonts[i]);
+    std::vector<char> buf(GetOutlineTextMetricsW(g_measureDC, 0, nullptr));
+    auto* otm = (OUTLINETEXTMETRICW*)buf.data();
+    if (buf.size() >= sizeof *otm && GetOutlineTextMetricsW(g_measureDC, (UINT)buf.size(), otm))
+      r += L" " + std::wstring(kStyle[i]) + L"=[" + (const wchar_t*)(buf.data() + (size_t)otm->otmpFullName) + L" " +
+           std::to_wstring(otm->otmTextMetrics.tmWeight) + L"]";
+  }
+  if (!g_fontError.empty()) r += L" error=[" + g_fontError + L"]";
+  return r;
+}
+
 // Resultado de un paso, una línea en <sesión>.bench (lo leen los wintest-*.ps1).
 static void ScriptLog(const std::wstring& r) {
   std::string u = ToUtf8(r) + "\n";
@@ -4718,6 +5016,22 @@ static void RunScriptStep() {
   } else if (s.rfind(L"zoom:", 0) == 0) {
     SetZoom(_wtoi(s.substr(5).c_str()));
     delay = 600;
+  } else if (s.rfind(L"font:", 0) == 0) {  // as if chosen in the title-bar menu
+    SetTerminalFont(s.substr(5));
+    delay = 600;
+  } else if (s == L"font-wait") {  // until the font download finishes (a minute at most)
+    static int waited = 0;
+    if (!g_fontLoading.empty() && ++waited < 200) g_scriptPos--, delay = 300;
+    else waited = 0, delay = 300;
+  } else if (s == L"font") {
+    ScriptLog(FontReport());
+  } else if (s == L"font-others") {  // menu → Font → Other installed
+    std::vector<std::wstring> v = OtherMonoFonts();
+    std::wstring r = L"font-others: " + std::to_wstring(v.size());
+    for (auto& n : v) r += L" [" + n + L"]";
+    ScriptLog(r);
+  } else if (s == L"toast") {
+    ScriptLog(L"toast: " + g_toast);
   } else if (s.rfind(L"shot:", 0) == 0) SaveScreenshot(s.substr(5)), delay = 200;
   else if (s == L"quit") {
     PostMessage(g_hwnd, WM_CLOSE, 0, 0);
@@ -4814,10 +5128,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_NCRBUTTONUP:
       if (wp == HTCAPTION) {  // clic derecho en la barra de título: idioma e iniciar con Windows
-        HMENU menu = CreatePopupMenu(), sub = CreatePopupMenu();
+        HMENU menu = CreatePopupMenu(), sub = CreatePopupMenu(), fonts = CreatePopupMenu(), others = CreatePopupMenu();
         for (int i = 0; i < kLangCount; i++)
           AppendMenuW(sub, MF_STRING | (i == g_lang ? MF_CHECKED : 0), 100 + i, kLangNames[i]);
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, T(S_LANGUAGE));
+        // Font: built-in, downloaded on first use, and the other monospaced ones installed.
+        for (int i = 0; i < kFontCount; i++) {
+          if (i == kBuiltinFonts) AppendMenuW(fonts, MF_SEPARATOR, 0, nullptr);
+          AppendMenuW(fonts, MF_STRING | (!_wcsicmp(g_fontFace.c_str(), kFonts[i].face) ? MF_CHECKED : 0), 200 + i, kFonts[i].face);
+        }
+        std::vector<std::wstring> mono = OtherMonoFonts();
+        if (mono.size() > 500) mono.resize(500);
+        for (size_t i = 0; i < mono.size(); i++)
+          AppendMenuW(others, MF_STRING | (mono[i] == g_fontFace ? MF_CHECKED : 0), 1000 + i, mono[i].c_str());
+        AppendMenuW(fonts, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(fonts, MF_POPUP | (mono.empty() ? MF_GRAYED : 0), (UINT_PTR)others, T(S_OTHER_FONTS));
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)fonts, T(S_FONT_MENU));
         AppendMenuW(menu, MF_STRING | (StartsWithWindows() ? MF_CHECKED : 0), 1, T(S_STARTUP));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         wchar_t upd[160] = L"";
@@ -4842,6 +5168,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           SaveSession();
           InvalidateRect(hwnd, nullptr, FALSE);
         }
+        if (cmd >= 200 && cmd < 200 + kFontCount) SetTerminalFont(kFonts[cmd - 200].face);
+        if (cmd >= 1000 && cmd < 1000 + (int)mono.size()) SetTerminalFont(mono[cmd - 1000]);
         return 0;
       }
       break;
@@ -4872,6 +5200,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_UPDPROG: InvalidateRect(hwnd, nullptr, FALSE); return 0;
     case WM_APP_UPDATE: OnUpdateReply(std::unique_ptr<UpdateReply>((UpdateReply*)lp).get()); return 0;
     case WM_APP_UPDATED: OnUpdateInstalled(std::unique_ptr<InstallJob>((InstallJob*)lp).get()); return 0;
+    case WM_APP_FONT: OnFontDownloaded(std::unique_ptr<FontJob>((FontJob*)lp).get()); return 0;
     case WM_APP_PARAMS: {  // parámetros de una orden, de ParamsThread
       std::unique_ptr<ParamsReply> r((ParamsReply*)lp);
       std::wstring low = Lower(r->cmd);
@@ -5351,6 +5680,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     FocusPane((int)wp, (int)lp);
     return 0;
   }
+  if (msg == g_msgFont && g_msgFont) {  // another window changed the font
+    std::wstring face = ReadFontSetting();
+    if (!face.empty() && _wcsicmp(face.c_str(), g_fontFace.c_str()) && (FontInstalled(face) || LoadFontFiles(face)))
+      ApplyTerminalFont(face);
+    return 0;
+  }
   if (msg == WM_COPYDATA) {
     auto* cd = (COPYDATASTRUCT*)lp;
     std::wstring t(cd->lpData ? (const wchar_t*)cd->lpData : L"", cd->cbData / sizeof(wchar_t));
@@ -5467,6 +5802,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   g_msgUpdated = RegisterWindowMessageW(L"warp-lite-updated");
   g_msgListPanes = RegisterWindowMessageW(L"warp-lite-list-panes");
   g_msgFocusPane = RegisterWindowMessageW(L"warp-lite-focus-pane");
+  g_msgFont = RegisterWindowMessageW(L"warp-lite-font");
   if (!g_openDir.empty()) {
     // El Explorador pasa "C:\" y Windows lo lee como «C:"»: se arregla la barra del final.
     while (!g_openDir.empty() && (g_openDir.back() == L' ' || g_openDir.back() == L'\t')) g_openDir.pop_back();
@@ -5515,6 +5851,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     DWORD n = 0;
     AddFontMemResourceEx((void*)f.a, (DWORD)(f.b - f.a), nullptr, &n);
   }
+  LoadFontSetting();
 
   WNDCLASSEXW wc{sizeof wc};
   wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;

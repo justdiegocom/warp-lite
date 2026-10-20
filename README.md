@@ -16,6 +16,7 @@ A small, fast terminal for Windows with the look and shortcuts of [Warp](https:/
 - `Ctrl+F` search, `Ctrl+click` links (also when wrapped over two lines), drop files to paste their path, `Ctrl +/-` zoom.
 - `Ctrl+C` copies the selection; text copied inside tmux/vim over SSH reaches the Windows clipboard (OSC 52).
 - Warp's dark theme and font (Hack 13 px), with Nerd Font icons and symbol fallback built in.
+- **Choose the font** by right-clicking the title bar: Hack, Cascadia Mono, Consolas, JetBrains Mono, Fira Code and other Google Fonts (downloaded once, the first time you pick them), or any other monospaced font you have installed. It changes in every window at once.
 - Light on CPU: only the rows that change are redrawn.
 
 ![Vertical tabs](docs/screenshot-vertical.png)
