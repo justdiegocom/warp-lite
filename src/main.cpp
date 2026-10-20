@@ -95,8 +95,8 @@ static const int kGap = 1;           // separación entre paneles (px)
 static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
-enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED };
-enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5 };
+enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG };
+enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6 };
 
 // ---------------------------------------------------------------------------
 // Modelo: pestañas -> árbol de paneles
@@ -208,6 +208,8 @@ struct UpdateState {
   RECT rc{}, action{}, close{};
 };
 static UpdateState g_upd;
+static std::atomic<int> g_updPct{-1};    // % descargado (-1: aún no se sabe)
+static std::atomic<int> g_updPhase{0};   // 0 descargando, 1 instalando
 static UINT g_msgUpdated;  // otra ventana ha instalado una versión: todas muestran «Reiniciar»
 
 // Textos de la interfaz: inglés por defecto; se cambia con clic derecho en la barra de título.
@@ -215,22 +217,23 @@ enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, 
            S_SEARCH_DIRS, S_PARENT_DIR, S_RENAME, S_HIDE, S_CLOSE_TAB, S_SHOW_ALL, S_HIDDEN_N, S_STARTUP,
            S_LOADING, S_KIND_CMD, S_KIND_DIR, S_KIND_FILE, S_KIND_PARAM, S_UPD_AVAIL, S_UPD_INSTALLING, S_UPD_READY,
            S_UPD_FAILED, S_UPD_INSTALL, S_UPD_RESTART, S_UPD_RETRY, S_UPD_CHECK, S_UPD_AUTO, S_UPD_LATEST, S_UPD_CHECKING,
-           S_UPD_OFFLINE, S_COUNT };
+           S_UPD_OFFLINE, S_UPD_DOWNLOADING, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
      L"Search directories…", L".. (Parent directory)", L"Rename", L"Hide tab", L"Close tab", L"Show all",
      L"%d hidden", L"Start with Windows", L"Loading…", L"Command", L"Folder", L"File", L"Parameter",
-     L"Warp %s is available", L"Updating to %s…", L"Updated to %s", L"Couldn't update to %s", L"Install", L"Restart",
+     L"Warp %s is available", L"Installing %s…", L"Updated to %s", L"Couldn't update to %s", L"Install", L"Restart",
      L"Retry", L"Check for updates", L"Update automatically", L"Warp is up to date", L"Checking for updates…",
-     L"Couldn't check for updates"},
+     L"Couldn't check for updates", L"Downloading %s…"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
      L"Mostrar todas", L"%d ocultas", L"Iniciar con Windows", L"Cargando…", L"Orden", L"Carpeta", L"Archivo",
-     L"Parámetro", L"Warp %s disponible", L"Actualizando a %s…", L"Actualizado a %s", L"No se pudo actualizar a %s",
+     L"Parámetro", L"Warp %s disponible", L"Instalando %s…", L"Actualizado a %s", L"No se pudo actualizar a %s",
      L"Instalar", L"Reiniciar", L"Reintentar", L"Buscar actualizaciones", L"Actualizar automáticamente",
-     L"Warp está al día", L"Buscando actualizaciones…", L"No se pudo comprobar si hay actualizaciones"},
+     L"Warp está al día", L"Buscando actualizaciones…", L"No se pudo comprobar si hay actualizaciones",
+     L"Descargando %s…"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -3212,7 +3215,14 @@ static void DrawUpdateNotice(HDC dc, int w, int h) {
   if (g_upd.stage == UPD_NONE || g_upd.hidden) return;
   static const Str kMsg[] = {S_UPD_AVAIL, S_UPD_AVAIL, S_UPD_INSTALLING, S_UPD_READY, S_UPD_FAILED};
   wchar_t msg[160];
-  swprintf(msg, 160, T(kMsg[g_upd.stage]), g_upd.latest.c_str());
+  bool busy = g_upd.stage == UPD_INSTALLING;
+  int pct = g_updPct;
+  if (busy && g_updPhase == 0) {
+    swprintf(msg, 160, T(S_UPD_DOWNLOADING), g_upd.latest.c_str());
+    if (pct >= 0) swprintf(msg + wcslen(msg), 160 - wcslen(msg), L" %d %%", pct);
+  } else {
+    swprintf(msg, 160, T(kMsg[g_upd.stage]), g_upd.latest.c_str());
+  }
   const wchar_t* act = g_upd.stage == UPD_AVAILABLE ? T(S_UPD_INSTALL)
                        : g_upd.stage == UPD_READY   ? T(S_UPD_RESTART)
                        : g_upd.stage == UPD_FAILED  ? T(S_UPD_RETRY)
@@ -3223,6 +3233,7 @@ static void DrawUpdateNotice(HDC dc, int w, int h) {
   if (act) GetTextExtentPoint32W(dc, act, (int)wcslen(act), &as);
   int bh = Px(40), aw = act ? as.cx + Px(20) : 0, cw = Px(28);
   int cardW = Px(14) + ms.cx + Px(12) + aw + Px(4) + cw + Px(4);
+  if (busy) cardW = std::max<int>(cardW, Px(300));  // que no baile al cambiar el % 
   RECT r{w - cardW - Px(14), h - bh - Px(14), w - Px(14), h - Px(14)};
   g_upd.rc = r;
   Panel(dc, r);
@@ -3236,6 +3247,17 @@ static void DrawUpdateNotice(HDC dc, int w, int h) {
   }
   g_upd.close = RECT{r.right - cw - Px(4), r.top + Px(6), r.right - Px(4), r.bottom - Px(6)};
   Text(dc, L"\u00d7", g_upd.close, kTabText, DT_CENTER);
+  if (busy) {  // barra de progreso fina abajo: % al descargar, en movimiento al instalar
+    RECT bar{r.left + Px(10), r.bottom - Px(5), r.right - Px(10), r.bottom - Px(3)};
+    Fill(dc, bar, kChipBorder);
+    int bw = bar.right - bar.left;
+    if (g_updPhase == 0 && pct >= 0) {
+      Fill(dc, RECT{bar.left, bar.top, bar.left + bw * pct / 100, bar.bottom}, kAccent);
+    } else {
+      int seg = bw / 4, x = (int)(GetTickCount64() / 4 % (DWORD)(bw + seg)) - seg;
+      Fill(dc, RECT{bar.left + std::max(0, x), bar.top, bar.left + std::min(bw, x + seg), bar.bottom}, kAccent);
+    }
+  }
   SetBkMode(dc, OPAQUE);
 }
 
@@ -3503,6 +3525,18 @@ static std::wstring UpdateSettingsPath() {
   return g_windowDir.empty() ? g_sessionPath + L".update" : g_windowDir + L"\\update.txt";
 }
 
+// update.log: una línea por intento (para saber por qué falló, si falla).
+static void UpdateLog(const std::wstring& line) {
+  std::wstring path = g_windowDir.empty() ? g_sessionPath + L".updlog" : g_windowDir + L"\\update.log";
+  if (FILE* f = _wfopen(path.c_str(), L"a")) {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d %s\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond,
+            ToUtf8(line).c_str());
+    fclose(f);
+  }
+}
+
 static void LoadUpdateSettings() {
   FILE* f = _wfopen(UpdateSettingsPath().c_str(), L"r");
   if (!f) return;
@@ -3520,18 +3554,23 @@ static void SaveUpdateSettings() {
   }
 }
 
-static bool HttpGet(const std::wstring& url, std::string& out, size_t maxBytes, bool allowHttp) {
+static bool HttpGet(const std::wstring& url, std::string& out, size_t maxBytes, bool allowHttp, std::wstring* err = nullptr,
+                    std::atomic<int>* pct = nullptr) {
+  auto fail = [&](const wchar_t* what) {
+    if (err && err->empty()) *err = std::wstring(what) + L" (" + std::to_wstring(GetLastError()) + L")";
+    return false;
+  };
   wchar_t host[256], path[2048], extra[2048];
   URL_COMPONENTS uc{sizeof uc};
   uc.lpszHostName = host, uc.dwHostNameLength = 256;
   uc.lpszUrlPath = path, uc.dwUrlPathLength = 2048;
   uc.lpszExtraInfo = extra, uc.dwExtraInfoLength = 2048;
-  if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return false;
+  if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return fail(L"url");
   bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
-  if (!https && !allowHttp) return false;
+  if (!https && !allowHttp) return fail(L"http");
   std::wstring ua = L"warp-lite/" + g_upd.running;
   HINTERNET s = WinHttpOpen(ua.c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!s) return false;
+  if (!s) return fail(L"open");
   WinHttpSetTimeouts(s, 10000, 10000, 15000, 60000);
   bool ok = false;
   if (HINTERNET c = WinHttpConnect(s, host, uc.nPort, 0)) {
@@ -3544,25 +3583,36 @@ static bool HttpGet(const std::wstring& url, std::string& out, size_t maxBytes, 
         WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status,
                             &sz, WINHTTP_NO_HEADER_INDEX);
         ok = status == 200;
+        if (!ok && err) *err = L"HTTP " + std::to_wstring(status);
+        DWORD total = 0;
+        sz = sizeof total;
+        if (pct && !WinHttpQueryHeaders(r, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                                        &total, &sz, WINHTTP_NO_HEADER_INDEX))
+          total = 0;
         DWORD avail = 0;
         while (ok && WinHttpQueryDataAvailable(r, &avail) && avail) {
           size_t at = out.size();
           if (at + avail > maxBytes) {
-            ok = false;
+            ok = fail(L"too big");
             break;
           }
           out.resize(at + avail);
           DWORD got = 0;
-          if (!WinHttpReadData(r, out.data() + at, avail, &got)) ok = false;
+          if (!WinHttpReadData(r, out.data() + at, avail, &got)) ok = fail(L"read");
           out.resize(at + got);
+          if (pct && total) {
+            int v = (int)std::min<uint64_t>(100, out.size() * 100ull / total);
+            if (pct->exchange(v) != v) PostMessage(g_hwnd, WM_APP_UPDPROG, 0, 0);
+          }
         }
       }
+      else fail(L"send");
       WinHttpCloseHandle(r);
     }
     WinHttpCloseHandle(c);
   }
   WinHttpCloseHandle(s);
-  return ok;
+  return ok || fail(L"connect");
 }
 
 // Valor de texto de "clave": "..." en el JSON a partir de from (las releases no llevan escapes ahí).
@@ -3648,8 +3698,10 @@ static DWORD WINAPI InstallThread(LPVOID arg) {
     job->error = L"busy";
   } else {
     std::string data;
-    if (!HttpGet(job->url, data, 64 << 20, g_upd.testUrl)) {
-      job->error = L"download";
+    std::wstring why;
+    g_updPhase = 0, g_updPct = -1;
+    if (!HttpGet(job->url, data, 64 << 20, g_upd.testUrl, &why, &g_updPct)) {
+      job->error = L"download: " + why;
     } else if (Sha256Hex(data) != ToUtf8(job->sha)) {
       job->error = L"checksum";
     } else {
@@ -3662,17 +3714,22 @@ static DWORD WINAPI InstallThread(LPVOID arg) {
       DWORD w = 0;
       bool written = f != INVALID_HANDLE_VALUE && WriteFile(f, data.data(), (DWORD)data.size(), &w, nullptr) && w == data.size();
       if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+      g_updPhase = 1;
+      PostMessage(g_hwnd, WM_APP_UPDPROG, 0, 0);
       std::wstring cmd = L"\"" + exe + L"\" --silent";
       STARTUPINFOW si{sizeof si};
       PROCESS_INFORMATION pi{};
-      if (!written || !CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi)) {
-        job->error = L"run";
+      if (!written) job->error = L"write";
+      else if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi)) {
+        job->error = L"run (" + std::to_wstring(GetLastError()) + L")";
       } else {
         WaitForSingleObject(pi.hProcess, 120000);
+        DWORD code = 0;
+        GetExitCodeProcess(pi.hProcess, &code);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         job->ok = ParseVersion(ExeVersion(InstalledExe())) == ParseVersion(job->latest);
-        if (!job->ok) job->error = L"version";
+        if (!job->ok) job->error = L"version " + ExeVersion(InstalledExe()) + L" tras instalar (salida " + std::to_wstring(code) + L")";
       }
       DeleteFileW(exe.c_str());
     }
@@ -3687,6 +3744,9 @@ static void InstallUpdate() {
   if (g_upd.stage == UPD_INSTALLING || g_upd.url.empty()) return;
   g_upd.stage = UPD_INSTALLING;
   g_upd.hidden = false;
+  g_updPhase = 0, g_updPct = -1;
+  SetTimer(g_hwnd, TIMER_UPDANIM, 50, nullptr);
+  UpdateLog(L"instalando " + g_upd.latest + L" desde " + g_upd.running);
   auto* job = new InstallJob{g_upd.latest, g_upd.url, g_upd.sha};
   HANDLE t = CreateThread(nullptr, 0, InstallThread, job, 0, nullptr);
   if (t) CloseHandle(t);
@@ -3710,6 +3770,7 @@ static void OnUpdateReply(UpdateReply* r) {
   g_upd.checking = false;
   if (!r->ok) {
     if (r->manual) Toast(T(S_UPD_OFFLINE), 3000);
+    UpdateLog(L"no se pudo comprobar" + std::wstring(r->manual ? L" (a mano)" : L""));
     return;
   }
   if (ParseVersion(r->latest) <= ParseVersion(g_upd.running)) {
@@ -3726,6 +3787,8 @@ static void OnUpdateReply(UpdateReply* r) {
 }
 
 static void OnUpdateInstalled(InstallJob* job) {
+  KillTimer(g_hwnd, TIMER_UPDANIM);
+  UpdateLog(job->ok ? L"instalada " + job->latest : L"error al instalar " + job->latest + L": " + job->error);
   if (job->ok) {
     g_upd.stage = UPD_READY;
     EnumWindows(SendUpdated, 0);
@@ -3881,7 +3944,15 @@ static void RunScriptStep() {
     delay = 3000;
   } else if (s == L"update-state") {
     static const wchar_t* kSt[] = {L"none", L"available", L"installing", L"ready", L"failed"};
-    ScriptLog(std::wstring(L"update: ") + kSt[g_upd.stage] + L" " + g_upd.latest + L" (corre " + g_upd.running + L")");
+    ScriptLog(std::wstring(L"update: ") + kSt[g_upd.stage] + L" " + g_upd.latest + L" (corre " + g_upd.running + L")" +
+              (g_upd.stage == UPD_INSTALLING ? (g_updPhase == 0 ? L" descargando " + std::to_wstring(g_updPct) + L"%" : L" instalando") : L""));
+  } else if (s.rfind(L"http-get:", 0) == 0) {  // descarga como el actualizador y dice qué ha pasado
+    std::string data;
+    std::wstring why;
+    bool ok = HttpGet(s.substr(9), data, 64 << 20, true, &why);
+    ScriptLog(L"http-get: " + std::wstring(ok ? L"ok " : L"error ") + std::to_wstring(data.size()) + L" " +
+              ToWide(Sha256Hex(data).substr(0, 12)) + L" " + why);
+    delay = 3000;
   } else if (s == L"tabs") {  // orden de las pestañas (por su nombre) y cuál está activa
     std::wstring r = L"tabs:";
     for (int i = 0; i < (int)g_tabs.size(); i++) r += L" " + (i == g_activeTab ? L"*" + g_tabs[i].name : g_tabs[i].name);
@@ -4099,6 +4170,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       Relayout();
       return 0;
     }
+    case WM_APP_UPDPROG: InvalidateRect(hwnd, nullptr, FALSE); return 0;
     case WM_APP_UPDATE: OnUpdateReply(std::unique_ptr<UpdateReply>((UpdateReply*)lp).get()); return 0;
     case WM_APP_UPDATED: OnUpdateInstalled(std::unique_ptr<InstallJob>((InstallJob*)lp).get()); return 0;
     case WM_APP_PARAMS: {  // parámetros de una orden, de ParamsThread
@@ -4154,6 +4226,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, TIMER_FRAME);
         g_frameTimer = false;
         PaintDirty();
+      } else if (wp == TIMER_UPDANIM) {  // barra de «Instalando…» en movimiento
+        if (g_upd.stage == UPD_INSTALLING && !g_upd.hidden) InvalidateRect(hwnd, &g_upd.rc, FALSE);
       } else if (wp == TIMER_UPDATE) {
         SetTimer(hwnd, TIMER_UPDATE, 6 * 3600 * 1000, nullptr);
         CheckForUpdates(false);
