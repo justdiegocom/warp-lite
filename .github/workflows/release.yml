@@ -1,0 +1,82 @@
+# Every push to main that touches the app builds it and publishes a new release.
+# Version: the one in src/setup.cpp if it is higher than the latest tag, otherwise the latest
+# tag with the patch number bumped. It is stamped into setup.cpp and warp-lite.rc before
+# building, because the updater reads FILEVERSION from the installed exe.
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Pick version
+        id: ver
+        run: |
+          prev=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+          # Nothing in the app changed since the last release (README, docs, tests...): no release.
+          if [[ -n "$prev" && "${{ github.event_name }}" == push ]] &&
+             git diff --quiet "$prev" HEAD -- src third_party assets tools/build.sh; then
+            echo "No app changes since $prev, skipping."
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          src=$(sed -n 's/.*kVersion = L"\([0-9.]*\)".*/\1/p' src/setup.cpp)
+          if [[ -z "$prev" ]]; then
+            v=$src
+          else
+            IFS=. read -r a b c <<< "${prev#v}"
+            next="$a.$b.$((c + 1))"
+            v=$(printf '%s\n%s\n' "$src" "$next" | sort -V | tail -n1)
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+          echo "Version $v (previous $prev)"
+
+      - name: Stamp version
+        if: steps.ver.outputs.skip != '1'
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          sed -i "s/kVersion = L\"[0-9.]*\"/kVersion = L\"$V\"/" src/setup.cpp
+          sed -i -E "s/(FILEVERSION|PRODUCTVERSION) [0-9,]+/\1 ${V//./,},0/; s/(\"(File|Product)Version\", )\"[0-9.]+\"/\1\"$V\"/" src/warp-lite.rc
+          grep -n kVersion src/setup.cpp
+          grep -nE 'VERSION|Version' src/warp-lite.rc
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: steps.ver.outputs.skip != '1'
+        with:
+          version: 0.16.0
+
+      - name: Build
+        if: steps.ver.outputs.skip != '1'
+        run: bash tools/build.sh --local
+
+      - name: Publish release
+        if: steps.ver.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.ver.outputs.version }}
+          PREV: ${{ steps.ver.outputs.prev }}
+        run: |
+          {
+            if [[ -n "$PREV" ]]; then git log --no-merges --format='- %s' "$PREV..HEAD"; fi
+            echo
+            echo "Install: download **warp-lite-setup.exe** and run it. Existing installs update themselves."
+          } > notes.md
+          gh release create "v$V" --target "$GITHUB_SHA" --title "v$V" --notes-file notes.md \
+            dist/warp-lite-setup.exe dist/warp-lite.exe
