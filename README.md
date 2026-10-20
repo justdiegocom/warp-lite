@@ -90,6 +90,13 @@ Icono propio en `assets/` (`warp-lite.ico`, incrustado en los dos `.exe`). `tool
 - Al reabrir, los paneles que tenían algo en marcha (ssh + tmux) lo relanzan; el resto deja la orden
   en la caja.
 
+## Rendimiento
+
+La salida de la shell solo repinta las filas que cambian (libvterm avisa por filas), como mucho a
+60 fps, sobre un búfer fijo; el pintado completo queda para cambios de interfaz. Medido en el PC con
+7 paneles: 3,6-4,8 ms un pintado completo frente a 0,07-0,1 ms por filas; el resultado es idéntico
+píxel a píxel (`tools/wintest-cpu.ps1`, pasos `prime`/`verify`/`bench`).
+
 ## Licencias
 
 libvterm (MIT) en `third_party/libvterm`. No se ha copiado código de Warp (AGPL-3.0); solo se replican
