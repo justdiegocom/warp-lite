@@ -17,6 +17,9 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
+#include <objbase.h>
+#include <shlobj.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1193,6 +1196,68 @@ static void CopySelection() {
 static bool EditorActive(Pane* p);
 static void EditorInsert(Pane* p, const std::wstring& t);
 
+static std::wstring QuotePath(const std::wstring& path) {
+  return path.find(L' ') == std::wstring::npos ? path : L"\"" + path + L"\"";
+}
+
+// Guarda la imagen del portapapeles (abierto) como PNG con WIC.
+static bool SaveClipboardPng(HBITMAP hb, const std::wstring& path) {
+  IWICImagingFactory* f = nullptr;
+  IWICBitmap* bmp = nullptr;
+  IWICStream* st = nullptr;
+  IWICBitmapEncoder* enc = nullptr;
+  IWICBitmapFrameEncode* fr = nullptr;
+  bool ok = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory, (void**)&f)) &&
+            SUCCEEDED(f->CreateBitmapFromHBITMAP(hb, nullptr, WICBitmapIgnoreAlpha, &bmp)) &&
+            SUCCEEDED(f->CreateStream(&st)) && SUCCEEDED(st->InitializeFromFilename(path.c_str(), GENERIC_WRITE)) &&
+            SUCCEEDED(f->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) &&
+            SUCCEEDED(enc->Initialize(st, WICBitmapEncoderNoCache)) && SUCCEEDED(enc->CreateNewFrame(&fr, nullptr)) &&
+            SUCCEEDED(fr->Initialize(nullptr));
+  if (ok) {
+    UINT w = 0, h = 0;
+    bmp->GetSize(&w, &h);
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat24bppBGR;
+    ok = SUCCEEDED(fr->SetSize(w, h)) && SUCCEEDED(fr->SetPixelFormat(&fmt)) && SUCCEEDED(fr->WriteSource(bmp, nullptr)) &&
+         SUCCEEDED(fr->Commit()) && SUCCEEDED(enc->Commit());
+  }
+  if (fr) fr->Release();
+  if (enc) enc->Release();
+  if (st) st->Release();
+  if (bmp) bmp->Release();
+  if (f) f->Release();
+  return ok;
+}
+
+// Portapapeles sin texto: archivos copiados → sus rutas; imagen → se guarda en %TEMP%\warp-lite
+// como PNG y se devuelve su ruta. Vacío si no hay nada que pegar.
+static std::wstring ClipboardAsPaths() {
+  if (!OpenClipboard(g_hwnd)) return {};
+  std::wstring out;
+  if (HDROP drop = (HDROP)GetClipboardData(CF_HDROP)) {
+    UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    for (UINT i = 0; i < n; i++) {
+      wchar_t f[MAX_PATH * 2];
+      if (DragQueryFileW(drop, i, f, MAX_PATH * 2)) out += (out.empty() ? L"" : L" ") + QuotePath(f);
+    }
+  } else if (HBITMAP hb = (HBITMAP)GetClipboardData(CF_BITMAP)) {
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring dir = std::wstring(tmp) + L"warp-lite";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t name[64];
+    swprintf(name, 64, L"\\paste-%04d%02d%02d-%02d%02d%02d-%03d.png", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute,
+             t.wSecond, t.wMilliseconds);
+    std::wstring path = dir + name;
+    if (SaveClipboardPng(hb, path)) out = QuotePath(path);
+  }
+  CloseClipboard();
+  return out;
+}
+
+static void PasteText(Pane* p, std::wstring w);
+
 static void Paste(Pane* p) {
   if (!OpenClipboard(g_hwnd)) return;
   std::wstring w;
@@ -1201,12 +1266,13 @@ static void Paste(Pane* p) {
     GlobalUnlock(h);
   }
   CloseClipboard();
-  if (w.empty()) {
-    // Sin texto (p. ej. una imagen): Ctrl+V tal cual al programa, para que tmux u otros puedan
-    // pegarla a su manera (el Ctrl+V de tmux de Diego trae la imagen del portapapeles).
-    if (!EditorActive(p)) SendChar(p, 0x16, VTERM_MOD_NONE);
-    return;
-  }
+  if (w.empty()) w = ClipboardAsPaths();  // imagen o archivos: se pega su ruta de Windows
+  PasteText(p, w);
+}
+
+// Escribe texto como un pegado: en la caja de entrada o, si hay un programa en marcha, a él.
+static void PasteText(Pane* p, std::wstring w) {
+  if (w.empty()) return;
   if (EditorActive(p)) {  // en la caja de entrada: una sola línea
     std::wstring t;
     for (wchar_t ch : w) {
@@ -2899,6 +2965,24 @@ static void RunScriptStep() {
   } else if (s.rfind(L"edit:", 0) == 0 && p) {  // escribe en la caja de entrada
     for (wchar_t c : s.substr(5)) SendMessageW(g_hwnd, WM_CHAR, c, 0);
     delay = 300;
+  } else if (s.rfind(L"drop:", 0) == 0) {  // drop:ruta1;ruta2 — como soltar archivos en el centro
+    std::wstring list = s.substr(5), files;
+    for (auto& c : list) files += c == L';' ? L'\0' : c;
+    files += L'\0';
+    files += L'\0';
+    HGLOBAL hg = GlobalAlloc(GHND, sizeof(DROPFILES) + files.size() * sizeof(wchar_t));
+    DROPFILES* df = (DROPFILES*)GlobalLock(hg);
+    df->pFiles = sizeof(DROPFILES);
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    df->pt = POINT{rc.right / 2, rc.bottom / 2};
+    df->fWide = TRUE;
+    memcpy((char*)df + sizeof(DROPFILES), files.data(), files.size() * sizeof(wchar_t));
+    GlobalUnlock(hg);
+    SendMessageW(g_hwnd, WM_DROPFILES, (WPARAM)hg, 0);
+  } else if (s == L"clear" && p) {
+    p->edit.clear();
+    p->caret = 0;
   } else if (s == L"submit" && p) {
     if (EditorActive(p)) SubmitEditor(p);
     delay = 2000;
@@ -3184,6 +3268,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
       }
       SendChar(CurTab().active, cp, msg == WM_SYSCHAR ? VTERM_MOD_ALT : VTERM_MOD_NONE);
+      return 0;
+    }
+    case WM_DROPFILES: {  // archivos o carpetas soltados: su ruta en el panel de debajo
+      HDROP drop = (HDROP)wp;
+      POINT pt;
+      DragQueryPoint(drop, &pt);
+      std::wstring paths;
+      UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+      for (UINT i = 0; i < n; i++) {
+        wchar_t f[MAX_PATH * 2];
+        if (DragQueryFileW(drop, i, f, MAX_PATH * 2)) paths += (paths.empty() ? L"" : L" ") + QuotePath(f);
+      }
+      DragFinish(drop);
+      if (g_tabs.empty()) return 0;
+      Pane* p = PaneAt(pt.x, pt.y);
+      if (!p) p = CurTab().active;
+      CurTab().active = p;
+      SetForegroundWindow(hwnd);
+      if (EditorActive(p) && p->caret && p->edit[p->caret - 1] != L' ') paths = L" " + paths;
+      PasteText(p, paths);
+      InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
     case WM_SYSCOMMAND:
@@ -3541,6 +3646,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   }
   LocalFree(argv);
   g_msgQuitAll = RegisterWindowMessageW(L"warp-lite-quit-all");
+  CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);  // WIC (pegar imágenes)
   g_sessionPath = SessionPath(windowArg);
   if (g_script.empty() && !windowArg.empty()) {  // pruebas: guion para las ventanas que se abren
     wchar_t sc[2048];
@@ -3574,6 +3680,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
                               1280, 760, nullptr, nullptr, inst, nullptr);
   if (!hwnd) return 1;
   SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
+  DragAcceptFiles(hwnd, TRUE);  // soltar archivos: se escribe su ruta
   // Mismo tamaño y estado (maximizada o en ventana) que la última vez, si ese sitio sigue en pantalla.
   if (g_hasWinPos && MonitorFromRect(&g_winRect, MONITOR_DEFAULTTONULL)) {
     WINDOWPLACEMENT wp{sizeof wp};
