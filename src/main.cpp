@@ -3625,7 +3625,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   pResizePseudoConsole = (PFN_ResizePseudoConsole)GetProcAddress(k32, "ResizePseudoConsole");
   pClosePseudoConsole = (PFN_ClosePseudoConsole)GetProcAddress(k32, "ClosePseudoConsole");
   if (!pCreatePseudoConsole) {
-    MessageBoxW(nullptr, T(S_NEED_WIN10), L"warp-lite", MB_ICONERROR);
+    MessageBoxW(nullptr, T(S_NEED_WIN10), L"Warp", MB_ICONERROR);
     return 1;
   }
   typedef BOOL(WINAPI * PFN_Dpi)(HANDLE);
@@ -3676,7 +3676,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
                                  GetSystemMetrics(SM_CYSMICON), 0);
   wc.lpszClassName = L"WarpLite";
   RegisterClassExW(&wc);
-  HWND hwnd = CreateWindowExW(0, L"WarpLite", L"warp-lite", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+  HWND hwnd = CreateWindowExW(0, L"WarpLite", L"Warp", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                               1280, 760, nullptr, nullptr, inst, nullptr);
   if (!hwnd) return 1;
   SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);

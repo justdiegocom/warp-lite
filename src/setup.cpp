@@ -30,17 +30,19 @@ extern "C" const unsigned char warp_lite_exe[], warp_lite_exe_end[];
 
 static const wchar_t* kUninstallKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\warp-lite";
 static const wchar_t* kVersion = L"0.1.0";
+// Nombre visible (se llamó warp-lite; la carpeta de instalación y la clave del registro lo conservan).
+static const wchar_t* kAppName = L"Warp";
 static bool g_silent = false;
 static bool g_es = false;  // textos en español si Windows está en español
 
 static const wchar_t* Tr(const wchar_t* en, const wchar_t* es) { return g_es ? es : en; }
 
 static void Message(const std::wstring& text, UINT flags = MB_ICONINFORMATION) {
-  if (!g_silent) MessageBoxW(nullptr, text.c_str(), L"warp-lite", flags);
+  if (!g_silent) MessageBoxW(nullptr, text.c_str(), kAppName, flags);
 }
 
 static bool Ask(const std::wstring& text) {
-  return g_silent || MessageBoxW(nullptr, text.c_str(), L"warp-lite", MB_YESNO | MB_ICONQUESTION) == IDYES;
+  return g_silent || MessageBoxW(nullptr, text.c_str(), kAppName, MB_YESNO | MB_ICONQUESTION) == IDYES;
 }
 
 static std::wstring KnownFolder(REFKNOWNFOLDERID id) {
@@ -52,8 +54,8 @@ static std::wstring KnownFolder(REFKNOWNFOLDERID id) {
 }
 
 static std::wstring InstallDir() { return KnownFolder(FOLDERID_LocalAppData) + L"\\Programs\\warp-lite"; }
-static std::wstring StartMenuLink() { return KnownFolder(FOLDERID_Programs) + L"\\warp-lite.lnk"; }
-static std::wstring DesktopLink() { return KnownFolder(FOLDERID_Desktop) + L"\\warp-lite.lnk"; }
+static std::wstring StartMenuLink() { return KnownFolder(FOLDERID_Programs) + L"\\Warp.lnk"; }
+static std::wstring DesktopLink() { return KnownFolder(FOLDERID_Desktop) + L"\\Warp.lnk"; }
 
 static bool MakeShortcut(const std::wstring& lnk, const std::wstring& target, const std::wstring& workDir) {
   IShellLinkW* sl = nullptr;
@@ -62,7 +64,7 @@ static bool MakeShortcut(const std::wstring& lnk, const std::wstring& target, co
   sl->SetPath(target.c_str());
   sl->SetWorkingDirectory(workDir.c_str());
   sl->SetIconLocation(target.c_str(), 0);
-  sl->SetDescription(L"warp-lite");
+  sl->SetDescription(kAppName);
   IPersistFile* pf = nullptr;
   bool ok = SUCCEEDED(sl->QueryInterface(IID_IPersistFile, (void**)&pf)) && SUCCEEDED(pf->Save(lnk.c_str(), TRUE));
   if (pf) pf->Release();
@@ -105,12 +107,12 @@ static void SetDword(HKEY k, const wchar_t* name, DWORD v) {
 }
 
 static int Install() {
-  std::wstring dir = InstallDir(), exe = dir + L"\\warp-lite.exe", uninst = dir + L"\\uninstall.exe";
-  if (!Ask(Tr(L"Install warp-lite for this user?", L"¿Instalar warp-lite para este usuario?"))) return 1;
+  std::wstring dir = InstallDir(), exe = dir + L"\\Warp.exe", uninst = dir + L"\\uninstall.exe";
+  if (!Ask(Tr(L"Install Warp for this user?", L"¿Instalar Warp para este usuario?"))) return 1;
   SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
   DeleteOldCopies(dir);
   if (!ReplaceFile(exe, warp_lite_exe, (DWORD)(warp_lite_exe_end - warp_lite_exe))) {
-    Message(Tr(L"Could not copy warp-lite.exe.", L"No se ha podido copiar warp-lite.exe."), MB_ICONERROR);
+    Message(Tr(L"Could not copy Warp.exe.", L"No se ha podido copiar Warp.exe."), MB_ICONERROR);
     return 2;
   }
   wchar_t self[MAX_PATH];
@@ -123,14 +125,19 @@ static int Install() {
   std::wstring home = KnownFolder(FOLDERID_Profile);
   MakeShortcut(StartMenuLink(), exe, home);
   MakeShortcut(DesktopLink(), exe, home);
-  // Antes se llamaba better-warp: fuera sus accesos.
-  DeleteFileW((KnownFolder(FOLDERID_Programs) + L"\\better-warp.lnk").c_str());
-  DeleteFileW((KnownFolder(FOLDERID_Desktop) + L"\\better-warp.lnk").c_str());
+  // Antes se llamaba better-warp y warp-lite: fuera sus accesos y el .exe con el nombre viejo.
+  for (const wchar_t* old : {L"better-warp.lnk", L"warp-lite.lnk"}) {
+    DeleteFileW((KnownFolder(FOLDERID_Programs) + L"\\" + old).c_str());
+    DeleteFileW((KnownFolder(FOLDERID_Desktop) + L"\\" + old).c_str());
+  }
+  std::wstring legacy = dir + L"\\warp-lite.exe";
+  if (!DeleteFileW(legacy.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND)  // abierto: se aparta
+    MoveFileExW(legacy.c_str(), (legacy + L".old-" + std::to_wstring(GetTickCount64())).c_str(), MOVEFILE_REPLACE_EXISTING);
 
   HKEY k;
   if (RegCreateKeyExW(HKEY_CURRENT_USER, kUninstallKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) ==
       ERROR_SUCCESS) {
-    SetString(k, L"DisplayName", L"warp-lite");
+    SetString(k, L"DisplayName", kAppName);
     SetString(k, L"DisplayVersion", kVersion);
     SetString(k, L"Publisher", L"justdiego");
     SetString(k, L"DisplayIcon", exe);
@@ -143,8 +150,8 @@ static int Install() {
     RegCloseKey(k);
   }
   if (!g_silent &&
-      MessageBoxW(nullptr, Tr(L"warp-lite is installed. Open it now?", L"warp-lite está instalado. ¿Abrirlo ahora?"),
-                  L"warp-lite", MB_YESNO | MB_ICONINFORMATION) == IDYES)
+      MessageBoxW(nullptr, Tr(L"Warp is installed. Open it now?", L"Warp está instalado. ¿Abrirlo ahora?"),
+                  kAppName, MB_YESNO | MB_ICONINFORMATION) == IDYES)
     ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr, home.c_str(), SW_SHOWNORMAL);
   return 0;
 }
@@ -153,8 +160,8 @@ static int Install() {
 static int Uninstall(bool fromTemp) {
   std::wstring dir = InstallDir();
   if (!fromTemp) {
-    if (!Ask(Tr(L"Uninstall warp-lite? Your sessions and settings are kept.",
-                L"¿Desinstalar warp-lite? Se conservan tus sesiones y ajustes.")))
+    if (!Ask(Tr(L"Uninstall Warp? Your sessions and settings are kept.",
+                L"¿Desinstalar Warp? Se conservan tus sesiones y ajustes.")))
       return 1;
     wchar_t self[MAX_PATH], tmp[MAX_PATH];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -175,15 +182,16 @@ static int Uninstall(bool fromTemp) {
   DeleteFileW(DesktopLink().c_str());
   RegDeleteKeyW(HKEY_CURRENT_USER, kUninstallKey);
   DeleteOldCopies(dir);
-  bool ok = DeleteFileW((dir + L"\\warp-lite.exe").c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
+  DeleteFileW((dir + L"\\warp-lite.exe").c_str());  // nombre antiguo
+  bool ok = DeleteFileW((dir + L"\\Warp.exe").c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
   // uninstall.exe sigue abierto unos instantes (es quien ha lanzado esta copia).
   for (int i = 0; i < 50 && !DeleteFileW((dir + L"\\uninstall.exe").c_str()) &&
                   GetLastError() != ERROR_FILE_NOT_FOUND;
        i++)
     Sleep(200);
   RemoveDirectoryW(dir.c_str());
-  if (ok) Message(Tr(L"warp-lite has been uninstalled.", L"warp-lite se ha desinstalado."));
-  else Message(Tr(L"Close warp-lite and try again.", L"Cierra warp-lite y vuelve a intentarlo."), MB_ICONWARNING);
+  if (ok) Message(Tr(L"Warp has been uninstalled.", L"Warp se ha desinstalado."));
+  else Message(Tr(L"Close Warp and try again.", L"Cierra Warp y vuelve a intentarlo."), MB_ICONWARNING);
   return ok ? 0 : 3;
 }
 

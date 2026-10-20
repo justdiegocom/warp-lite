@@ -1,4 +1,4 @@
-# warp-lite
+# warp-lite (se instala como «Warp»)
 
 Terminal mínima para Windows con pestañas y paneles al estilo de [Warp](https://github.com/warpdotdev/warp),
 sin nada más: ni IA, ni bloques, ni cuenta, ni telemetría. Un único `.exe` de ~1 MB (Win32 + ConPTY + libvterm + GDI).
@@ -62,6 +62,9 @@ con Tab. Cada panel recuerda su carpeta al reabrir. Con `WARPLITE_SHELL` (otra s
 `tools/wintest.ps1` es la prueba de humo en Windows (dos arranques con guion y capturas).
 
 ## Instalar en Windows
+
+Se instala con el nombre visible «Warp» (`Warp.exe`, accesos `Warp.lnk`, «Aplicaciones instaladas»);
+la carpeta de instalación y la de datos siguen llamándose `warp-lite` para conservar las sesiones.
 
 `dist/warp-lite-setup.exe`: instala para el usuario actual (sin administrador) en
 `%LOCALAPPDATA%\Programs\warp-lite`, crea accesos en Inicio y escritorio y aparece en «Aplicaciones
