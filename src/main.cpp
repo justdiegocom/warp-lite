@@ -1562,8 +1562,12 @@ static void DrawInput(HDC dc, Pane* p, bool active, bool focus) {
   SelectObject(dc, op);
   DeleteObject(br);
   DeleteObject(pen);
-  SelectObject(dc, g_iconFont);
-  Text(dc, L"\uE8B7", RECT{chip.left + Px(4), chip.top, chip.left + iconW, chip.bottom}, kTabText, DT_CENTER);
+  {  // icono de carpeta (pestaña + cuerpo)
+    int fx = chip.left + Px(8), fw = Px(12), fh = Px(9), fy = (chip.top + chip.bottom - fh) / 2;
+    Fill(dc, RECT{fx, fy, fx + Px(5), fy + Px(2)}, kTabText);
+    Fill(dc, RECT{fx, fy + Px(2), fx + fw, fy + fh}, kTabText);
+    Fill(dc, RECT{fx + 1, fy + Px(3), fx + fw - 1, fy + fh - 1}, kChipBg);
+  }
   SelectObject(dc, g_fonts[1]);
   Text(dc, path, RECT{chip.left + iconW, chip.top, chip.right - Px(6), chip.bottom}, kFg, DT_LEFT | DT_PATH_ELLIPSIS);
   // Orden
