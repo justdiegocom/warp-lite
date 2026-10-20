@@ -78,6 +78,18 @@ Icono propio en `assets/` (`warp-lite.ico`, incrustado en los dos `.exe`). `tool
   libvterm lleva un parche para el atenuado (SGR 2).
 - Ctrl + ratón sobre un enlace http(s) lo subraya; Ctrl+clic lo abre, aunque esté partido en varias filas.
 
+## Pestañas, búsqueda y ventanas
+
+- Botón a la izquierda: pestañas arriba o en barra lateral. Clic derecho en una pestaña: renombrar,
+  ocultar, cerrar; «N ocultas» las vuelve a mostrar. Ctrl+Tab y Ctrl+1…9 se saltan las ocultas.
+- Ctrl+F (y Ctrl+Shift+F, el de Warp): buscar en pantalla e historial; Enter / Shift+Enter, Esc cierra.
+- Clic en el apartado de la carpeta: selector con buscador (carpeta: cd; archivo: su ruta a la caja).
+- Arrastrar una pestaña o la cabecera de un panel fuera de la ventana: se abre en otra ventana (un
+  proceso por ventana, sesión en `%APPDATA%\warp-lite\window-<id>.txt`). Al abrir warp-lite vuelven
+  todas; cerrar una con otras abiertas la quita; Ctrl+Shift+Q o apagar Windows las guardan todas.
+- Al reabrir, los paneles que tenían algo en marcha (ssh + tmux) lo relanzan; el resto deja la orden
+  en la caja.
+
 ## Licencias
 
 libvterm (MIT) en `third_party/libvterm`. No se ha copiado código de Warp (AGPL-3.0); solo se replican
