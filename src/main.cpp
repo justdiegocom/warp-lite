@@ -70,6 +70,8 @@ static const COLORREF kDivider = RGB(0x3a, 0x3a, 0x3a);
 static const COLORREF kSelBg = RGB(0x1d, 0x4f, 0x63);
 static const COLORREF kCloseHover = RGB(0xc4, 0x2b, 0x1c);
 static const COLORREF kChipBg = RGB(0x1c, 0x1c, 0x1c);
+static const COLORREF kFindBg = RGB(0xc9, 0xa2, 0x27);   // coincidencia
+static const COLORREF kFindCur = RGB(0xff, 0x8c, 0x1a);  // coincidencia actual
 static const COLORREF kCmdOk = RGB(0x4e, 0xd1, 0x8f);   // orden que existe
 static const COLORREF kCmdBad = RGB(0xf0, 0x55, 0x55);  // orden desconocida
 static const COLORREF kChipBorder = RGB(0x3a, 0x3a, 0x3a);
@@ -144,6 +146,8 @@ struct Pane {
   std::map<std::wstring, bool> existsMemo;
   int histPos = -1;
   RECT input{};
+  RECT chip{};          // apartado de la carpeta (clic: selector de carpetas)
+  bool resumeRun = false;  // al reabrir, volver a lanzar la orden (estaba en marcha al cerrar)
   int lineRow = -1, lineCol = -1;
   // Restauración tras reiniciar.
   std::string restoreCmd;
@@ -171,12 +175,15 @@ static bool g_renameAll = false;  // texto entero seleccionado: lo que se escrib
 static std::wstring g_toast;
 
 // Textos de la interfaz: inglés por defecto; se cambia con clic derecho en la barra de título.
-enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, S_COUNT };
+enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, S_FIND, S_NO_RESULTS,
+           S_SEARCH_DIRS, S_PARENT_DIR, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
-     L"Windows 10 1809 or later is required (ConPTY).", L"Language"},
+     L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
+     L"Search directories…", L".. (Parent directory)"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
-     L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma"},
+     L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
+     L"Buscar carpetas…", L".. (Carpeta superior)"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -192,6 +199,7 @@ static std::wstring Tf(Str s, int v) {
 static bool g_hasWinPos = false, g_winMax = false;
 static RECT g_winRect{};
 static int g_cellW = 8, g_cellH = 16;
+static int g_textDy = 0;  // margen vertical del texto dentro de la celda
 static std::wstring g_sessionPath;
 static bool g_focused = true;
 
@@ -208,6 +216,35 @@ struct LinkHit {
   std::wstring url;
 };
 static LinkHit g_link;
+
+// Buscar (Ctrl+F): coincidencias en el historial + pantalla del panel activo.
+struct FindMatch {
+  int line, col, len;  // línea absoluta: 0 = la más antigua del historial
+};
+struct FindState {
+  bool open = false;
+  Pane* p = nullptr;
+  std::wstring query;
+  std::vector<FindMatch> matches;
+  int cur = -1;
+};
+static FindState g_find;
+
+// Selector de carpetas al pulsar el apartado de la ruta, como en Warp.
+struct DirEntry {
+  std::wstring name;
+  bool dir, parent;
+};
+struct DirPicker {
+  bool open = false;
+  Pane* p = nullptr;
+  std::wstring base, filter;
+  std::vector<DirEntry> all, shown;
+  int sel = 0, top = 0;
+  RECT rc{};
+};
+static DirPicker g_pick;
+static const int kPickRows = 9;
 static Pane* g_dragPane = nullptr;
 static Pane* g_dropTarget = nullptr;
 static bool g_layoutHeaders = false;
@@ -556,6 +593,8 @@ static void DestroyPane(Pane* p) {
   if (g_selPane == p) g_selPane = nullptr, g_hasSel = false;
   if (g_dragPane == p || g_dropTarget == p) g_dragPane = g_dropTarget = nullptr;
   if (g_link.p == p) g_link = LinkHit{};
+  if (g_find.p == p) g_find = FindState{};
+  if (g_pick.p == p) g_pick = DirPicker{};
   if (p->wait) UnregisterWaitEx(p->wait, INVALID_HANDLE_VALUE);
   if (p->hpc) pClosePseudoConsole(p->hpc);
   if (p->proc) {
@@ -799,7 +838,9 @@ static void CyclePane(int dir) {
 
 static void SaveNode(std::ostringstream& o, Node* n) {
   if (n->leaf()) {
-    o << "L " << HexEncode(n->pane->lastCmd) << " " << HexEncode(ToUtf8(n->pane->cwd)) << "\n";
+    // «run»: tenía algo en marcha (p. ej. ssh + tmux) y se vuelve a lanzar al reabrir.
+    o << "L " << HexEncode(n->pane->lastCmd) << " " << HexEncode(ToUtf8(n->pane->cwd))
+      << (n->pane->runningCmd.empty() || n->pane->lastCmd.empty() ? "" : " run") << "\n";
   } else {
     o << "S " << (n->vertical ? 1 : 0) << " " << n->ratio << "\n";
     SaveNode(o, n->a);
@@ -853,6 +894,14 @@ static Node* LoadNode(std::istringstream& in, std::vector<Pane*>& created) {
     Pane* p = NewPane();
     p->lastCmd = HexDecode(hex);
     p->cwd = ToWide(dir);
+    auto pos2 = in.tellg();
+    std::string flag;
+    if (in >> flag && flag == "run") {
+      p->resumeRun = true;
+    } else {
+      in.clear();
+      in.seekg(pos2);
+    }
     p->restoreCmd = p->lastCmd;
     p->node = n;
     n->pane = p;
@@ -1182,6 +1231,8 @@ static void ActivateTab(int i) {
   Relayout();
 }
 
+static void OpenFind(Pane* p);
+
 // Atajos de Warp en Windows/Linux (app/src/util/bindings.rs y pane_group/mod.rs).
 static bool HandleShortcut(WPARAM vk) {
   bool ctrl = GetKeyState(VK_CONTROL) & 0x8000;
@@ -1200,6 +1251,7 @@ static bool HandleShortcut(WPARAM vk) {
       case 'W': ClosePane(act); return true;
       case 'C': CopySelection(); return true;
       case 'V': Paste(act); return true;
+      case 'F': OpenFind(act); return true;  // Ctrl+Shift+F: el de Warp
       case VK_OEM_4: CyclePane(-1); InvalidateRect(g_hwnd, nullptr, FALSE); return true;  // Ctrl+Shift+{
       case VK_OEM_6: CyclePane(+1); InvalidateRect(g_hwnd, nullptr, FALSE); return true;  // Ctrl+Shift+}
       case VK_PRIOR:
@@ -1245,6 +1297,7 @@ static bool HandleShortcut(WPARAM vk) {
         }
         return false;
       case 'V': Paste(act); return true;
+      case 'F': OpenFind(act); return true;
     }
     if (vk >= '1' && vk <= '9') {
       ActivateTab(vk == '9' ? (int)g_tabs.size() - 1 : (int)(vk - '1'));
@@ -1260,6 +1313,238 @@ static bool HandleShortcut(WPARAM vk) {
     return true;
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Buscar (Ctrl+F)
+
+static std::wstring RowText(Pane* p, int row);
+
+// Texto de una línea absoluta (historial + pantalla), una letra por columna. Con el lock tomado.
+static std::wstring AbsLineText(Pane* p, int line) {
+  int sbn = (int)p->sb.size();
+  if (line >= sbn) {
+    int saved = p->scrollOff;
+    p->scrollOff = 0;
+    std::wstring t = RowText(p, line - sbn);
+    p->scrollOff = saved;
+    return t;
+  }
+  std::wstring t(p->cols, L' ');
+  auto& v = p->sb[line];
+  for (int c = 0; c < p->cols && c < (int)v.size(); c++) {
+    uint32_t ch = v[c].chars[0];
+    if (ch && ch != (uint32_t)-1) t[c] = ch < 0x10000 ? (wchar_t)ch : L'?';
+  }
+  return t;
+}
+
+static void FindRecompute() {
+  Pane* p = g_find.p;
+  g_find.matches.clear();
+  g_find.cur = -1;
+  if (!p || !g_live.count(p) || g_find.query.empty()) return;
+  std::wstring q = g_find.query;
+  for (auto& c : q) c = towlower(c);
+  EnterCriticalSection(&p->cs);
+  int total = (int)p->sb.size() + p->rows;
+  for (int l = 0; l < total; l++) {
+    std::wstring t = AbsLineText(p, l);
+    for (auto& c : t) c = towlower(c);
+    for (size_t at = 0; (at = t.find(q, at)) != std::wstring::npos; at += q.size())
+      g_find.matches.push_back({l, (int)at, (int)q.size()});
+  }
+  LeaveCriticalSection(&p->cs);
+  if (!g_find.matches.empty()) g_find.cur = (int)g_find.matches.size() - 1;  // la más reciente
+}
+
+// Desplaza la vista para que se vea la coincidencia actual.
+static void FindReveal() {
+  Pane* p = g_find.p;
+  if (!p || g_find.cur < 0) return;
+  EnterCriticalSection(&p->cs);
+  int sbn = (int)p->sb.size();
+  int line = g_find.matches[g_find.cur].line;
+  int viewRow = line - sbn + p->scrollOff;
+  if (viewRow < 0 || viewRow >= p->rows) p->scrollOff = std::clamp(sbn - line + p->rows / 2, 0, sbn);
+  LeaveCriticalSection(&p->cs);
+}
+
+// 0 = nada, 1 = coincidencia, 2 = coincidencia actual. Con el lock tomado.
+static int FindMark(Pane* p, int row, int col) {
+  if (!g_find.open || g_find.p != p || g_find.matches.empty()) return 0;
+  int line = row - p->scrollOff + (int)p->sb.size();
+  // Coincidencias ordenadas por línea: búsqueda binaria de la primera de esa línea.
+  auto it = std::lower_bound(g_find.matches.begin(), g_find.matches.end(), line,
+                             [](const FindMatch& m, int l) { return m.line < l; });
+  for (; it != g_find.matches.end() && it->line == line; ++it)
+    if (col >= it->col && col < it->col + it->len) return (it - g_find.matches.begin()) == g_find.cur ? 2 : 1;
+  return 0;
+}
+
+static void OpenFind(Pane* p) {
+  g_find.open = true;
+  g_find.p = p;
+  if (g_hasSel && g_selPane == p) {  // con texto seleccionado, se busca eso
+    std::wstring sel = SelectionText();
+    if (!sel.empty() && sel.find(L'\n') == std::wstring::npos) g_find.query = sel;
+  }
+  FindRecompute();
+  FindReveal();
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void CloseFind() {
+  g_find.open = false;
+  g_find.matches.clear();
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void FindStep(int dir) {
+  if (g_find.matches.empty()) return;
+  int n = (int)g_find.matches.size();
+  g_find.cur = ((g_find.cur < 0 ? 0 : g_find.cur) + dir + n) % n;
+  FindReveal();
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static bool FindKey(WPARAM vk) {
+  bool shift = GetKeyState(VK_SHIFT) & 0x8000;
+  if (vk == VK_ESCAPE) CloseFind();
+  else if (vk == VK_RETURN || vk == VK_F3) FindStep(shift ? -1 : 1);
+  else if (vk == VK_UP) FindStep(-1);
+  else if (vk == VK_DOWN) FindStep(1);
+  else if (vk == VK_BACK) {
+    if (!g_find.query.empty()) g_find.query.pop_back();
+    FindRecompute();
+    FindReveal();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+  } else if (vk == 'F' && (GetKeyState(VK_CONTROL) & 0x8000)) CloseFind();
+  else return false;
+  return true;
+}
+
+static void FindChar(wchar_t c) {
+  if (c < 0x20 || g_find.query.size() >= 200) return;
+  g_find.query += c;
+  FindRecompute();
+  FindReveal();
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// ---------------------------------------------------------------------------
+// Selector de carpetas (clic en el apartado de la ruta)
+
+static void PickFilter() {
+  std::wstring f = g_pick.filter;
+  for (auto& c : f) c = towlower(c);
+  g_pick.shown.clear();
+  for (auto& e : g_pick.all) {
+    std::wstring n = e.name;
+    for (auto& c : n) c = towlower(c);
+    if (e.parent ? f.empty() : n.find(f) != std::wstring::npos) g_pick.shown.push_back(e);
+  }
+  g_pick.sel = 0;
+  g_pick.top = 0;
+}
+
+static void OpenPicker(Pane* p) {
+  if (p->cwd.empty()) return;
+  g_pick = DirPicker{};
+  g_pick.open = true;
+  g_pick.p = p;
+  g_pick.base = p->cwd;
+  bool root = p->cwd.size() <= 3;  // C:\ (o C:)
+  if (!root) g_pick.all.push_back({L"", true, true});
+  std::vector<DirEntry> dirs, files;
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((p->cwd + (p->cwd.back() == L'\\' ? L"*" : L"\\*")).c_str(), &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+      if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+      (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ? dirs : files).push_back({fd.cFileName, (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, false});
+    } while (FindNextFileW(h, &fd) && dirs.size() + files.size() < 3000);
+    FindClose(h);
+  }
+  auto byName = [](const DirEntry& a, const DirEntry& b) { return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0; };
+  std::sort(dirs.begin(), dirs.end(), byName);
+  std::sort(files.begin(), files.end(), byName);
+  g_pick.all.insert(g_pick.all.end(), dirs.begin(), dirs.end());
+  g_pick.all.insert(g_pick.all.end(), files.begin(), files.end());
+  PickFilter();
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void ClosePicker() {
+  g_pick.open = false;
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static bool EditorActive(Pane* p);
+static void EditorInsert(Pane* p, const std::wstring& t);
+
+// Carpeta: la shell cambia a ella (sin tocar lo que hubiera escrito en la caja).
+// Archivo: su ruta entre comillas se escribe en la caja.
+static void PickChoose(int i) {
+  if (i < 0 || i >= (int)g_pick.shown.size()) return;
+  DirEntry e = g_pick.shown[i];
+  Pane* p = g_pick.p;
+  ClosePicker();
+  if (!g_live.count(p) || !EditorActive(p)) return;
+  std::wstring base = g_pick.base;
+  if (!base.empty() && base.back() == L'\\') base.pop_back();
+  std::wstring path;
+  if (e.parent) {
+    size_t cut = base.find_last_of(L'\\');
+    path = cut == std::wstring::npos ? base : base.substr(0, cut);
+    if (path.size() == 2 && path[1] == L':') path += L'\\';
+  } else {
+    path = base + L"\\" + e.name;
+  }
+  std::wstring quoted = L"'";
+  for (wchar_t c : path) quoted += c == L'\'' ? std::wstring(L"''") : std::wstring(1, c);
+  quoted += L"'";
+  if (!e.dir) {
+    EditorInsert(p, (p->caret && p->edit[p->caret - 1] != L' ' ? L" " : L"") + quoted);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+    return;
+  }
+  std::string u = ToUtf8(L"Set-Location -LiteralPath " + quoted);
+  EnterCriticalSection(&p->cs);
+  ToBottom(p);
+  p->atPrompt = false;
+  p->outBuf += u + "\r";
+  LeaveCriticalSection(&p->cs);
+  FlushOut(p);
+}
+
+static bool PickKey(WPARAM vk) {
+  int n = (int)g_pick.shown.size();
+  switch (vk) {
+    case VK_ESCAPE: ClosePicker(); return true;
+    case VK_RETURN: PickChoose(g_pick.sel); return true;
+    case VK_UP: g_pick.sel = std::max(0, g_pick.sel - 1); break;
+    case VK_DOWN: g_pick.sel = std::min(n - 1, g_pick.sel + 1); break;
+    case VK_PRIOR: g_pick.sel = std::max(0, g_pick.sel - kPickRows); break;
+    case VK_NEXT: g_pick.sel = std::min(n - 1, g_pick.sel + kPickRows); break;
+    case VK_BACK:
+      if (!g_pick.filter.empty()) g_pick.filter.pop_back();
+      PickFilter();
+      break;
+    default: return false;
+  }
+  if (g_pick.sel < g_pick.top) g_pick.top = g_pick.sel;
+  if (g_pick.sel >= g_pick.top + kPickRows) g_pick.top = g_pick.sel - kPickRows + 1;
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+  return true;
+}
+
+static void PickChar(wchar_t c) {
+  if (c < 0x20) return;
+  g_pick.filter += c;
+  PickFilter();
+  InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
 // ---------------------------------------------------------------------------
@@ -1683,7 +1968,9 @@ static void MakeFonts() {
   SelectObject(dc, old);
   ReleaseDC(nullptr, dc);
   g_cellW = std::max(1, (int)sz.cx);
-  g_cellH = std::max(1, (int)tm.tmHeight);
+  // Altura de línea de Warp: 1,2 × tamaño de letra (DEFAULT_UI_LINE_HEIGHT_RATIO).
+  g_cellH = std::max((int)tm.tmHeight, (int)(MulDiv(g_fontPx, ScaledDpi(), 96) * 1.2 + 0.5));
+  g_textDy = (g_cellH - (int)tm.tmHeight) / 2;
 }
 
 static COLORREF ResolveColor(Pane* p, VTermColor c, bool fg) {
@@ -1725,6 +2012,7 @@ static void DrawInput(HDC dc, Pane* p, bool active, bool focus) {
   GetTextExtentPoint32W(dc, path.c_str(), (int)path.size(), &sz);
   int iconW = Px(24);
   RECT chip{x, r.top + Px(12), std::min<int>(x + iconW + sz.cx + Px(10), r.right - Px(12)), r.top + Px(12) + ChipH()};
+  p->chip = chip;
   HBRUSH br = CreateSolidBrush(kChipBg);
   HPEN pen = CreatePen(PS_SOLID, 1, kChipBorder);
   HGDIOBJ ob = SelectObject(dc, br), op = SelectObject(dc, pen);
@@ -1814,6 +2102,7 @@ static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
                      (GetBValue(s.fg) + GetBValue(s.bg)) / 2);
         if (c.attrs.reverse) std::swap(s.fg, s.bg);
         if (InSelection(p, row, col)) s.bg = kSelBg;
+        if (int f = FindMark(p, row, col)) s.bg = f == 2 ? kFindCur : kFindBg, s.fg = RGB(0, 0, 0);
         s.font = (c.attrs.bold ? 1 : 0) | (c.attrs.italic ? 2 : 0);
         s.underline = c.attrs.underline;
         s.strike = c.attrs.strike;
@@ -1836,7 +2125,7 @@ static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
       SelectObject(dc, g_fonts[st.font]);
       SetTextColor(dc, st.fg);
       SetBkColor(dc, st.bg);
-      ExtTextOutW(dc, r.left, y, ETO_OPAQUE | ETO_CLIPPED, &r, txt.c_str(), (UINT)txt.size(), dx.data());
+      ExtTextOutW(dc, r.left, y + g_textDy, ETO_OPAQUE | ETO_CLIPPED, &r, txt.c_str(), (UINT)txt.size(), dx.data());
       if (st.underline || st.strike) {
         int ly = st.strike ? y + g_cellH / 2 : y + g_cellH - 2;
         Fill(dc, RECT{r.left, ly, r.right, ly + 1}, st.fg);
@@ -1858,7 +2147,7 @@ static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
       SetBkColor(dc, kFg);
       SetTextColor(dc, kBg);
       SelectObject(dc, g_fonts[0]);
-      ExtTextOutW(dc, cr.left, cr.top, ETO_OPAQUE | ETO_CLIPPED, &cr, ch.c_str(), (UINT)ch.size(), nullptr);
+      ExtTextOutW(dc, cr.left, cr.top + g_textDy, ETO_OPAQUE | ETO_CLIPPED, &cr, ch.c_str(), (UINT)ch.size(), nullptr);
     } else {
       HBRUSH b = CreateSolidBrush(kFg);
       FrameRect(dc, &cr, b);
@@ -1989,6 +2278,89 @@ static void DrawPaneHeader(HDC dc, Pane* p, bool active) {
   SetBkMode(dc, OPAQUE);
 }
 
+static void Panel(HDC dc, RECT r) {
+  HBRUSH br = CreateSolidBrush(kChipBg);
+  HPEN pen = CreatePen(PS_SOLID, 1, kChipBorder);
+  HGDIOBJ ob = SelectObject(dc, br), op = SelectObject(dc, pen);
+  RoundRect(dc, r.left, r.top, r.right, r.bottom, Px(8), Px(8));
+  SelectObject(dc, ob);
+  SelectObject(dc, op);
+  DeleteObject(br);
+  DeleteObject(pen);
+}
+
+static void DrawFindBar(HDC dc) {
+  Pane* p = g_find.p;
+  if (!g_find.open || !p || !g_live.count(p) || p != CurTab().active) return;
+  RECT c = p->content;
+  int w = std::min<int>(Px(340), c.right - c.left - Px(16));
+  RECT r{c.right - w - Px(8), c.top + Px(8), c.right - Px(8), c.top + Px(8) + Px(34)};
+  Panel(dc, r);
+  SetBkMode(dc, TRANSPARENT);
+  SelectObject(dc, g_uiFont);
+  std::wstring count = g_find.query.empty() ? L""
+                       : g_find.matches.empty() ? T(S_NO_RESULTS)
+                       : std::to_wstring(g_find.cur + 1) + L"/" + std::to_wstring(g_find.matches.size());
+  RECT cr{r.right - Px(110), r.top, r.right - Px(10), r.bottom};
+  Text(dc, count, cr, kTabText, DT_RIGHT);
+  RECT qr{r.left + Px(10), r.top, cr.left - Px(6), r.bottom};
+  SelectObject(dc, g_fonts[0]);
+  if (g_find.query.empty()) Text(dc, T(S_FIND), qr, RGB(0x6a, 0x6a, 0x6a), DT_LEFT);
+  else Text(dc, g_find.query, qr, kFg, DT_LEFT | DT_END_ELLIPSIS);
+  SIZE sz{};
+  GetTextExtentPoint32W(dc, g_find.query.c_str(), (int)g_find.query.size(), &sz);
+  int cx = std::min<int>(qr.left + sz.cx + 1, qr.right);
+  Fill(dc, RECT{cx, r.top + Px(9), cx + std::max(2, Px(2)), r.bottom - Px(9)}, kFg);
+  SetBkMode(dc, OPAQUE);
+}
+
+static void DrawPicker(HDC dc) {
+  Pane* p = g_pick.p;
+  if (!g_pick.open || !p || !g_live.count(p)) {
+    g_pick.rc = RECT{};
+    return;
+  }
+  int rowH = Px(30), n = std::min<int>(kPickRows, (int)g_pick.shown.size());
+  int h = Px(40) + std::max(1, n) * rowH + Px(6);
+  int w = std::min<int>(Px(440), p->rc.right - p->rc.left - Px(16));
+  int left = p->chip.left, bottom = p->chip.top - Px(6);
+  RECT r{left, std::max<int>(TabBarH() + Px(4), bottom - h), left + w, bottom};
+  g_pick.rc = r;
+  Panel(dc, r);
+  SetBkMode(dc, TRANSPARENT);
+  SelectObject(dc, g_uiFont);
+  RECT fr{r.left + Px(12), r.top, r.right - Px(12), r.top + Px(40)};
+  if (g_pick.filter.empty()) Text(dc, T(S_SEARCH_DIRS), fr, RGB(0x8a, 0x8a, 0x8a), DT_LEFT);
+  else Text(dc, g_pick.filter, fr, kFg, DT_LEFT | DT_END_ELLIPSIS);
+  Fill(dc, RECT{r.left + 1, r.top + Px(40) - 1, r.right - 1, r.top + Px(40)}, kChipBorder);
+  for (int i = 0; i < n; i++) {
+    int idx = g_pick.top + i;
+    if (idx >= (int)g_pick.shown.size()) break;
+    const DirEntry& e = g_pick.shown[idx];
+    RECT ir{r.left + Px(4), r.top + Px(40) + i * rowH + Px(2), r.right - Px(4), r.top + Px(40) + (i + 1) * rowH};
+    bool sel = idx == g_pick.sel;
+    if (sel) Fill(dc, ir, kAccent);
+    // icono: flecha para la carpeta superior, carpeta o documento
+    int ix = ir.left + Px(10), iy = (ir.top + ir.bottom) / 2;
+    COLORREF ic = sel ? kFg : kTabText;
+    if (e.parent) {
+      RECT ar{ix, ir.top, ix + Px(14), ir.bottom};
+      Text(dc, L"\u2191", ar, ic, DT_CENTER);
+    } else if (e.dir) {
+      Fill(dc, RECT{ix, iy - Px(5), ix + Px(5), iy - Px(3)}, ic);
+      Fill(dc, RECT{ix, iy - Px(3), ix + Px(13), iy + Px(5)}, ic);
+      Fill(dc, RECT{ix + 1, iy - Px(2), ix + Px(13) - 1, iy + Px(5) - 1}, sel ? kAccent : kChipBg);
+    } else {
+      Fill(dc, RECT{ix + Px(1), iy - Px(6), ix + Px(11), iy + Px(6)}, ic);
+      Fill(dc, RECT{ix + Px(1) + 1, iy - Px(6) + 1, ix + Px(11) - 1, iy + Px(6) - 1}, sel ? kAccent : kChipBg);
+    }
+    RECT tr{ix + Px(24), ir.top, ir.right - Px(8), ir.bottom};
+    Text(dc, e.parent ? std::wstring(T(S_PARENT_DIR)) : e.name, tr, sel ? kFg : RGB(0xd0, 0xd0, 0xd0),
+         DT_LEFT | DT_END_ELLIPSIS);
+  }
+  SetBkMode(dc, OPAQUE);
+}
+
 static void Render(HDC dc, int w, int h) {
   RECT all{0, 0, w, h};
   Fill(dc, all, kBg);
@@ -2002,6 +2374,8 @@ static void Render(HDC dc, int w, int h) {
     DrawPaneHeader(dc, p, p == t.active);
   }
   DrawDividers(dc, t.root);
+  DrawFindBar(dc);
+  DrawPicker(dc);
   if (g_dropTarget) {  // destino al arrastrar un panel por su cabecera
     HBRUSH b = CreateSolidBrush(kAccent);
     RECT r = g_dropTarget->rc;
@@ -2089,6 +2463,20 @@ static void RunScriptStep() {
     swscanf(s.c_str() + 6, L"%d,%d", &c, &r);
     g_link = LinkAt(p, p->content.left + kPad + c * g_cellW + 1, p->content.top + kPad + r * g_cellH + 1);
     Toast(g_link.url.empty() ? L"(sin enlace)" : g_link.url);
+  } else if (s.rfind(L"find:", 0) == 0 && p) {
+    OpenFind(p);
+    for (wchar_t c : s.substr(5)) FindChar(c);
+  } else if (s == L"find-next") {
+    FindStep(1);
+  } else if (s == L"find-close") {
+    CloseFind();
+  } else if (s == L"picker" && p) {
+    OpenPicker(p);
+  } else if (s.rfind(L"picker-type:", 0) == 0) {
+    for (wchar_t c : s.substr(12)) PickChar(c);
+  } else if (s == L"picker-enter") {
+    PickChoose(g_pick.sel);
+    delay = 2000;
   } else if (s.rfind(L"lang:", 0) == 0) {
     for (int i = 0; i < kLangCount; i++)
       if (ToUtf8(s.substr(5)) == kLangCodes[i]) g_lang = i;
@@ -2217,8 +2605,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (wp && !p->restoreCmd.empty()) {  // primer prompt: la última orden queda en la caja
         p->edit = ToWide(p->restoreCmd);
         p->caret = p->edit.size();
-        p->history.push_back(p->edit);
         p->restoreCmd.clear();
+        if (p->resumeRun) {  // estaba en marcha al cerrar: se relanza (tmux new -A reengancha)
+          p->resumeRun = false;
+          SubmitEditor(p);
+        } else {
+          p->history.push_back(p->edit);
+        }
       }
       Relayout();
       return 0;
@@ -2284,6 +2677,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CHAR:
     case WM_SYSCHAR: {
       if (g_tabs.empty()) return 0;
+      if (g_pick.open) {
+        if (msg == WM_CHAR) PickChar((wchar_t)wp);
+        return 0;
+      }
+      if (g_find.open && g_renameTab < 0) {
+        if (msg == WM_CHAR) FindChar((wchar_t)wp);
+        return 0;
+      }
       if (g_renameTab >= 0) {
         if (wp >= 0x20 && msg == WM_CHAR) {
           if (g_renameAll) g_renameText.clear(), g_renameAll = false;
@@ -2318,6 +2719,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL: {
       POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
       ScreenToClient(hwnd, &pt);
+      if (g_pick.open && PtInRect(&g_pick.rc, pt)) {
+        int maxTop = std::max(0, (int)g_pick.shown.size() - kPickRows);
+        g_pick.top = std::clamp(g_pick.top + (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -3 : 3), 0, maxTop);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
       if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) SetZoom(g_zoom + (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 10 : -10));
       else if (!g_tabs.empty()) OnMouseWheel(pt.x, pt.y, GET_WHEEL_DELTA_WPARAM(wp));
       return 0;
@@ -2338,6 +2745,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_tabs.empty()) return 0;
       SetFocus(hwnd);
       if (g_renameTab >= 0) EndRename(true);  // clic fuera: guarda el nombre
+      if (g_pick.open) {  // selector de carpetas abierto: elegir o cerrar
+        POINT pt{x, y};
+        int row = (y - g_pick.rc.top - Px(40)) / Px(30);
+        if (msg == WM_LBUTTONDOWN && PtInRect(&g_pick.rc, pt) && y >= g_pick.rc.top + Px(40)) PickChoose(g_pick.top + row);
+        else if (!PtInRect(&g_pick.rc, pt)) ClosePicker();
+        return 0;
+      }
       if (y < TabBarH()) {
         int i;
         int hit = TitleHit(x, y, &i);
@@ -2376,7 +2790,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (!p) return 0;
       CurTab().active = p;
       POINT pt{x, y};
-      if (PtInRect(&p->input, pt)) {  // clic en la caja de entrada: solo enfoca el panel
+      if (PtInRect(&p->input, pt)) {  // clic en la caja de entrada: enfoca; en la carpeta, selector
+        if (msg == WM_LBUTTONDOWN && PtInRect(&p->chip, pt) && EditorActive(p)) OpenPicker(p);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
@@ -2438,7 +2853,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
-      if (Pane* p = PaneAt(x, y); p && p->mouseMode >= VTERM_PROP_MOUSE_DRAG && (wp & MK_LBUTTON)) {
+      // Movimiento del ratón a la aplicación: siempre si lo pide todo (1003, hovers de Claude
+      // en tmux); con botón pulsado si pide arrastres (1002).
+      bool anyButton = wp & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON);
+      if (Pane* p = PaneAt(x, y); p && (p->mouseMode == VTERM_PROP_MOUSE_MOVE ||
+                                       (p->mouseMode == VTERM_PROP_MOUSE_DRAG && anyButton))) {
         MouseToApp(p, x, y, 0, false);
       }
       {  // Ctrl sobre un enlace: subrayado y mano
@@ -2582,6 +3001,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
   MSG m;
   while (GetMessageW(&m, nullptr, 0, 0)) {
+    bool keyDown = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN;
+    if (g_pick.open && keyDown) {
+      if (!PickKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
+      continue;
+    }
+    if (g_find.open && keyDown && g_renameTab < 0) {
+      if (!FindKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
+      continue;
+    }
     if (g_renameTab >= 0 && (m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN)) {
       if (!RenameKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
       continue;
