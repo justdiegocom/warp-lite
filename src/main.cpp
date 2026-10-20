@@ -68,6 +68,8 @@ static const COLORREF kAccent = RGB(0x19, 0xaa, 0xd8);
 static const COLORREF kDivider = RGB(0x3a, 0x3a, 0x3a);
 static const COLORREF kSelBg = RGB(0x1d, 0x4f, 0x63);
 static const COLORREF kCloseHover = RGB(0xc4, 0x2b, 0x1c);
+static const COLORREF kChipBg = RGB(0x1c, 0x1c, 0x1c);
+static const COLORREF kChipBorder = RGB(0x3a, 0x3a, 0x3a);
 static const uint32_t kAnsi[16] = {0x616161, 0xFF8272, 0xB4FA72, 0xFEFDC2, 0xA5D5FE, 0xFF8FFD,
                                    0xD0D1FE, 0xF1F1F1, 0x8E8E8E, 0xFFC4BD, 0xD6FCB9, 0xFEFDD5,
                                    0xC1E3FE, 0xFFB1FE, 0xE5E6FE, 0xFEFFFF};
@@ -75,7 +77,7 @@ static const int kGap = 1;           // separación entre paneles (px)
 static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
-enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT };
+enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT };
 enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3 };
 
 // ---------------------------------------------------------------------------
@@ -126,6 +128,15 @@ struct Pane {
   DWORD pid = 0;
   std::string submittedCmd;
   std::wstring runningCmd;
+  // Caja de entrada al estilo Warp (solo con PowerShell integrado): la shell avisa con
+  // OSC 9;9;<ruta> cada vez que muestra el prompt; mientras tanto se escribe en la caja.
+  bool integrated = false, atPrompt = false;
+  std::string oscBuf;
+  std::wstring cwd, edit;
+  size_t caret = 0;
+  std::vector<std::wstring> history;
+  int histPos = -1;
+  RECT input{};
   int lineRow = -1, lineCol = -1;
   // Restauración tras reiniciar.
   std::string restoreCmd;
@@ -285,7 +296,11 @@ static int CbSetTermProp(VTermProp prop, VTermValue* v, void* user) {
   Pane* p = (Pane*)user;
   switch (prop) {
     case VTERM_PROP_CURSORVISIBLE: p->cursorVisible = v->boolean; break;
-    case VTERM_PROP_ALTSCREEN: p->altScreen = v->boolean; p->scrollOff = 0; break;
+    case VTERM_PROP_ALTSCREEN:
+      p->altScreen = v->boolean;
+      p->scrollOff = 0;
+      if (p->integrated) PostMessage(g_hwnd, WM_APP_LAYOUT, 0, (LPARAM)p);  // la caja se oculta a pantalla completa
+      break;
     case VTERM_PROP_MOUSE: p->mouseMode = v->number; break;
     case VTERM_PROP_TITLE:
       if (v->string.initial) p->titleBuf.clear();
@@ -293,6 +308,21 @@ static int CbSetTermProp(VTermProp prop, VTermValue* v, void* user) {
       if (v->string.final) p->title = ToWide(p->titleBuf);
       break;
     default: break;
+  }
+  return 1;
+}
+
+// OSC 9;9;<ruta> (lo emite el prompt de warp-lite): la shell espera una orden en <ruta>.
+static int CbOsc(int command, VTermStringFragment frag, void* user) {
+  Pane* p = (Pane*)user;
+  if (command != 9) return 0;
+  if (frag.initial) p->oscBuf.clear();
+  p->oscBuf.append(frag.str, frag.len);
+  if (frag.final && p->oscBuf.rfind("9;", 0) == 0) {
+    p->cwd = ToWide(p->oscBuf.substr(2));
+    bool first = !p->integrated;
+    p->integrated = p->atPrompt = true;
+    PostMessage(g_hwnd, WM_APP_LAYOUT, first, (LPARAM)p);
   }
   return 1;
 }
@@ -343,6 +373,12 @@ static Pane* NewPane() {
     return c;
   }();
   vterm_screen_set_callbacks(p->scr, &cbs, p);
+  static VTermStateFallbacks fallbacks = [] {
+    VTermStateFallbacks f{};
+    f.osc = CbOsc;
+    return f;
+  }();
+  vterm_screen_set_unrecognised_fallbacks(p->scr, &fallbacks, p);
   vterm_screen_enable_altscreen(p->scr, 1);
   vterm_screen_enable_reflow(p->scr, true);
   VTermState* st = vterm_obtain_state(p->vt);
@@ -360,12 +396,33 @@ static Pane* NewPane() {
   return p;
 }
 
+// Prompt de PowerShell que avisa a warp-lite (OSC 9;9;<ruta>) y deja solo un "> " gris.
+static std::wstring IntegrationArgs() {
+  const wchar_t* script =
+      L"function global:prompt { $e = [char]27; $b = [char]7; "
+      L"$p = $executionContext.SessionState.Path.CurrentLocation.ProviderPath; "
+      L"\"$e]9;9;$p$b$e[90m> $e[0m\" }";
+  std::string bytes((const char*)script, wcslen(script) * sizeof(wchar_t));  // UTF-16LE
+  static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::wstring b64;
+  for (size_t i = 0; i < bytes.size(); i += 3) {
+    uint32_t v = (uint8_t)bytes[i] << 16;
+    if (i + 1 < bytes.size()) v |= (uint8_t)bytes[i + 1] << 8;
+    if (i + 2 < bytes.size()) v |= (uint8_t)bytes[i + 2];
+    b64 += t[v >> 18];
+    b64 += t[(v >> 12) & 63];
+    b64 += i + 1 < bytes.size() ? t[(v >> 6) & 63] : '=';
+    b64 += i + 2 < bytes.size() ? t[v & 63] : '=';
+  }
+  return L" -NoExit -EncodedCommand " + b64;
+}
+
 static std::wstring ShellCommand() {
   wchar_t buf[MAX_PATH * 2];
   DWORD n = GetEnvironmentVariableW(L"WARPLITE_SHELL", buf, MAX_PATH * 2);
-  if (n > 0 && n < MAX_PATH * 2) return buf;
-  if (SearchPathW(nullptr, L"pwsh.exe", nullptr, MAX_PATH, buf, nullptr)) return L"pwsh.exe -NoLogo";
-  return L"powershell.exe -NoLogo";
+  if (n > 0 && n < MAX_PATH * 2) return buf;  // otra shell: sin caja de entrada
+  if (SearchPathW(nullptr, L"pwsh.exe", nullptr, MAX_PATH, buf, nullptr)) return L"pwsh.exe -NoLogo" + IntegrationArgs();
+  return L"powershell.exe -NoLogo" + IntegrationArgs();
 }
 
 static VOID CALLBACK OnProcessExit(PVOID ctx, BOOLEAN) {
@@ -388,6 +445,13 @@ static DWORD WINAPI ReaderThread(LPVOID arg) {
     RequestRepaint();
   }
   return 0;
+}
+
+// Carpeta de arranque: la última del panel si sigue existiendo; si no, el perfil del usuario.
+static const wchar_t* StartDir(Pane* p, const wchar_t* home) {
+  DWORD a = p->cwd.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(p->cwd.c_str());
+  if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) return p->cwd.c_str();
+  return home[0] ? home : nullptr;
 }
 
 static bool SpawnPane(Pane* p) {
@@ -416,7 +480,7 @@ static bool SpawnPane(Pane* p) {
   PROCESS_INFORMATION pi{};
   BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
                            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT, nullptr,
-                           home[0] ? home : nullptr, &si.StartupInfo, &pi);
+                           StartDir(p, home), &si.StartupInfo, &pi);
   DeleteProcThreadAttributeList(si.lpAttributeList);
   HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
   if (!ok) return false;
@@ -451,9 +515,17 @@ static void DestroyPane(Pane* p) {
   delete p;
 }
 
+static int ChipH() { return g_cellH + Px(8); }
+static int InputH() { return Px(12) + ChipH() + Px(10) + g_cellH + Px(12); }
+
 static void ResizePane(Pane* p, RECT r) {
   p->rc = p->content = r;
   if (g_layoutHeaders) p->content.top += PaneHdrH();
+  p->input = RECT{};
+  if (p->integrated && !p->altScreen && p->content.bottom - p->content.top > InputH() + 2 * g_cellH) {
+    p->input = RECT{p->content.left, p->content.bottom - InputH(), p->content.right, p->content.bottom};
+    p->content.bottom = p->input.top;
+  }
   RECT& c = p->content;
   int cols = std::max(2, (int)(c.right - c.left - 2 * kPad) / g_cellW);
   int rows = std::max(1, (int)(c.bottom - c.top - 2 * kPad) / g_cellH);
@@ -668,7 +740,7 @@ static void CyclePane(int dir) {
 
 static void SaveNode(std::ostringstream& o, Node* n) {
   if (n->leaf()) {
-    o << "L " << HexEncode(n->pane->lastCmd) << "\n";
+    o << "L " << HexEncode(n->pane->lastCmd) << " " << HexEncode(ToUtf8(n->pane->cwd)) << "\n";
   } else {
     o << "S " << (n->vertical ? 1 : 0) << " " << n->ratio << "\n";
     SaveNode(o, n->a);
@@ -709,10 +781,19 @@ static Node* LoadNode(std::istringstream& in, std::vector<Pane*>& created) {
   if (!(in >> kind)) return nullptr;
   Node* n = new Node();
   if (kind == "L") {
-    std::string hex;
+    std::string hex, dir;
     in >> hex;
+    auto pos = in.tellg();  // la carpeta es opcional (sesiones antiguas no la traen)
+    if (in >> dir && dir.find_first_not_of("0123456789abcdef-") == std::string::npos) {
+      dir = HexDecode(dir);
+    } else {
+      dir.clear();
+      in.clear();
+      in.seekg(pos);
+    }
     Pane* p = NewPane();
     p->lastCmd = HexDecode(hex);
+    p->cwd = ToWide(dir);
     p->restoreCmd = p->lastCmd;
     p->node = n;
     n->pane = p;
@@ -864,7 +945,7 @@ static void ToBottom(Pane* p) {
 static void SendKey(Pane* p, VTermKey key, VTermModifier mod) {
   EnterCriticalSection(&p->cs);
   ToBottom(p);
-  if (key == VTERM_KEY_ENTER) {
+  if (key == VTERM_KEY_ENTER && !p->integrated) {
     std::string cmd = ReadTypedLine(p);
     p->lineRow = p->lineCol = -1;
     if (!cmd.empty()) p->submittedCmd = cmd;
@@ -912,6 +993,9 @@ static void CopySelection() {
   CloseClipboard();
 }
 
+static bool EditorActive(Pane* p);
+static void EditorInsert(Pane* p, const std::wstring& t);
+
 static void Paste(Pane* p) {
   if (!OpenClipboard(g_hwnd)) return;
   std::wstring w;
@@ -920,6 +1004,19 @@ static void Paste(Pane* p) {
     GlobalUnlock(h);
   }
   CloseClipboard();
+  if (EditorActive(p)) {  // en la caja de entrada: una sola línea
+    std::wstring t;
+    for (wchar_t ch : w) {
+      if (ch == L'\r') continue;
+      if (ch == L'\n' || ch == L'\t') ch = L' ';
+      if (ch < 0x20 || ch == 0x7f || (ch >= 0x80 && ch < 0xa0)) continue;
+      t += ch;
+    }
+    while (!t.empty() && t.back() == L' ') t.pop_back();
+    EditorInsert(p, t);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+    return;
+  }
   // Sin ESC ni otros controles: un "\e[201~" pegado no puede salirse del pegado protegido.
   std::wstring norm;
   for (size_t i = 0; i < w.size(); i++) {
@@ -1099,11 +1196,119 @@ static bool HandleShortcut(WPARAM vk) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// Caja de entrada (editor de órdenes)
+
+static bool EditorActive(Pane* p) { return p && p->integrated && p->atPrompt && !p->altScreen; }
+
+static void EditorInsert(Pane* p, const std::wstring& t) {
+  p->edit.insert(p->caret, t);
+  p->caret += t.size();
+  p->histPos = -1;
+}
+
+static void SubmitEditor(Pane* p) {
+  std::wstring cmd = p->edit;
+  std::string u = ToUtf8(cmd);
+  if (!cmd.empty()) {
+    if (p->history.empty() || p->history.back() != cmd) p->history.push_back(cmd);
+    if (p->history.size() > 500) p->history.erase(p->history.begin());
+    p->submittedCmd = u;
+    if (u != "exit" && u != "logout") p->lastCmd = u;
+  }
+  p->edit.clear();
+  p->caret = 0;
+  p->histPos = -1;
+  EnterCriticalSection(&p->cs);
+  ToBottom(p);
+  p->atPrompt = false;  // hasta el siguiente prompt, las teclas van al programa
+  p->outBuf += u + "\r";
+  LeaveCriticalSection(&p->cs);
+  FlushOut(p);
+  if (!cmd.empty()) SaveSession();
+}
+
+static bool IsWordChar(wchar_t c) { return iswalnum(c) || c == L'_' || c == L'-'; }
+
+// Teclas especiales del editor; true si se consume.
+static bool EditorKey(Pane* p, WPARAM vk) {
+  bool ctrl = GetKeyState(VK_CONTROL) & 0x8000;
+  std::wstring& e = p->edit;
+  size_t& c = p->caret;
+  auto wordLeft = [&] {
+    size_t i = c;
+    while (i > 0 && !IsWordChar(e[i - 1])) i--;
+    while (i > 0 && IsWordChar(e[i - 1])) i--;
+    return i;
+  };
+  auto wordRight = [&] {
+    size_t i = c;
+    while (i < e.size() && !IsWordChar(e[i])) i++;
+    while (i < e.size() && IsWordChar(e[i])) i++;
+    return i;
+  };
+  switch (vk) {
+    case VK_RETURN: SubmitEditor(p); break;
+    case VK_BACK:
+      if (ctrl) {
+        size_t i = wordLeft();
+        e.erase(i, c - i);
+        c = i;
+      } else if (c > 0) {
+        e.erase(--c, 1);
+      }
+      break;
+    case VK_DELETE:
+      if (c < e.size()) e.erase(c, ctrl ? wordRight() - c : 1);
+      break;
+    case VK_LEFT: c = ctrl ? wordLeft() : (c ? c - 1 : 0); break;
+    case VK_RIGHT: c = ctrl ? wordRight() : std::min(c + 1, e.size()); break;
+    case VK_HOME: c = 0; break;
+    case VK_END: c = e.size(); break;
+    case VK_ESCAPE: e.clear(), c = 0, p->histPos = -1; break;
+    case VK_TAB: break;  // sin autocompletado por ahora
+    case VK_UP:
+      if (!p->history.empty()) {
+        if (p->histPos < 0) p->histPos = (int)p->history.size();
+        if (p->histPos > 0) p->histPos--;
+        e = p->history[p->histPos];
+        c = e.size();
+      }
+      break;
+    case VK_DOWN:
+      if (p->histPos >= 0) {
+        if (++p->histPos >= (int)p->history.size()) p->histPos = -1, e.clear();
+        else e = p->history[p->histPos];
+        c = e.size();
+      }
+      break;
+    case 'C':
+      if (!ctrl) return false;
+      if (!e.empty()) e.clear(), c = 0;  // Ctrl+C con texto: lo descarta
+      else SendChar(p, 3, VTERM_MOD_NONE);
+      break;
+    case 'A':
+      if (!ctrl) return false;
+      c = 0;
+      break;
+    case 'E':
+      if (!ctrl) return false;
+      c = e.size();
+      break;
+    default: return false;
+  }
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+  return true;
+}
+
 // Devuelve true si la tecla se ha consumido (no se traduce a WM_CHAR).
 static bool HandleKeyDown(WPARAM vk, LPARAM) {
   if (g_tabs.empty()) return false;
   if (HandleShortcut(vk)) return true;
   Pane* p = CurTab().active;
+  if (EditorActive(p)) {
+    if (!(GetKeyState(VK_SHIFT) & 0x8000) || (vk != VK_PRIOR && vk != VK_NEXT)) return EditorKey(p, vk);
+  }
   VTermModifier mod = Mods();
   VTermKey key = VTERM_KEY_NONE;
   switch (vk) {
@@ -1332,6 +1537,58 @@ struct Style {
   }
 };
 
+static void Text(HDC dc, const std::wstring& s, RECT r, COLORREF c, UINT flags);
+
+// Caja de entrada: apartado con la ruta y, debajo, la orden que se está escribiendo.
+static void DrawInput(HDC dc, Pane* p, bool active, bool focus) {
+  RECT r = p->input;
+  if (r.bottom <= r.top) return;
+  Fill(dc, r, kBg);
+  Fill(dc, RECT{r.left, r.top, r.right, r.top + 1}, kDivider);
+  int x = r.left + Px(12);
+  SetBkMode(dc, TRANSPARENT);
+  // Apartado con la ruta
+  std::wstring path = p->cwd.empty() ? L"…" : p->cwd;
+  SelectObject(dc, g_fonts[1]);
+  SIZE sz{};
+  GetTextExtentPoint32W(dc, path.c_str(), (int)path.size(), &sz);
+  int iconW = Px(24);
+  RECT chip{x, r.top + Px(12), std::min<int>(x + iconW + sz.cx + Px(10), r.right - Px(12)), r.top + Px(12) + ChipH()};
+  HBRUSH br = CreateSolidBrush(kChipBg);
+  HPEN pen = CreatePen(PS_SOLID, 1, kChipBorder);
+  HGDIOBJ ob = SelectObject(dc, br), op = SelectObject(dc, pen);
+  RoundRect(dc, chip.left, chip.top, chip.right, chip.bottom, Px(6), Px(6));
+  SelectObject(dc, ob);
+  SelectObject(dc, op);
+  DeleteObject(br);
+  DeleteObject(pen);
+  SelectObject(dc, g_iconFont);
+  Text(dc, L"\uE8B7", RECT{chip.left + Px(4), chip.top, chip.left + iconW, chip.bottom}, kTabText, DT_CENTER);
+  SelectObject(dc, g_fonts[1]);
+  Text(dc, path, RECT{chip.left + iconW, chip.top, chip.right - Px(6), chip.bottom}, kFg, DT_LEFT | DT_PATH_ELLIPSIS);
+  // Orden
+  int ey = chip.bottom + Px(10);
+  RECT er{x, ey, r.right - Px(12), ey + g_cellH};
+  SelectObject(dc, g_fonts[0]);
+  bool ready = EditorActive(p);
+  int cx = x;
+  if (!ready) {
+    Text(dc, L"Ejecutando… las teclas van al programa", er, kTabText, DT_LEFT | DT_END_ELLIPSIS);
+  } else if (p->edit.empty()) {
+    Text(dc, L"Escribe una orden", er, RGB(0x6a, 0x6a, 0x6a), DT_LEFT);
+  } else {
+    size_t cols = std::max(1, (int)(er.right - er.left) / g_cellW);
+    size_t off = p->caret >= cols ? p->caret - cols + 1 : 0;
+    std::wstring vis = p->edit.substr(off, cols);
+    std::vector<INT> dx(vis.size(), g_cellW);
+    SetTextColor(dc, kFg);
+    ExtTextOutW(dc, x, ey, ETO_CLIPPED, &er, vis.c_str(), (UINT)vis.size(), dx.data());
+    cx = x + (int)(p->caret - off) * g_cellW;
+  }
+  if (ready && active && focus) Fill(dc, RECT{cx, ey, cx + std::max(2, Px(2)), ey + g_cellH}, kFg);
+  SetBkMode(dc, OPAQUE);
+}
+
 static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
   EnterCriticalSection(&p->cs);
   Fill(dc, p->content, kBg);
@@ -1387,8 +1644,9 @@ static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
       }
     }
   }
-  // Cursor
-  if (active && p->cursorVisible && p->scrollOff == 0) {
+  DrawInput(dc, p, active, showFocus);
+  // Cursor (no se dibuja mientras se escribe en la caja de entrada)
+  if (active && p->cursorVisible && p->scrollOff == 0 && !EditorActive(p)) {
     RECT cr{ox + p->cursor.col * g_cellW, oy + p->cursor.row * g_cellH, 0, 0};
     cr.right = cr.left + g_cellW;
     cr.bottom = cr.top + g_cellH;
@@ -1613,6 +1871,12 @@ static void RunScriptStep() {
     SetWindowPos(g_hwnd, nullptr, x, y, w, h, SWP_NOZORDER);
   } else if (s == L"maximize") {
     ShowWindow(g_hwnd, SW_MAXIMIZE);
+  } else if (s.rfind(L"edit:", 0) == 0 && p) {  // escribe en la caja de entrada
+    for (wchar_t c : s.substr(5)) SendMessageW(g_hwnd, WM_CHAR, c, 0);
+    delay = 300;
+  } else if (s == L"submit" && p) {
+    if (EditorActive(p)) SubmitEditor(p);
+    delay = 2000;
   } else if (s == L"rename-start") {
     BeginRename(g_activeTab);
   } else if (s.rfind(L"rename-type:", 0) == 0) {
@@ -1715,6 +1979,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       Relayout();
       return 0;
     }
+    case WM_APP_LAYOUT: {
+      Pane* p = (Pane*)lp;
+      if (!g_live.count(p)) return 0;
+      if (wp && !p->restoreCmd.empty()) {  // primer prompt: la última orden queda en la caja
+        p->edit = ToWide(p->restoreCmd);
+        p->caret = p->edit.size();
+        p->history.push_back(p->edit);
+        p->restoreCmd.clear();
+      }
+      Relayout();
+      return 0;
+    }
     case WM_APP_DIRTY:
       g_dirtyPosted = false;
       InvalidateRect(hwnd, nullptr, FALSE);
@@ -1738,9 +2014,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Escribe la última orden en el prompt cuando la shell ha terminado de arrancar.
         DWORD now = GetTickCount();
         for (Pane* p : g_live) {
-          if (p->restoreCmd.empty() || !p->proc) continue;
+          // Shells sin integración (WARPLITE_SHELL): se escribe en su prompt tras arrancar.
+          if (p->restoreCmd.empty() || !p->proc || p->integrated) continue;
           bool settled = p->firstOut && now - p->lastOut > 400;
-          if (!settled && now - p->spawnTick < 8000) continue;
+          if (now - p->spawnTick < (settled ? 6000u : 10000u)) continue;
           EnterCriticalSection(&p->cs);
           MarkLineStart(p);
           p->outBuf += p->restoreCmd;  // sin Enter: solo queda escrita
@@ -1788,6 +2065,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       }
       if (cp >= 0xDC00 && cp < 0xE000 && high) cp = 0x10000 + ((high - 0xD800) << 10) + (cp - 0xDC00);
       high = 0;
+      if (EditorActive(CurTab().active)) {
+        if (msg == WM_CHAR && cp >= 0x20 && cp != 0x7f) {
+          std::wstring t;
+          AppendUtf16(t, cp);
+          EditorInsert(CurTab().active, t);
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+      }
       SendChar(CurTab().active, cp, msg == WM_SYSCHAR ? VTERM_MOD_ALT : VTERM_MOD_NONE);
       return 0;
     }
@@ -1854,6 +2140,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       Pane* p = PaneAt(x, y);
       if (!p) return 0;
       CurTab().active = p;
+      POINT pt{x, y};
+      if (PtInRect(&p->input, pt)) {  // clic en la caja de entrada: solo enfoca el panel
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
       bool shift = GetKeyState(VK_SHIFT) & 0x8000;
       if (p->mouseMode && !shift) {
         MouseToApp(p, x, y, msg == WM_LBUTTONDOWN ? 1 : msg == WM_MBUTTONDOWN ? 2 : 3, true);
