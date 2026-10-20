@@ -105,6 +105,7 @@ struct Tab {
   Node* root = nullptr;
   Pane* active = nullptr;
   std::wstring name;  // puesto a mano (doble clic); vacío = título de la shell
+  bool hidden = false;  // oculta (clic derecho → Ocultar); se recupera desde «N ocultas»
 };
 
 struct Pane {
@@ -176,14 +177,16 @@ static std::wstring g_toast;
 
 // Textos de la interfaz: inglés por defecto; se cambia con clic derecho en la barra de título.
 enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, S_FIND, S_NO_RESULTS,
-           S_SEARCH_DIRS, S_PARENT_DIR, S_COUNT };
+           S_SEARCH_DIRS, S_PARENT_DIR, S_RENAME, S_HIDE, S_CLOSE_TAB, S_SHOW_ALL, S_HIDDEN_N, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
-     L"Search directories…", L".. (Parent directory)"},
+     L"Search directories…", L".. (Parent directory)", L"Rename", L"Hide tab", L"Close tab", L"Show all",
+     L"%d hidden"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
-     L"Buscar carpetas…", L".. (Carpeta superior)"},
+     L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
+     L"Mostrar todas", L"%d ocultas"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -201,6 +204,10 @@ static RECT g_winRect{};
 static int g_cellW = 8, g_cellH = 16;
 static int g_textDy = 0;  // margen vertical del texto dentro de la celda
 static std::wstring g_sessionPath;
+// Varias ventanas: un proceso por ventana, cada una con su fichero window-<id>.txt en g_windowDir.
+static std::wstring g_windowDir;
+static bool g_keepSession = false;  // al cerrar, conservar la sesión (salir de todo / apagar Windows)
+static UINT g_msgQuitAll;           // mensaje registrado: «cerrar todas guardándolas»
 static bool g_focused = true;
 
 // Selección (coordenadas de vista dentro de un panel).
@@ -249,8 +256,12 @@ static Pane* g_dragPane = nullptr;
 static Pane* g_dropTarget = nullptr;
 static bool g_layoutHeaders = false;
 // Barra de título propia.
-enum { HIT_NONE, HIT_TAB, HIT_TABCLOSE, HIT_PLUS, HIT_MIN, HIT_MAX, HIT_CLOSE };
+enum { HIT_NONE, HIT_TAB, HIT_TABCLOSE, HIT_PLUS, HIT_MIN, HIT_MAX, HIT_CLOSE, HIT_TOGGLE, HIT_HIDDEN };
+static bool g_vertTabs = false;  // pestañas en barra lateral (botón de la izquierda)
 static int g_hoverHit = HIT_NONE, g_hoverTab = -1, g_pressedHit = HIT_NONE;
+// Pestaña pulsada (para arrastrarla fuera de la ventana).
+static int g_tabDrag = -1;
+static POINT g_tabDragStart{};
 
 // Guion de prueba (--script) para capturas automáticas.
 static std::vector<std::wstring> g_script;
@@ -658,11 +669,14 @@ static void LayoutNode(Node* n, RECT r) {
   }
 }
 
+static int SidebarW() { return g_vertTabs ? Px(220) : 0; }
+
 static void Relayout() {
   if (!g_hwnd || g_tabs.empty()) return;
   RECT rc;
   GetClientRect(g_hwnd, &rc);
   rc.top += TabBarH();
+  rc.left += SidebarW();
   for (auto& t : g_tabs) {
     g_layoutHeaders = !t.root->leaf();  // cabeceras solo con el panel dividido
     LayoutNode(t.root, rc);
@@ -848,10 +862,31 @@ static void SaveNode(std::ostringstream& o, Node* n) {
   }
 }
 
+static void SaveNode(std::ostringstream& o, Node* n);
+
+static std::string SessionHeader(int active, const RECT* win, bool max) {
+  std::ostringstream o;
+  o << "BW1\nactive " << active << "\nui " << g_zoom << " " << g_fontPx << "\nlang " << kLangCodes[g_lang]
+    << "\nvtabs " << (g_vertTabs ? 1 : 0) << "\n";
+  if (win) o << "win " << win->left << " " << win->top << " " << win->right << " " << win->bottom << " " << (max ? 1 : 0) << "\n";
+  return o.str();
+}
+
+static bool WriteSessionFile(const std::wstring& path, const std::string& data) {
+  std::wstring tmp = path + L".tmp";
+  HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return false;
+  DWORD w;
+  WriteFile(f, data.data(), (DWORD)data.size(), &w, nullptr);
+  CloseHandle(f);
+  return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
 static void SaveSession() {
   if (g_tabs.empty() || g_sessionPath.empty()) return;
   std::ostringstream o;
-  o << "BW1\nactive " << g_activeTab << "\nui " << g_zoom << " " << g_fontPx << "\nlang " << kLangCodes[g_lang] << "\n";
+  o << "BW1\nactive " << g_activeTab << "\nui " << g_zoom << " " << g_fontPx << "\nlang " << kLangCodes[g_lang]
+    << "\nvtabs " << (g_vertTabs ? 1 : 0) << "\n";
   WINDOWPLACEMENT wp{sizeof wp};
   if (g_hwnd && GetWindowPlacement(g_hwnd, &wp)) {
     RECT& r = wp.rcNormalPosition;
@@ -863,7 +898,7 @@ static void SaveSession() {
     std::vector<Pane*> ls;
     Leaves(t.root, ls);
     int ai = (int)(std::find(ls.begin(), ls.end(), t.active) - ls.begin());
-    o << "tab " << ai << " " << HexEncode(ToUtf8(t.name)) << "\n";
+    o << "tab " << ai << " " << HexEncode(ToUtf8(t.name)) << (t.hidden ? " hidden" : "") << "\n";
     SaveNode(o, t.root);
   }
   std::string data = o.str();
@@ -933,6 +968,12 @@ static bool LoadSession() {
   if (!(in >> magic) || magic != "BW1" || !(in >> word >> active)) return false;
   std::vector<Pane*> created;
   while (in >> word) {
+    if (word == "vtabs") {
+      int v = 0;
+      in >> v;
+      g_vertTabs = v != 0;
+      continue;
+    }
     if (word == "lang") {
       std::string code;
       in >> code;
@@ -965,14 +1006,24 @@ static bool LoadSession() {
       in.clear();
       in.seekg(pos);
     }
+    bool hidden = false;
+    pos = in.tellg();
+    std::string flag;
+    if (in >> flag && flag == "hidden") {
+      hidden = true;
+    } else {
+      in.clear();
+      in.seekg(pos);
+    }
     size_t first = created.size();
     Node* root = LoadNode(in, created);
     if (!root) break;
-    Tab t{root, created[std::min(first + std::max(ai, 0), created.size() - 1)], ToWide(name)};
+    Tab t{root, created[std::min(first + std::max(ai, 0), created.size() - 1)], ToWide(name), hidden};
     g_tabs.push_back(t);
   }
   if (g_tabs.empty()) return false;
   g_activeTab = std::clamp(active, 0, (int)g_tabs.size() - 1);
+  g_tabs[g_activeTab].hidden = false;
   Relayout();
   for (auto& t : g_tabs) {
     std::vector<Pane*> ls;
@@ -1226,12 +1277,147 @@ static bool RenameKey(WPARAM vk) {
 
 static void ActivateTab(int i) {
   if (i < 0 || i >= (int)g_tabs.size()) return;
+  g_tabs[i].hidden = false;  // ir a una pestaña oculta la vuelve a mostrar
   g_activeTab = i;
   ClearSelection();
   Relayout();
 }
 
 static void OpenFind(Pane* p);
+
+static int HiddenCount() {
+  int n = 0;
+  for (auto& t : g_tabs) n += t.hidden;
+  return n;
+}
+
+// Siguiente pestaña visible en la dirección dir (las ocultas se saltan).
+static int NextVisibleTab(int from, int dir) {
+  int n = (int)g_tabs.size();
+  for (int k = 1; k <= n; k++) {
+    int j = ((from + dir * k) % n + n) % n;
+    if (!g_tabs[j].hidden) return j;
+  }
+  return from;
+}
+
+static void HideTab(int i) {
+  if ((int)g_tabs.size() - HiddenCount() <= 1) return;  // siempre queda una visible
+  g_tabs[i].hidden = true;
+  if (i == g_activeTab) ActivateTab(NextVisibleTab(i, 1));
+  SaveSession();
+  Relayout();
+}
+
+static void CloseTab(int i) {
+  std::vector<Pane*> ls;
+  Leaves(g_tabs[i].root, ls);
+  for (Pane* p : ls) ClosePane(p);
+}
+
+// Menú de una pestaña (clic derecho): renombrar, ocultar, cerrar.
+static void TabMenu(int i, POINT screen) {
+  HMENU m = CreatePopupMenu();
+  AppendMenuW(m, MF_STRING, 1, T(S_RENAME));
+  AppendMenuW(m, MF_STRING | ((int)g_tabs.size() - HiddenCount() <= 1 ? MF_GRAYED : 0), 2, T(S_HIDE));
+  AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(m, MF_STRING, 3, T(S_CLOSE_TAB));
+  int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, g_hwnd, nullptr);
+  DestroyMenu(m);
+  if (cmd == 1) ActivateTab(i), BeginRename(i);
+  else if (cmd == 2) HideTab(i);
+  else if (cmd == 3) CloseTab(i);
+}
+
+// Menú de pestañas ocultas: cada una (la muestra y va a ella) o todas.
+static void HiddenMenu(POINT screen) {
+  HMENU m = CreatePopupMenu();
+  for (int i = 0; i < (int)g_tabs.size(); i++)
+    if (g_tabs[i].hidden)
+      AppendMenuW(m, MF_STRING, 100 + i,
+                  (g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name).c_str());
+  AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(m, MF_STRING, 1, T(S_SHOW_ALL));
+  int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, g_hwnd, nullptr);
+  DestroyMenu(m);
+  if (cmd == 1)
+    for (auto& t : g_tabs) t.hidden = false;
+  else if (cmd >= 100) ActivateTab(cmd - 100);
+  if (cmd) SaveSession(), Relayout();
+}
+
+// ---------------------------------------------------------------------------
+// Varias ventanas
+
+static std::wstring NewWindowFile() {
+  wchar_t id[32];
+  swprintf(id, 32, L"%llx%04x", (unsigned long long)GetTickCount64(), (unsigned)(GetCurrentProcessId() & 0xffff));
+  return g_windowDir + L"\\window-" + id + L".txt";
+}
+
+static void LaunchWindow(const std::wstring& file) {
+  wchar_t exe[MAX_PATH];
+  GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --window \"" + file + L"\"";
+  STARTUPINFOW si{sizeof si};
+  PROCESS_INFORMATION pi{};
+  if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
+    CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
+}
+
+static BOOL CALLBACK CountOthers(HWND h, LPARAM lp) {
+  wchar_t cls[32];
+  if (h != g_hwnd && GetClassNameW(h, cls, 32) && !wcscmp(cls, L"WarpLite")) ++*(int*)lp;
+  return TRUE;
+}
+
+static int OtherWindows() {
+  int n = 0;
+  EnumWindows(CountOthers, (LPARAM)&n);
+  return n;
+}
+
+static BOOL CALLBACK SendQuitAll(HWND h, LPARAM) {
+  wchar_t cls[32];
+  if (GetClassNameW(h, cls, 32) && !wcscmp(cls, L"WarpLite")) PostMessageW(h, g_msgQuitAll, 0, 0);
+  return TRUE;
+}
+
+// Lleva una pestaña (o un solo panel) a una ventana nueva en el punto de la pantalla donde
+// se suelta: se escribe su sesión, se abre otro warp-lite con ella y aquí se cierra. Lo que
+// estaba en marcha (ssh + tmux) se relanza allí.
+static void Detach(int tabIdx, Pane* single, POINT screen) {
+  if (tabIdx < 0 || tabIdx >= (int)g_tabs.size()) return;
+  Tab& t = g_tabs[tabIdx];
+  Node* root = single ? single->node : t.root;
+  std::vector<Pane*> moved;
+  Leaves(root, moved);
+  RECT wr;
+  GetWindowRect(g_hwnd, &wr);
+  int w = wr.right - wr.left, h = wr.bottom - wr.top;
+  RECT win{screen.x - Px(120), screen.y - Px(20), screen.x - Px(120) + w, screen.y - Px(20) + h};
+  int ai = single ? 0 : (int)(std::find(moved.begin(), moved.end(), t.active) - moved.begin());
+  std::ostringstream o;
+  o << SessionHeader(0, &win, false) << "tab " << ai << " " << HexEncode(ToUtf8(single ? L"" : t.name)) << "\n";
+  SaveNode(o, root);
+  std::wstring file = NewWindowFile();
+  if (!WriteSessionFile(file, o.str())) return;
+  LaunchWindow(file);
+  for (Pane* p : moved) ClosePane(p);
+  SaveSession();
+}
+
+static bool OutsideWindow(POINT screen) {
+  RECT wr;
+  GetWindowRect(g_hwnd, &wr);
+  return !PtInRect(&wr, screen);
+}
+
+static void ToggleVerticalTabs() {
+  g_vertTabs = !g_vertTabs;
+  SaveSession();
+  Relayout();
+}
 
 // Atajos de Warp en Windows/Linux (app/src/util/bindings.rs y pane_group/mod.rs).
 static bool HandleShortcut(WPARAM vk) {
@@ -1252,6 +1438,7 @@ static bool HandleShortcut(WPARAM vk) {
       case 'C': CopySelection(); return true;
       case 'V': Paste(act); return true;
       case 'F': OpenFind(act); return true;  // Ctrl+Shift+F: el de Warp
+      case 'Q': EnumWindows(SendQuitAll, 0); return true;  // cerrar todas las ventanas guardándolas
       case VK_OEM_4: CyclePane(-1); InvalidateRect(g_hwnd, nullptr, FALSE); return true;  // Ctrl+Shift+{
       case VK_OEM_6: CyclePane(+1); InvalidateRect(g_hwnd, nullptr, FALSE); return true;  // Ctrl+Shift+}
       case VK_PRIOR:
@@ -1263,7 +1450,7 @@ static bool HandleShortcut(WPARAM vk) {
         InvalidateRect(g_hwnd, nullptr, FALSE);
         return true;
       }
-      case VK_TAB: ActivateTab((g_activeTab + (int)g_tabs.size() - 1) % (int)g_tabs.size()); return true;
+      case VK_TAB: ActivateTab(NextVisibleTab(g_activeTab, -1)); return true;
     }
   }
   if (ctrl && alt && (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN)) {
@@ -1279,9 +1466,9 @@ static bool HandleShortcut(WPARAM vk) {
   }
   if (ctrl && !shift && !alt) {
     switch (vk) {
-      case VK_PRIOR: ActivateTab((g_activeTab + (int)g_tabs.size() - 1) % (int)g_tabs.size()); return true;
+      case VK_PRIOR: ActivateTab(NextVisibleTab(g_activeTab, -1)); return true;
       case VK_NEXT:
-      case VK_TAB: ActivateTab((g_activeTab + 1) % (int)g_tabs.size()); return true;
+      case VK_TAB: ActivateTab(NextVisibleTab(g_activeTab, 1)); return true;
       case VK_OEM_PLUS:
       case VK_ADD: SetZoom(g_zoom + 10); return true;
       case VK_OEM_MINUS:
@@ -1299,8 +1486,12 @@ static bool HandleShortcut(WPARAM vk) {
       case 'V': Paste(act); return true;
       case 'F': OpenFind(act); return true;
     }
-    if (vk >= '1' && vk <= '9') {
-      ActivateTab(vk == '9' ? (int)g_tabs.size() - 1 : (int)(vk - '1'));
+    if (vk >= '1' && vk <= '9') {  // entre las visibles
+      std::vector<int> vis;
+      for (int i = 0; i < (int)g_tabs.size(); i++)
+        if (!g_tabs[i].hidden) vis.push_back(i);
+      int k = vk == '9' ? (int)vis.size() - 1 : (int)(vk - '1');
+      if (k < (int)vis.size()) ActivateTab(vis[k]);
       return true;
     }
   }
@@ -1502,8 +1693,14 @@ static void PickChoose(int i) {
   } else {
     path = base + L"\\" + e.name;
   }
+  // Cadena literal de PowerShell: toda comilla simple (también las tipográficas ‘ ’ ‚ ‛, que
+  // PowerShell trata igual) va duplicada; los controles no pueden darse en nombres de Windows.
   std::wstring quoted = L"'";
-  for (wchar_t c : path) quoted += c == L'\'' ? std::wstring(L"''") : std::wstring(1, c);
+  for (wchar_t c : path) {
+    if (c < 0x20) return;
+    quoted += c;
+    if (c == L'\'' || c == 0x2018 || c == 0x2019 || c == 0x201A || c == 0x201B) quoted += c;
+  }
   quoted += L"'";
   if (!e.dir) {
     EditorInsert(p, (p->caret && p->edit[p->caret - 1] != L' ' ? L" " : L"") + quoted);
@@ -1868,21 +2065,64 @@ static int TabWidth() { return Px(200); }
 static int TabsX0() { return Px(8); }
 static int WinBtnW() { return Px(46); }
 
+// Dónde va cada pestaña visible, el «+», el botón de ocultas y el de alternar, en los dos modos.
+struct TabLayout {
+  std::vector<std::pair<int, RECT>> tabs;
+  RECT plus{}, hiddenBtn{}, toggle{};
+  int end = 0;  // x donde acaba lo dibujado en la barra de título
+};
+
+static TabLayout ComputeTabs() {
+  TabLayout L;
+  int th = TabBarH();
+  L.toggle = RECT{Px(6), Px(6), Px(6) + Px(32), th - Px(2)};
+  int hidden = HiddenCount();
+  if (!g_vertTabs) {
+    int x = L.toggle.right + Px(6), tw = TabWidth();
+    for (int i = 0; i < (int)g_tabs.size(); i++)
+      if (!g_tabs[i].hidden) L.tabs.push_back({i, RECT{x, Px(6), x + tw - Px(2), th}}), x += tw;
+    L.plus = RECT{x, Px(6), x + Px(34), th};
+    x += Px(34);
+    if (hidden) L.hiddenBtn = RECT{x, Px(6), x + Px(90), th}, x += Px(90);
+    L.end = x;
+  } else {
+    int y = th + Px(6), rowH = Px(34), sw = SidebarW();
+    for (int i = 0; i < (int)g_tabs.size(); i++)
+      if (!g_tabs[i].hidden) L.tabs.push_back({i, RECT{Px(6), y, sw - Px(6), y + rowH}}), y += rowH + Px(2);
+    L.plus = RECT{Px(6), y, sw - Px(6), y + rowH};
+    y += rowH + Px(2);
+    if (hidden) L.hiddenBtn = RECT{Px(6), y, sw - Px(6), y + rowH};
+    L.end = L.toggle.right;
+  }
+  return L;
+}
+
+static RECT TabCloseRect(RECT r) { return RECT{r.right - Px(28), r.top, r.right - Px(6), r.bottom}; }
+
+// Qué hay bajo el punto en la barra de título o en la barra lateral de pestañas.
 static int TitleHit(int x, int y, int* tab) {
   *tab = -1;
-  if (y >= TabBarH()) return HIT_NONE;
-  RECT rc;
-  GetClientRect(g_hwnd, &rc);
-  int bw = WinBtnW();
-  if (x >= rc.right - bw) return HIT_CLOSE;
-  if (x >= rc.right - 2 * bw) return HIT_MAX;
-  if (x >= rc.right - 3 * bw) return HIT_MIN;
-  int n = (int)g_tabs.size(), tw = TabWidth(), x0 = TabsX0();
-  if (x >= x0 && x < x0 + n * tw && y >= Px(6)) {
-    *tab = (x - x0) / tw;
-    return x >= x0 + (*tab + 1) * tw - Px(28) ? HIT_TABCLOSE : HIT_TAB;
+  bool inTitle = y < TabBarH(), inSide = !inTitle && x < SidebarW();
+  if (!inTitle && !inSide) return HIT_NONE;
+  POINT pt{x, y};
+  if (inTitle) {
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    int bw = WinBtnW();
+    if (x >= rc.right - bw) return HIT_CLOSE;
+    if (x >= rc.right - 2 * bw) return HIT_MAX;
+    if (x >= rc.right - 3 * bw) return HIT_MIN;
   }
-  if (x >= x0 + n * tw && x < x0 + n * tw + Px(34)) return HIT_PLUS;
+  TabLayout L = ComputeTabs();
+  if (PtInRect(&L.toggle, pt)) return HIT_TOGGLE;
+  for (auto& [i, r] : L.tabs)
+    if (PtInRect(&r, pt)) {
+      *tab = i;
+      RECT c = TabCloseRect(r);
+      return PtInRect(&c, pt) ? HIT_TABCLOSE : HIT_TAB;
+    }
+  if (PtInRect(&L.plus, pt)) return HIT_PLUS;
+  if (PtInRect(&L.hiddenBtn, pt)) return HIT_HIDDEN;
   return HIT_NONE;  // resto de la barra: arrastrar la ventana
 }
 
@@ -2210,51 +2450,73 @@ static void Text(HDC dc, const std::wstring& s, RECT r, COLORREF c, UINT flags) 
   DrawTextW(dc, s.c_str(), (int)s.size(), &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | flags);
 }
 
-static void DrawTitleBar(HDC dc, int w) {
+static void DrawTabItem(HDC dc, int i, RECT r, bool vertical) {
+  bool act = i == g_activeTab, hover = g_hoverTab == i;
+  if (act || hover) Fill(dc, r, act ? kTabActiveBg : RGB(0x1a, 0x1a, 0x1a));
+  if (vertical && act) Fill(dc, RECT{r.left, r.top, r.left + Px(3), r.bottom}, kAccent);
+  RECT tr{r.left + (vertical ? Px(14) : Px(28)), r.top, r.right - Px(28), r.bottom};
+  UINT align = vertical ? DT_LEFT : DT_CENTER;
+  if (i == g_renameTab) {  // editando el nombre: texto con cursor
+    Fill(dc, r, kTabActiveBg);
+    Fill(dc, RECT{r.left, r.bottom - Px(2), r.right, r.bottom}, kAccent);
+    SIZE sz{};
+    GetTextExtentPoint32W(dc, g_renameText.c_str(), (int)g_renameText.size(), &sz);
+    int cx = vertical ? std::min<int>(tr.left + sz.cx, tr.right) : std::min((int)(tr.left + tr.right + sz.cx) / 2, (int)tr.right);
+    if (g_renameAll && sz.cx > 0)  // selección de todo el nombre
+      Fill(dc, RECT{std::max(cx - (int)sz.cx, (int)tr.left), r.top + Px(8), cx + 1, r.bottom - Px(8)}, kSelBg);
+    Text(dc, g_renameText, tr, kFg, align);
+    Fill(dc, RECT{cx + 1, r.top + Px(9), cx + 1 + std::max(1, Px(1)), r.bottom - Px(9)}, kFg);
+    return;
+  }
+  const std::wstring& label = g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name;
+  Text(dc, label, tr, act ? kFg : kTabText, align | DT_END_ELLIPSIS);
+  if (act || hover) {
+    RECT xr = TabCloseRect(r);
+    bool hx = g_hoverHit == HIT_TABCLOSE && hover;
+    SelectObject(dc, g_iconFont);
+    Text(dc, L"", xr, hx ? kFg : kTabText, DT_CENTER);
+    SelectObject(dc, g_uiFont);
+  }
+}
+
+static void DrawTitleBar(HDC dc, int w, int h) {
   int th = TabBarH();
   Fill(dc, RECT{0, 0, w, th}, kTitleBg);
+  if (g_vertTabs) {
+    Fill(dc, RECT{0, th, SidebarW(), h}, kTitleBg);
+    Fill(dc, RECT{SidebarW() - 1, th, SidebarW(), h}, kDivider);
+  }
   SetBkMode(dc, TRANSPARENT);
   SelectObject(dc, g_uiFont);
-  int tw = TabWidth(), x0 = TabsX0();
-  for (int i = 0; i < (int)g_tabs.size(); i++) {
-    RECT r{x0 + i * tw, Px(6), x0 + (i + 1) * tw - Px(2), th};
-    bool act = i == g_activeTab, hover = g_hoverTab == i;
-    if (act || hover) Fill(dc, r, act ? kTabActiveBg : RGB(0x1a, 0x1a, 0x1a));
-    RECT tr{r.left + Px(28), r.top, r.right - Px(28), r.bottom};
-    if (i == g_renameTab) {  // editando el nombre: texto con cursor
-      Fill(dc, r, kTabActiveBg);
-      Fill(dc, RECT{r.left, r.bottom - Px(2), r.right, r.bottom}, kAccent);
-      SIZE sz{};
-      GetTextExtentPoint32W(dc, g_renameText.c_str(), (int)g_renameText.size(), &sz);
-      int cx = std::min((int)(tr.left + tr.right + sz.cx) / 2, (int)tr.right);
-      if (g_renameAll && sz.cx > 0)  // selección de todo el nombre
-        Fill(dc, RECT{std::max(cx - (int)sz.cx, (int)tr.left), r.top + Px(8), cx + 1, r.bottom - Px(8)}, kSelBg);
-      Text(dc, g_renameText, tr, kFg, DT_CENTER);
-      Fill(dc, RECT{cx + 1, r.top + Px(9), cx + 1 + std::max(1, Px(1)), r.bottom - Px(9)}, kFg);
-      continue;
-    }
-    const std::wstring& label = g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name;
-    Text(dc, label, tr, act ? kFg : kTabText, DT_CENTER | DT_END_ELLIPSIS);
-    if (act || hover) {
-      RECT xr{r.right - Px(28), r.top, r.right - Px(6), r.bottom};
-      bool hx = g_hoverHit == HIT_TABCLOSE && hover;
-      SelectObject(dc, g_iconFont);
-      Text(dc, L"\uE8BB", xr, hx ? kFg : kTabText, DT_CENTER);
-      SelectObject(dc, g_uiFont);
-    }
+  TabLayout L = ComputeTabs();
+  // Botón para alternar pestañas arriba / en barra lateral (dos rectángulos)
+  {
+    RECT r = L.toggle;
+    bool hov = g_hoverHit == HIT_TOGGLE;
+    if (hov || g_vertTabs) Fill(dc, r, hov ? RGB(0x2a, 0x2a, 0x2a) : RGB(0x1e, 0x1e, 0x1e));
+    COLORREF c = hov || g_vertTabs ? kFg : kTabText;
+    int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2, iw = Px(16), ih = Px(12);
+    RECT o{cx - iw / 2, cy - ih / 2, cx + iw / 2, cy + ih / 2};
+    HBRUSH b = CreateSolidBrush(c);
+    FrameRect(dc, &o, b);
+    DeleteObject(b);
+    Fill(dc, RECT{o.left + Px(5), o.top, o.left + Px(5) + 1, o.bottom}, c);
   }
-  int px = x0 + (int)g_tabs.size() * tw;
-  RECT plus{px, Px(6), px + Px(34), th};
-  if (g_hoverHit == HIT_PLUS) Fill(dc, plus, RGB(0x1a, 0x1a, 0x1a));
-  Text(dc, L"+", plus, g_hoverHit == HIT_PLUS ? kFg : kTabText, DT_CENTER);
+  for (auto& [i, r] : L.tabs) DrawTabItem(dc, i, r, g_vertTabs);
+  if (g_hoverHit == HIT_PLUS) Fill(dc, L.plus, RGB(0x1a, 0x1a, 0x1a));
+  Text(dc, L"+", L.plus, g_hoverHit == HIT_PLUS ? kFg : kTabText, DT_CENTER);
+  if (L.hiddenBtn.right > L.hiddenBtn.left) {
+    if (g_hoverHit == HIT_HIDDEN) Fill(dc, L.hiddenBtn, RGB(0x1a, 0x1a, 0x1a));
+    Text(dc, Tf(S_HIDDEN_N, HiddenCount()), L.hiddenBtn, g_hoverHit == HIT_HIDDEN ? kFg : kTabText, DT_CENTER);
+  }
   if (!g_toast.empty()) {
-    RECT tr{px + Px(44), 0, w - 3 * WinBtnW() - Px(12), th};
+    RECT tr{L.end + Px(10), 0, w - 3 * WinBtnW() - Px(12), th};
     Text(dc, g_toast, tr, kFg, DT_RIGHT);
   }
   // Minimizar, maximizar/restaurar, cerrar
   SelectObject(dc, g_iconFont);
   int bw = WinBtnW();
-  const wchar_t* glyphs[3] = {L"\uE921", IsZoomed(g_hwnd) ? L"\uE923" : L"\uE922", L"\uE8BB"};
+  const wchar_t* glyphs[3] = {L"", IsZoomed(g_hwnd) ? L"" : L"", L""};
   for (int k = 0; k < 3; k++) {
     RECT r{w - (3 - k) * bw, 0, w - (2 - k) * bw, th};
     bool hover = g_hoverHit == HIT_MIN + k;
@@ -2364,7 +2626,7 @@ static void DrawPicker(HDC dc) {
 static void Render(HDC dc, int w, int h) {
   RECT all{0, 0, w, h};
   Fill(dc, all, kBg);
-  DrawTitleBar(dc, w);
+  DrawTitleBar(dc, w, h);
   if (g_tabs.empty()) return;
   Tab& t = CurTab();
   std::vector<Pane*> ls;
@@ -2470,6 +2732,18 @@ static void RunScriptStep() {
     FindStep(1);
   } else if (s == L"find-close") {
     CloseFind();
+  } else if (s == L"detach-tab") {
+    RECT wr;
+    GetWindowRect(g_hwnd, &wr);
+    Detach(g_activeTab, nullptr, POINT{wr.left + 200, wr.top + 120});
+    delay = 3000;
+  } else if (s == L"quit-all") {
+    EnumWindows(SendQuitAll, 0);
+    return;
+  } else if (s.rfind(L"hide-tab", 0) == 0) {
+    HideTab(g_activeTab);
+  } else if (s == L"vtabs") {
+    ToggleVerticalTabs();
   } else if (s == L"picker" && p) {
     OpenPicker(p);
   } else if (s.rfind(L"picker-type:", 0) == 0) {
@@ -2524,8 +2798,7 @@ static void SetHover(int hit, int tab) {
   if (hit == g_hoverHit && tab == g_hoverTab) return;
   g_hoverHit = hit;
   g_hoverTab = tab;
-  RECT r{0, 0, 1 << 15, TabBarH()};
-  InvalidateRect(g_hwnd, &r, FALSE);
+  InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2731,7 +3004,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_LBUTTONDBLCLK: {
       int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp), i;
-      if (!g_tabs.empty() && y < TabBarH() && TitleHit(x, y, &i) == HIT_TAB) {
+      if (!g_tabs.empty() && (y < TabBarH() || x < SidebarW()) && TitleHit(x, y, &i) == HIT_TAB) {
         ActivateTab(i);
         BeginRename(i);
         return 0;
@@ -2752,17 +3025,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (!PtInRect(&g_pick.rc, pt)) ClosePicker();
         return 0;
       }
-      if (y < TabBarH()) {
+      if (y < TabBarH() || x < SidebarW()) {
         int i;
         int hit = TitleHit(x, y, &i);
+        POINT sp{x, y};
+        ClientToScreen(hwnd, &sp);
         if ((hit == HIT_TAB && msg == WM_MBUTTONDOWN) || (hit == HIT_TABCLOSE && msg == WM_LBUTTONDOWN)) {
-          std::vector<Pane*> ls;
-          Leaves(g_tabs[i].root, ls);
-          for (Pane* p : ls) ClosePane(p);
+          CloseTab(i);
+        } else if (msg == WM_RBUTTONDOWN && (hit == HIT_TAB || hit == HIT_TABCLOSE)) {
+          TabMenu(i, sp);
         } else if (msg == WM_LBUTTONDOWN) {
-          if (hit == HIT_TAB) ActivateTab(i);
+          if (hit == HIT_TAB) ActivateTab(i), g_tabDrag = i, g_tabDragStart = POINT{x, y}, SetCapture(hwnd);
           else if (hit == HIT_PLUS) NewTab();
-          else if (hit >= HIT_MIN) g_pressedHit = hit;  // se ejecuta al soltar
+          else if (hit == HIT_TOGGLE) ToggleVerticalTabs();
+          else if (hit == HIT_HIDDEN) HiddenMenu(sp);
+          else if (hit >= HIT_MIN && hit <= HIT_CLOSE) g_pressedHit = hit;  // se ejecuta al soltar
         }
         return 0;
       }
@@ -2827,10 +3104,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_tabs.empty()) return 0;
       {
         int tab;
-        int hit = y < TabBarH() ? TitleHit(x, y, &tab) : HIT_NONE;
+        int hit = y < TabBarH() || x < SidebarW() ? TitleHit(x, y, &tab) : HIT_NONE;
         SetHover(hit, tab);
         TRACKMOUSEEVENT tme{sizeof tme, TME_LEAVE, hwnd, 0};
         TrackMouseEvent(&tme);
+      }
+      if (g_tabDrag >= 0) {  // arrastrando una pestaña: fuera de la ventana se abre en otra
+        POINT sp;
+        GetCursorPos(&sp);
+        SetCursor(LoadCursor(nullptr, OutsideWindow(sp) ? IDC_SIZEALL : IDC_ARROW));
+        return 0;
       }
       if (g_dragPane) {
         Pane* t = PaneAt(x, y);
@@ -2889,12 +3172,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_pressedHit = HIT_NONE;
         return 0;
       }
-      if (g_dragPane) {  // soltar un panel sobre otro: intercambiarlos
+      if (g_tabDrag >= 0) {  // soltar una pestaña fuera de la ventana: a una ventana nueva
+        int ti = g_tabDrag;
+        g_tabDrag = -1;
+        ReleaseCapture();
+        POINT sp;
+        GetCursorPos(&sp);
+        if (msg == WM_LBUTTONUP && OutsideWindow(sp) && g_tabs.size() > 1) Detach(ti, nullptr, sp);
+        return 0;
+      }
+      if (g_dragPane) {  // soltar un panel sobre otro: intercambiarlos; fuera: ventana nueva
         Pane* target = g_dropTarget;
         Pane* dragged = g_dragPane;
         g_dragPane = g_dropTarget = nullptr;
         ReleaseCapture();
-        if (target && g_live.count(target) && g_live.count(dragged)) SwapPanes(dragged, target);
+        POINT sp;
+        GetCursorPos(&sp);
+        if (target && g_live.count(target) && g_live.count(dragged)) {
+          SwapPanes(dragged, target);
+        } else if (g_live.count(dragged) && OutsideWindow(sp) && (dragged->node->parent || g_tabs.size() > 1)) {
+          int ti = TabIndexOf(dragged);
+          Detach(ti, dragged->node->parent ? dragged : nullptr, sp);
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
@@ -2913,10 +3212,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (LOWORD(lp) == HTCLIENT) return TRUE;  // lo fija WM_MOUSEMOVE
       break;
     case WM_CLOSE:
-      SaveSession();
+      // Con otras ventanas abiertas, cerrar esta la quita de la sesión (como en Warp); la última
+      // que se cierra, «salir de todo» (Ctrl+Shift+Q) o apagar Windows la conservan.
+      if (!g_keepSession && OtherWindows() > 0 && !g_windowDir.empty()) DeleteFileW(g_sessionPath.c_str()), g_sessionPath.clear();
+      else SaveSession();
       DestroyWindow(hwnd);
       return 0;
+    case WM_QUERYENDSESSION:
+      g_keepSession = true;
+      SaveSession();
+      return TRUE;
+    case WM_ENDSESSION:
+      if (wp) SaveSession();
+      return 0;
     case WM_DESTROY: {
+      if (g_tabs.empty() && !g_keepSession && OtherWindows() > 0 && !g_sessionPath.empty())
+        DeleteFileW(g_sessionPath.c_str());  // se cerró su último panel y quedan otras ventanas
       std::vector<Pane*> all(g_live.begin(), g_live.end());
       for (Pane* p : all) DestroyPane(p);
       g_tabs.clear();
@@ -2924,19 +3235,76 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     }
   }
+  if (msg == g_msgQuitAll && g_msgQuitAll) {
+    g_keepSession = true;
+    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    return 0;
+  }
   return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static std::wstring SessionPath() {
+static HANDLE g_windowMutex;
+
+// Cada ventana «posee» su fichero mientras está abierta (mutex con el nombre del fichero).
+static bool ClaimWindowFile(const std::wstring& file) {
+  std::wstring name = L"Local\\warp-lite-" + file.substr(file.find_last_of(L'\\') + 1);
+  HANDLE m = CreateMutexW(nullptr, TRUE, name.c_str());
+  if (!m) return false;
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    CloseHandle(m);
+    return false;
+  }
+  g_windowMutex = m;
+  return true;
+}
+
+// Sesión de esta ventana. Sin --window: restaura todas las ventanas guardadas (esta se queda la
+// primera libre y abre las demás); si están todas abiertas, abre una ventana nueva.
+static std::wstring SessionPath(const std::wstring& windowArg) {
   wchar_t buf[MAX_PATH];
-  if (GetEnvironmentVariableW(L"WARPLITE_SESSION", buf, MAX_PATH)) return buf;
-  if (!GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) return L"warp-lite-session.txt";
-  std::wstring dir = std::wstring(buf) + L"\\warp-lite";
-  CreateDirectoryW(dir.c_str(), nullptr);
-  std::wstring path = dir + L"\\session.txt";
-  // Se llamaba better-warp: conserva la sesión anterior.
-  CopyFileW((std::wstring(buf) + L"\\BetterWarp\\session.txt").c_str(), path.c_str(), TRUE);
-  return path;
+  if (GetEnvironmentVariableW(L"WARPLITE_SESSION", buf, MAX_PATH)) return buf;  // pruebas: un fichero fijo
+  if (GetEnvironmentVariableW(L"WARPLITE_DIR", buf, MAX_PATH)) {
+    g_windowDir = buf;
+  } else {
+    if (!GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) return L"warp-lite-session.txt";
+    g_windowDir = std::wstring(buf) + L"\\warp-lite";
+    // Se llamaba better-warp, y antes había una sola sesión: se convierten en la primera ventana.
+    CreateDirectoryW(g_windowDir.c_str(), nullptr);
+    std::wstring single = g_windowDir + L"\\session.txt";
+    CopyFileW((std::wstring(buf) + L"\\BetterWarp\\session.txt").c_str(), single.c_str(), TRUE);
+    if (GetFileAttributesW(single.c_str()) != INVALID_FILE_ATTRIBUTES)
+      MoveFileExW(single.c_str(), (g_windowDir + L"\\window-1.txt").c_str(), 0);
+  }
+  CreateDirectoryW(g_windowDir.c_str(), nullptr);
+  if (!windowArg.empty()) {
+    ClaimWindowFile(windowArg);
+    return windowArg;
+  }
+  std::vector<std::wstring> files;
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((g_windowDir + L"\\window-*.txt").c_str(), &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do files.push_back(g_windowDir + L"\\" + fd.cFileName);
+    while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  std::sort(files.begin(), files.end());
+  std::wstring mine;
+  for (auto& file : files) {
+    if (mine.empty()) {
+      if (ClaimWindowFile(file)) mine = file;
+      continue;
+    }
+    std::wstring name = L"Local\\warp-lite-" + file.substr(file.find_last_of(L'\\') + 1);
+    HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE, name.c_str());
+    if (m) CloseHandle(m);  // ya abierta
+    else LaunchWindow(file);
+  }
+  if (mine.empty()) {
+    mine = NewWindowFile();
+    ClaimWindowFile(mine);
+  }
+  return mine;
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
@@ -2953,9 +3321,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     fn((HANDLE)-4);  // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 
   int argc = 0;
+  std::wstring windowArg;
   wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   for (int i = 1; i + 1 < argc; i++) {
-    if (!wcscmp(argv[i], L"--script")) {
+    if (!wcscmp(argv[i], L"--window")) windowArg = argv[++i];
+    else if (!wcscmp(argv[i], L"--script")) {
       std::wstring s = argv[++i];
       size_t pos;
       while ((pos = s.find(L'|')) != std::wstring::npos) g_script.push_back(s.substr(0, pos)), s.erase(0, pos + 1);
@@ -2963,7 +3333,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     }
   }
   LocalFree(argv);
-  g_sessionPath = SessionPath();
+  g_msgQuitAll = RegisterWindowMessageW(L"warp-lite-quit-all");
+  g_sessionPath = SessionPath(windowArg);
+  if (g_script.empty() && !windowArg.empty()) {  // pruebas: guion para las ventanas que se abren
+    wchar_t sc[2048];
+    if (GetEnvironmentVariableW(L"WARPLITE_CHILD_SCRIPT", sc, 2048)) {
+      std::wstring s = sc;
+      size_t pos;
+      while ((pos = s.find(L'|')) != std::wstring::npos) g_script.push_back(s.substr(0, pos)), s.erase(0, pos + 1);
+      if (!s.empty()) g_script.push_back(s);
+    }
+  }
   struct { const unsigned char *a, *b; } fonts[] = {{hack_regular, hack_regular_end},
                                                      {hack_bold, hack_bold_end},
                                                      {hack_italic, hack_italic_end},

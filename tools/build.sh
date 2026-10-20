@@ -32,7 +32,9 @@ if sub != 2:
     sys.exit(f'warp-lite.exe no es una app de ventana (subsistema {sub})')
 PY
   # Instalador: lleva dentro dist/warp-lite.exe (por eso va después).
-  "$ZIG" c++ -target $T -O2 -std=c++17 -municode -Wl,--subsystem,windows src/setup.cpp src/warp-lite.rc \
+  # La huella del .exe entra en la clave de caché de zig (que no sigue el .incbin).
+  STAMP=$(shasum dist/warp-lite.exe | cut -c1-16)
+  "$ZIG" c++ -target $T -O2 -std=c++17 -municode -DWARP_LITE_STAMP=$STAMP -Wl,--subsystem,windows src/setup.cpp src/warp-lite.rc \
     -lole32 -lshell32 -luuid -ladvapi32 -luser32 -static -o dist/warp-lite-setup.exe
   ls -l dist/warp-lite.exe dist/warp-lite-setup.exe
 }

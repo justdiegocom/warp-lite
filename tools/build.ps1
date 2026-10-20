@@ -16,7 +16,9 @@ if ($LASTEXITCODE) { throw 'falló main.cpp' }
 & $zig c++ -target $T -O2 -municode '-Wl,--subsystem,windows' build/main.o @objs src/warp-lite.rc `
   -lgdi32 -luser32 -lkernel32 -lshell32 -static -o dist/warp-lite.exe
 if ($LASTEXITCODE) { throw 'falló el enlace de warp-lite.exe' }
-& $zig c++ -target $T -O2 -std=c++17 -municode '-Wl,--subsystem,windows' src/setup.cpp src/warp-lite.rc `
+# La huella del .exe entra en la clave de caché de zig (que no sigue el .incbin).
+$stamp = (Get-FileHash dist\warp-lite.exe -Algorithm SHA1).Hash.Substring(0, 16)
+& $zig c++ -target $T -O2 -std=c++17 -municode "-DWARP_LITE_STAMP=$stamp" '-Wl,--subsystem,windows' src/setup.cpp src/warp-lite.rc `
   -lole32 -lshell32 -luuid -ladvapi32 -luser32 -static -o dist/warp-lite-setup.exe
 if ($LASTEXITCODE) { throw 'falló warp-lite-setup.exe' }
 Get-Item dist\warp-lite.exe, dist\warp-lite-setup.exe | ForEach-Object { "$($_.Name) $($_.Length)" }
