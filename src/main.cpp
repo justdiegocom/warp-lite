@@ -810,7 +810,7 @@ static void ClosePane(Pane* p) {
     delete n;
     DestroyPane(p);
     if (g_tabs.empty()) {
-      // Último panel cerrado: salimos sin pisar la sesión guardada.
+      // Último panel cerrado: la ventana se cierra y se descarta su sesión (WM_DESTROY).
       DestroyWindow(g_hwnd);
       return;
     }
@@ -3097,6 +3097,9 @@ static void RunScriptStep() {
     GetWindowRect(g_hwnd, &wr);
     Detach(g_activeTab, nullptr, POINT{wr.left + 200, wr.top + 120});
     delay = 3000;
+  } else if (s == L"close") {  // como pulsar la X de esta ventana
+    PostMessage(g_hwnd, WM_CLOSE, 0, 0);
+    return;
   } else if (s == L"quit-all") {
     EnumWindows(SendQuitAll, 0);
     return;
@@ -3605,10 +3608,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (LOWORD(lp) == HTCLIENT) return TRUE;  // lo fija WM_MOUSEMOVE
       break;
     case WM_CLOSE:
-      // Con otras ventanas abiertas, cerrar esta la quita de la sesión (como en Warp); la última
-      // que se cierra, «salir de todo» (Ctrl+Shift+Q) o apagar Windows la conservan.
-      if (!g_keepSession && OtherWindows() > 0 && !g_windowDir.empty()) DeleteFileW(g_sessionPath.c_str()), g_sessionPath.clear();
-      else SaveSession();
+      // Cerrar con la X guarda la ventana: al volver a abrir Warp vuelven todas. Para descartarla
+      // se cierran sus pestañas (al quedarse vacía se borra su sesión, ver WM_DESTROY).
+      SaveSession();
       DestroyWindow(hwnd);
       return 0;
     case WM_QUERYENDSESSION:
@@ -3619,8 +3621,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (wp) SaveSession();
       return 0;
     case WM_DESTROY: {
-      if (g_tabs.empty() && !g_keepSession && OtherWindows() > 0 && !g_sessionPath.empty())
-        DeleteFileW(g_sessionPath.c_str());  // se cerró su último panel y quedan otras ventanas
+      if (g_tabs.empty() && !g_keepSession && !g_windowDir.empty() && !g_sessionPath.empty())
+        DeleteFileW(g_sessionPath.c_str());  // se cerraron todas sus pestañas: la ventana se descarta
       std::vector<Pane*> all(g_live.begin(), g_live.end());
       for (Pane* p : all) DestroyPane(p);
       g_tabs.clear();

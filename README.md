@@ -93,7 +93,7 @@ Icono propio en `assets/` (`warp-lite.ico`, incrustado en los dos `.exe`). `tool
 - Clic en el apartado de la carpeta: selector con buscador (carpeta: cd; archivo: su ruta a la caja).
 - Arrastrar una pestaña o la cabecera de un panel fuera de la ventana: se abre en otra ventana (un
   proceso por ventana, sesión en `%APPDATA%\warp-lite\window-<id>.txt`). Al abrir warp-lite vuelven
-  todas; cerrar una con otras abiertas la quita; Ctrl+Shift+Q o apagar Windows las guardan todas.
+  todas: cerrar con la X guarda la ventana; cerrar todas sus pestañas la descarta.
 - Al reabrir, los paneles que tenían algo en marcha (ssh + tmux) lo relanzan; el resto deja la orden
   en la caja.
 
