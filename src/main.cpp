@@ -30,6 +30,7 @@
 #include <array>
 #include <functional>
 #include <map>
+#include <memory>
 #include <unordered_map>
 #include <set>
 #include <sstream>
@@ -92,7 +93,7 @@ static const int kGap = 1;           // separación entre paneles (px)
 static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
-enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT };
+enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP };
 enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4 };
 
 // ---------------------------------------------------------------------------
@@ -148,6 +149,9 @@ struct Pane {
   // OSC 9;9;<ruta> cada vez que muestra el prompt; mientras tanto se escribe en la caja.
   bool integrated = false, atPrompt = false;
   std::string oscBuf;
+  std::string clipBuf;  // OSC 52 a medio llegar (tmux copia así al portapapeles)
+  char selBuf[4096];    // donde libvterm decodifica el base64 del OSC 52
+  std::string token;  // va en el OSC 9;9 del prompt: sin él, un `cat` cualquiera podría imitarlo
   std::wstring cwd, edit;
   size_t caret = 0;
   std::vector<std::wstring> history;
@@ -429,18 +433,37 @@ static int CbSetTermProp(VTermProp prop, VTermValue* v, void* user) {
   return 1;
 }
 
-// OSC 9;9;<ruta> (lo emite el prompt de warp-lite): la shell espera una orden en <ruta>.
+// Solo carpetas locales (C:\...): nada de \\servidor ni \\?\, que Windows abriría por la red.
+static bool IsLocalDir(const std::wstring& d) {
+  return d.size() >= 3 && iswalpha(d[0]) && d[1] == L':' && d[2] == L'\\';
+}
+
+// OSC 9;9;<token>;<ruta> (lo emite el prompt de warp-lite): la shell espera una orden en <ruta>.
 static int CbOsc(int command, VTermStringFragment frag, void* user) {
   Pane* p = (Pane*)user;
   if (command != 9) return 0;
   if (frag.initial) p->oscBuf.clear();
   p->oscBuf.append(frag.str, frag.len);
-  if (frag.final && p->oscBuf.rfind("9;", 0) == 0) {
-    p->cwd = ToWide(p->oscBuf.substr(2));
+  std::string head = "9;" + p->token + ";";
+  if (frag.final && !p->token.empty() && p->oscBuf.rfind(head, 0) == 0) {
+    std::wstring dir = ToWide(p->oscBuf.substr(head.size()));
+    if (!IsLocalDir(dir)) return 1;
+    p->cwd = dir;
     bool first = !p->integrated;
     p->integrated = p->atPrompt = true;
     PostMessage(g_hwnd, WM_APP_LAYOUT, first, (LPARAM)p);
   }
+  return 1;
+}
+
+// OSC 52 (lo que se copia en tmux): libvterm ya lo trae decodificado; al acabar, al portapapeles.
+// Solo escritura: las consultas (OSC 52;c;?) no se contestan.
+static int CbSelSet(VTermSelectionMask mask, VTermStringFragment frag, void* user) {
+  Pane* p = (Pane*)user;
+  if (!(mask & VTERM_SELECTION_CLIPBOARD)) return 1;
+  if (frag.initial) p->clipBuf.clear();
+  if (p->clipBuf.size() < (8u << 20)) p->clipBuf.append(frag.str ? frag.str : "", frag.len);
+  if (frag.final && !p->clipBuf.empty()) PostMessage(g_hwnd, WM_APP_CLIP, 0, (LPARAM) new std::wstring(ToWide(p->clipBuf)));
   return 1;
 }
 
@@ -497,6 +520,8 @@ static Pane* NewPane() {
     return f;
   }();
   vterm_screen_set_unrecognised_fallbacks(p->scr, &fallbacks, p);
+  static VTermSelectionCallbacks selCbs{CbSelSet, nullptr};
+  vterm_state_set_selection_callbacks(vterm_obtain_state(p->vt), &selCbs, p, p->selBuf, sizeof p->selBuf);
   vterm_screen_set_damage_merge(p->scr, VTERM_DAMAGE_ROW);  // un aviso por fila cambiada
   p->dirtyRows.assign(p->rows, 1);
   vterm_screen_enable_altscreen(p->scr, 1);
@@ -516,19 +541,19 @@ static Pane* NewPane() {
   return p;
 }
 
-// Prompt de PowerShell que avisa a warp-lite (OSC 9;9;<ruta>) y deja solo un "> " gris.
-static std::wstring IntegrationArgs() {
-  const wchar_t* script =
-      L"function global:prompt { $e = [char]27; $b = [char]7; "
-      L"$p = $executionContext.SessionState.Path.CurrentLocation.ProviderPath; "
-      // El aviso va aparte: PSReadLine redibuja el texto del prompt y no entiende OSC.
-      L"[Console]::Write(\"$e]9;9;$p$b\"); \"$e[90m> $e[0m\" }; "
+// Prompt de PowerShell que avisa a warp-lite (OSC 9;9;<token>;<ruta>) y deja solo un "> " gris.
+static std::wstring IntegrationArgs(const std::string& token) {
+  std::wstring prompt = L"function global:prompt { $e = [char]27; $b = [char]7; "
+                        L"$p = $executionContext.SessionState.Path.CurrentLocation.ProviderPath; "
+                        L"[Console]::Write(\"$e]9;9;" + ToWide(token) + L";$p$b\"); \"$e[90m> $e[0m\" }; ";
+  // El aviso va aparte: PSReadLine redibuja el texto del prompt y no entiende OSC.
+  std::wstring script = prompt +
       // Lista de órdenes para colorear la caja de entrada; se escribe en segundo plano.
       L"$null = Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -MaxTriggerCount 1 -Action { "
       L"try { $f = Join-Path $env:TEMP ('warp-lite-cmds-' + $PID + '.txt'); "
       L"Get-Command -CommandType Alias,Function,Filter,Cmdlet | ForEach-Object Name | "
       L"Set-Content -Encoding UTF8 ($f + '.tmp'); Move-Item -Force ($f + '.tmp') $f } catch {} }";
-  std::string bytes((const char*)script, wcslen(script) * sizeof(wchar_t));  // UTF-16LE
+  std::string bytes((const char*)script.data(), script.size() * sizeof(wchar_t));  // UTF-16LE
   static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   std::wstring b64;
   for (size_t i = 0; i < bytes.size(); i += 3) {
@@ -543,12 +568,12 @@ static std::wstring IntegrationArgs() {
   return L" -NoExit -EncodedCommand " + b64;
 }
 
-static std::wstring ShellCommand() {
+static std::wstring ShellCommand(const std::string& token) {
   wchar_t buf[MAX_PATH * 2];
   DWORD n = GetEnvironmentVariableW(L"WARPLITE_SHELL", buf, MAX_PATH * 2);
   if (n > 0 && n < MAX_PATH * 2) return buf;  // otra shell: sin caja de entrada
-  if (SearchPathW(nullptr, L"pwsh.exe", nullptr, MAX_PATH, buf, nullptr)) return L"pwsh.exe -NoLogo" + IntegrationArgs();
-  return L"powershell.exe -NoLogo" + IntegrationArgs();
+  if (SearchPathW(nullptr, L"pwsh.exe", nullptr, MAX_PATH, buf, nullptr)) return L"pwsh.exe -NoLogo" + IntegrationArgs(token);
+  return L"powershell.exe -NoLogo" + IntegrationArgs(token);
 }
 
 static VOID CALLBACK OnProcessExit(PVOID ctx, BOOLEAN) {
@@ -619,7 +644,13 @@ static bool SpawnPane(Pane* p) {
   InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attrSize);
   UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, p->hpc,
                             sizeof(p->hpc), nullptr, nullptr);
-  std::wstring cmd = ShellCommand();
+  GUID g;  // token nuevo por cada shell
+  CoCreateGuid(&g);
+  char tok[33];
+  snprintf(tok, sizeof tok, "%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x", g.Data1, g.Data2, g.Data3, g.Data4[0],
+           g.Data4[1], g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+  p->token = tok;
+  std::wstring cmd = ShellCommand(p->token);
   std::wstring env = ShellEnvironment();
   wchar_t home[MAX_PATH] = L"";
   GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH);
@@ -971,6 +1002,7 @@ static Node* LoadNode(std::istringstream& in, std::vector<Pane*>& created) {
     Pane* p = NewPane();
     p->lastCmd = HexDecode(hex);
     p->cwd = ToWide(dir);
+    if (!IsLocalDir(p->cwd)) p->cwd.clear();
     auto pos2 = in.tellg();
     std::string flag;
     if (in >> flag && flag == "run") {
@@ -1190,8 +1222,7 @@ static void SendText(Pane* p, const std::wstring& text) {
 
 static std::wstring SelectionText();
 
-static void CopySelection() {
-  std::wstring s = SelectionText();
+static void SetClipboardText(const std::wstring& s) {
   if (s.empty() || !OpenClipboard(g_hwnd)) return;
   EmptyClipboard();
   HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (s.size() + 1) * sizeof(wchar_t));
@@ -1200,6 +1231,8 @@ static void CopySelection() {
   SetClipboardData(CF_UNICODETEXT, h);
   CloseClipboard();
 }
+
+static void CopySelection() { SetClipboardText(SelectionText()); }
 
 static bool EditorActive(Pane* p);
 static void EditorInsert(Pane* p, const std::wstring& t);
@@ -2143,8 +2176,10 @@ static std::wstring RowText(Pane* p, int row) {
 
 // URL http(s) en la celda bajo el punto; si llega al final de la fila, sigue en las siguientes.
 // URLs http(s) que empiezan en la fila r0, con sus trozos en filas siguientes si vienen partidas.
-// Partida = acaba a ≤3 columnas del borde (solo espacios detrás) y la fila siguiente sigue con la
-// misma sangría que la fila donde empieza (Claude Code parte así: «…/warp-li» + «  te»).
+// Partida = acaba a ≤3 columnas del borde (solo espacios detrás) y la fila siguiente sigue con una
+// sangría entre la de la fila donde empieza y la propia URL (Claude Code parte así: «…/warp-li» +
+// «  te», y en listas «- https://…/z» + «  as/…»). No sigue si la fila de abajo empieza por «(» o
+// es una palabra normal con más texto detrás («…:8680/» + «(sirve la…»).
 struct UrlSeg {
   int row, c0, c1;
 };
@@ -2174,10 +2209,13 @@ static std::vector<UrlSpan> UrlsFrom(Pane* p, int r0, const std::function<const 
     while (r + 1 < p->rows && curEnd + 3 >= cur->size() && cur->find_first_not_of(L' ', curEnd) == std::wstring::npos) {
       const std::wstring& next = text(r + 1);
       size_t s0 = next.find_first_not_of(L' ');
-      if (s0 == std::wstring::npos || s0 != (indent == std::wstring::npos ? 0 : indent)) break;
+      if (s0 == std::wstring::npos || s0 < (indent == std::wstring::npos ? 0 : indent) || s0 > at) break;
+      if (wcschr(L"([{<", next[s0])) break;
       size_t e = next.find_first_of(kStop, s0);
       if (e == std::wstring::npos) e = next.size();
       if (e == s0) break;
+      bool urlish = next.find_first_of(L"/.?=&#%:_~+0123456789", s0) < e;
+      if (!urlish && next.find_first_not_of(L' ', e) != std::wstring::npos) break;
       u.url += next.substr(s0, e - s0);
       u.segs.push_back({r + 1, (int)s0, (int)e});
       r++, cur = &next, curEnd = e;
@@ -3054,8 +3092,19 @@ static bool SaveScreenshot(const std::wstring& path) {
 // Guion de prueba: pasos separados por '|', uno cada ~1,2 s.
 //   type:<texto> enter splitR splitD tab close-pane left right up down swap-<dir> rename:<nombre>
 //   zoom:<%> move:x,y,w,h maximize rename-start rename-type:<texto> shot:<fichero.bmp> wait quit
+//   drag-tab:<de>,<a> tabs clipboard (estos y hover/hover-text dejan el resultado en <sesión>.bench)
 
 static void SetStartWithWindows(bool on);
+
+// Resultado de un paso, una línea en <sesión>.bench (lo leen los wintest-*.ps1).
+static void ScriptLog(const std::wstring& r) {
+  std::string u = ToUtf8(r) + "\n";
+  HANDLE fh = CreateFileW((g_sessionPath + L".bench").c_str(), FILE_APPEND_DATA, 0, nullptr, OPEN_ALWAYS, 0, nullptr);
+  if (fh == INVALID_HANDLE_VALUE) return;
+  DWORD w;
+  WriteFile(fh, u.data(), (DWORD)u.size(), &w, nullptr);
+  CloseHandle(fh);
+}
 
 static void RunScriptStep() {
   if (g_scriptPos >= g_script.size()) return;
@@ -3113,6 +3162,7 @@ static void RunScriptStep() {
     swscanf(s.c_str() + 6, L"%d,%d", &c, &r);
     g_link = LinkAt(p, p->content.left + kPad + c * g_cellW + 1, p->content.top + kPad + r * g_cellH + 1);
     Toast(g_link.url.empty() ? L"(sin enlace)" : g_link.url);
+    ScriptLog(L"hover " + std::to_wstring(c) + L"," + std::to_wstring(r) + L": " + (g_link.url.empty() ? L"(sin enlace)" : g_link.url));
   } else if (s.rfind(L"find:", 0) == 0 && p) {
     OpenFind(p);
     for (wchar_t c : s.substr(5)) FindChar(c);
@@ -3123,14 +3173,42 @@ static void RunScriptStep() {
   } else if (s == L"prime") {
     PrimeBack();
   } else if (s == L"bench" || s == L"verify") {
-    std::wstring r = s == L"bench" ? Bench() : L"píxeles distintos entre pintado por filas y completo: " + std::to_wstring(VerifyPartial());
-    std::string u = ToUtf8(r) + "\n";
-    HANDLE fh = CreateFileW((g_sessionPath + L".bench").c_str(), FILE_APPEND_DATA, 0, nullptr, OPEN_ALWAYS, 0, nullptr);
-    if (fh != INVALID_HANDLE_VALUE) {
-      DWORD w;
-      WriteFile(fh, u.data(), (DWORD)u.size(), &w, nullptr);
-      CloseHandle(fh);
+    ScriptLog(s == L"bench" ? Bench() : L"píxeles distintos entre pintado por filas y completo: " + std::to_wstring(VerifyPartial()));
+  } else if (s.rfind(L"drag-tab:", 0) == 0) {  // drag-tab:de,a — arrastra la pestaña «de» sobre «a» con el ratón
+    int from = 0, to = 0;
+    swscanf(s.c_str() + 9, L"%d,%d", &from, &to);
+    TabLayout L = ComputeTabs();
+    auto center = [&](int ti) {
+      for (auto& [i, r] : L.tabs)
+        if (i == ti) return POINT{(r.left + r.right) / 2 - Px(30), (r.top + r.bottom) / 2};
+      return POINT{-1, -1};
+    };
+    POINT a = center(from), b = center(to);
+    auto at = [](POINT q) { return MAKELPARAM(q.x, q.y); };
+    auto cursor = [](POINT q) {
+      ClientToScreen(g_hwnd, &q);
+      SetCursorPos(q.x, q.y);
+    };
+    cursor(a);
+    SendMessageW(g_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, at(a));
+    for (int k = 1; k <= 8; k++) {
+      POINT q{a.x + (b.x - a.x) * k / 8, a.y + (b.y - a.y) * k / 8};
+      cursor(q);
+      SendMessageW(g_hwnd, WM_MOUSEMOVE, MK_LBUTTON, at(q));
     }
+    SendMessageW(g_hwnd, WM_LBUTTONUP, 0, at(b));
+  } else if (s == L"tabs") {  // orden de las pestañas (por su nombre) y cuál está activa
+    std::wstring r = L"tabs:";
+    for (int i = 0; i < (int)g_tabs.size(); i++) r += L" " + (i == g_activeTab ? L"*" + g_tabs[i].name : g_tabs[i].name);
+    ScriptLog(r);
+  } else if (s == L"clipboard") {
+    std::wstring w = L"(vacío)";
+    if (OpenClipboard(g_hwnd)) {
+      if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) w = (const wchar_t*)GlobalLock(h), GlobalUnlock(h);
+      CloseClipboard();
+    }
+    for (size_t i; (i = w.find(L"\r\n")) != std::wstring::npos;) w.replace(i, 2, L"\\n");
+    ScriptLog(L"clipboard: " + w);
   } else if (s == L"paste" && p) {
     Paste(p);
   } else if (s == L"detach-tab") {
@@ -3169,6 +3247,7 @@ static void RunScriptStep() {
       if (a != std::wstring::npos && t.substr(a, b - a + 1) == want) {
         g_link = LinkAt(p, p->content.left + kPad + (int)a * g_cellW + 1, p->content.top + kPad + r * g_cellH + 1);
         Toast(g_link.url.empty() ? L"(sin enlace)" : g_link.url);
+        ScriptLog(L"hover-text " + want + L": " + (g_link.url.empty() ? L"(sin enlace)" : g_link.url));
         break;
       }
     }
@@ -3318,6 +3397,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                    SWP_NOZORDER | SWP_NOACTIVATE);
       Relayout();
+      return 0;
+    }
+    case WM_APP_CLIP: {  // OSC 52: texto copiado en tmux → portapapeles de Windows (con \r\n)
+      std::unique_ptr<std::wstring> t((std::wstring*)lp);
+      std::wstring w;
+      for (wchar_t c : *t) {
+        if (c == L'\n' && (w.empty() || w.back() != L'\r')) w += L'\r';
+        w += c;
+      }
+      SetClipboardText(w);
       return 0;
     }
     case WM_APP_LAYOUT: {
@@ -3583,9 +3672,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TRACKMOUSEEVENT tme{sizeof tme, TME_LEAVE, hwnd, 0};
         TrackMouseEvent(&tme);
       }
-      if (g_tabDrag >= 0) {  // arrastrando una pestaña: fuera de la ventana se abre en otra
-        POINT sp;
-        GetCursorPos(&sp);
+      if (g_tabDrag >= 0) {  // arrastrando una pestaña: sobre otra se cambian de sitio; fuera, a otra ventana
+        POINT sp{x, y};
+        ClientToScreen(hwnd, &sp);
+        int j;
+        bool moved = abs(x - g_tabDragStart.x) > Px(6) || abs(y - g_tabDragStart.y) > Px(6);
+        int hit = moved && !OutsideWindow(sp) ? TitleHit(x, y, &j) : HIT_NONE;
+        if ((hit == HIT_TAB || hit == HIT_TABCLOSE) && j != g_tabDrag) {
+          if (j > g_tabDrag) std::rotate(g_tabs.begin() + g_tabDrag, g_tabs.begin() + g_tabDrag + 1, g_tabs.begin() + j + 1);
+          else std::rotate(g_tabs.begin() + j, g_tabs.begin() + g_tabDrag, g_tabs.begin() + g_tabDrag + 1);
+          g_activeTab = g_tabDrag = j;
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
         SetCursor(LoadCursor(nullptr, OutsideWindow(sp) ? IDC_SIZEALL : IDC_ARROW));
         return 0;
       }
@@ -3657,8 +3755,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int ti = g_tabDrag;
         g_tabDrag = -1;
         ReleaseCapture();
-        POINT sp;
-        GetCursorPos(&sp);
+        POINT sp{x, y};
+        ClientToScreen(hwnd, &sp);
         if (msg == WM_LBUTTONUP && OutsideWindow(sp) && g_tabs.size() > 1) Detach(ti, nullptr, sp);
         return 0;
       }
