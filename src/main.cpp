@@ -2738,6 +2738,8 @@ static void RunScriptStep() {
     FindStep(1);
   } else if (s == L"find-close") {
     CloseFind();
+  } else if (s == L"paste" && p) {
+    Paste(p);
   } else if (s == L"detach-tab") {
     RECT wr;
     GetWindowRect(g_hwnd, &wr);
