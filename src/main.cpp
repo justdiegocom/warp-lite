@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <map>
 #include <unordered_map>
 #include <set>
@@ -2139,32 +2140,74 @@ static std::wstring RowText(Pane* p, int row) {
 }
 
 // URL http(s) en la celda bajo el punto; si llega al final de la fila, sigue en las siguientes.
+// URLs http(s) que empiezan en la fila r0, con sus trozos en filas siguientes si vienen partidas.
+// Partida = acaba a ≤3 columnas del borde (solo espacios detrás) y la fila siguiente sigue con la
+// misma sangría que la fila donde empieza (Claude Code parte así: «…/warp-li» + «  te»).
+struct UrlSeg {
+  int row, c0, c1;
+};
+struct UrlSpan {
+  std::wstring url;
+  std::vector<UrlSeg> segs;
+};
+
+static std::vector<UrlSpan> UrlsFrom(Pane* p, int r0, const std::function<const std::wstring&(int)>& text) {
+  static const std::wstring kStop = L" \t\"'<>`|";
+  std::vector<UrlSpan> out;
+  const std::wstring& t = text(r0);
+  size_t indent = t.find_first_not_of(L' ');
+  for (size_t at = 0; (at = t.find(L"http", at)) != std::wstring::npos;) {
+    if (t.compare(at, 7, L"http://") && t.compare(at, 8, L"https://")) {
+      at += 4;
+      continue;
+    }
+    size_t end = t.find_first_of(kStop, at);
+    if (end == std::wstring::npos) end = t.size();
+    UrlSpan u;
+    u.url = t.substr(at, end - at);
+    u.segs.push_back({r0, (int)at, (int)end});
+    int r = r0;
+    size_t curEnd = end;
+    const std::wstring* cur = &t;
+    while (r + 1 < p->rows && curEnd + 3 >= cur->size() && cur->find_first_not_of(L' ', curEnd) == std::wstring::npos) {
+      const std::wstring& next = text(r + 1);
+      size_t s0 = next.find_first_not_of(L' ');
+      if (s0 == std::wstring::npos || s0 != (indent == std::wstring::npos ? 0 : indent)) break;
+      size_t e = next.find_first_of(kStop, s0);
+      if (e == std::wstring::npos) e = next.size();
+      if (e == s0) break;
+      u.url += next.substr(s0, e - s0);
+      u.segs.push_back({r + 1, (int)s0, (int)e});
+      r++, cur = &next, curEnd = e;
+    }
+    while (!u.url.empty() && wcschr(L".,;:!?)]}'\"", u.url.back())) {  // puntuación final fuera
+      u.url.pop_back();
+      if (u.segs.back().c1 > u.segs.back().c0) u.segs.back().c1--;
+    }
+    out.push_back(u);
+    at = end;
+  }
+  return out;
+}
+
+// URL bajo el punto (también si se pulsa en el trozo de una URL partida).
 static LinkHit LinkAt(Pane* p, int x, int y) {
   LinkHit h;
   POINT pt{x, y};
   if (!PtInRect(&p->content, pt)) return h;
   VTermPos pos = CellFromPoint(p, x, y);
-  static const std::wstring kStop = L" \t\"'<>`|";
   EnterCriticalSection(&p->cs);
-  std::wstring row = RowText(p, pos.row);
-  for (size_t at = 0; (at = row.find(L"http", at)) != std::wstring::npos; at++) {
-    if (row.compare(at, 7, L"http://") && row.compare(at, 8, L"https://")) continue;
-    size_t end = row.find_first_of(kStop, at);
-    if (end == std::wstring::npos) end = row.size();
-    if ((int)at > pos.col || (int)end <= pos.col) continue;
-    h.p = p, h.row = pos.row, h.c0 = (int)at, h.c1 = (int)end;
-    h.url = row.substr(at, end - at);
-    for (int r = pos.row + 1; end == row.size() && r < p->rows; r++) {  // URL partida en varias filas
-      std::wstring next = RowText(p, r);
-      end = next.find_first_of(kStop);
-      if (end == 0) break;
-      if (end == std::wstring::npos) end = next.size();
-      h.url += next.substr(0, end);
-      row = next;
-    }
-    while (!h.url.empty() && wcschr(L".,;:!?)]}'\"", h.url.back())) h.url.pop_back();
-    break;
-  }
+  std::map<int, std::wstring> cache;
+  auto text = [&](int r) -> const std::wstring& {
+    auto it = cache.find(r);
+    return it != cache.end() ? it->second : (cache[r] = RowText(p, r));
+  };
+  for (int r0 = std::max(0, pos.row - 4); r0 <= pos.row && h.url.empty(); r0++)
+    for (auto& u : UrlsFrom(p, r0, text))
+      for (auto& sg : u.segs)
+        if (sg.row == pos.row && pos.col >= sg.c0 && pos.col < sg.c1) {
+          h.p = p, h.row = pos.row, h.c0 = sg.c0, h.c1 = sg.c1, h.url = u.url;
+        }
   LeaveCriticalSection(&p->cs);
   return h;
 }
@@ -2390,28 +2433,14 @@ static std::wstring RowText(Pane* p, int row);
 
 // Celdas de la fila que forman parte de una URL http(s) (también la continuación de una URL
 // partida desde la fila anterior). Con el lock tomado.
-static std::vector<char> UrlMask(Pane* p, int row) {
-  static const std::wstring kStop = L" \t\"'<>`|()[]{}";
+static std::vector<char> UrlMask(Pane* p, int row, const std::function<const std::wstring&(int)>& text) {
   std::vector<char> m(p->cols, 0);
-  std::wstring t = RowText(p, row);
-  auto mark = [&](const std::wstring& s, std::vector<char>* out) {
-    bool tail = false;  // la última URL llega al final de la fila
-    for (size_t at = 0; (at = s.find(L"http", at)) != std::wstring::npos;) {
-      if (s.compare(at, 7, L"http://") && s.compare(at, 8, L"https://")) { at += 4; continue; }
-      size_t end = s.find_first_of(kStop, at);
-      if (end == std::wstring::npos) end = s.size(), tail = true;
-      while (end > at && wcschr(L".,;:!?", s[end - 1])) end--;
-      if (out) for (size_t i = at; i < end; i++) (*out)[i] = 1;
-      at = end;
-    }
-    return tail;
-  };
-  mark(t, &m);
-  VTermScreenCell last;
-  if (row > 0 && t[0] != L' ' && (CellAt(p, row - 1, p->cols - 1, &last), last.chars[0] && last.chars[0] != ' ') &&
-      mark(RowText(p, row - 1), nullptr)) {  // continuación
-    size_t end = t.find_first_of(kStop);
-    for (size_t i = 0; i < (end == std::wstring::npos ? t.size() : end); i++) m[i] = 1;
+  for (int r0 = std::max(0, row - 4); r0 <= row; r0++) {
+    if (text(r0).find(L"http") == std::wstring::npos) continue;
+    for (auto& u : UrlsFrom(p, r0, text))
+      for (auto& sg : u.segs)
+        if (sg.row == row)
+          for (int i = sg.c0; i < sg.c1 && i < p->cols; i++) m[i] = 1;
   }
   return m;
 }
@@ -2515,6 +2544,11 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
   int ox = p->content.left + kPad, oy = p->content.top + kPad;
   std::wstring txt;
   std::vector<INT> dx;
+  std::map<int, std::wstring> rowCache;  // textos de fila para detectar URLs
+  auto rowText = [&](int r) -> const std::wstring& {
+    auto it = rowCache.find(r);
+    return it != rowCache.end() ? it->second : (rowCache[r] = RowText(p, r));
+  };
   for (int row = 0; row < p->rows; row++) {
     int y = oy + row * g_cellH;
     if (!full) {
@@ -2524,7 +2558,7 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
       if (drawn.right == drawn.left) drawn = rr;
       else UnionRect(&drawn, &drawn, &rr);
     }
-    std::vector<char> url = UrlMask(p, row);
+    std::vector<char> url = UrlMask(p, row, rowText);
     int col = 0;
     while (col < p->cols) {
       int start = col;
@@ -3101,6 +3135,8 @@ static void RunScriptStep() {
     delay = 3000;
   } else if (s.rfind(L"startup:", 0) == 0) {
     SetStartWithWindows(s.substr(8) == L"on");
+  } else if (s.rfind(L"goto:", 0) == 0) {
+    ActivateTab(_wtoi(s.c_str() + 5));
   } else if (s == L"close") {  // como pulsar la X de esta ventana
     PostMessage(g_hwnd, WM_CLOSE, 0, 0);
     return;
@@ -3118,6 +3154,19 @@ static void RunScriptStep() {
   } else if (s == L"picker-enter") {
     PickChoose(g_pick.sel);
     delay = 2000;
+  } else if (s.rfind(L"hover-text:", 0) == 0 && p) {  // Ctrl sobre la primera fila cuyo texto es ese
+    std::wstring want = s.substr(11);
+    for (int r = 0; r < p->rows; r++) {
+      EnterCriticalSection(&p->cs);
+      std::wstring t = RowText(p, r);
+      LeaveCriticalSection(&p->cs);
+      size_t a = t.find_first_not_of(L' '), b = t.find_last_not_of(L' ');
+      if (a != std::wstring::npos && t.substr(a, b - a + 1) == want) {
+        g_link = LinkAt(p, p->content.left + kPad + (int)a * g_cellW + 1, p->content.top + kPad + r * g_cellH + 1);
+        Toast(g_link.url.empty() ? L"(sin enlace)" : g_link.url);
+        break;
+      }
+    }
   } else if (s.rfind(L"lang:", 0) == 0) {
     for (int i = 0; i < kLangCount; i++)
       if (ToUtf8(s.substr(5)) == kLangCodes[i]) g_lang = i;
