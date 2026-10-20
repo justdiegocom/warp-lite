@@ -5182,6 +5182,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       ApplyDpi(WindowDpi(hwnd));
       SetPropW(hwnd, kInstanceProp, InstanceKey());
       if (!LoadSession() && g_openDir.empty()) NewTab();
+      MakeFonts();  // the session may have restored zoom and font size
       if (!g_openDir.empty()) NewTab(g_tabs.empty() ? -1 : g_activeTab + 1, g_openDir);
       SetTimer(hwnd, TIMER_RESTORE, 250, nullptr);
       if (!g_script.empty()) SetTimer(hwnd, TIMER_SCRIPT, 3000, nullptr);
