@@ -434,7 +434,8 @@ static std::wstring IntegrationArgs() {
   const wchar_t* script =
       L"function global:prompt { $e = [char]27; $b = [char]7; "
       L"$p = $executionContext.SessionState.Path.CurrentLocation.ProviderPath; "
-      L"\"$e]9;9;$p$b$e[90m> $e[0m\" }; "
+      // El aviso va aparte: PSReadLine redibuja el texto del prompt y no entiende OSC.
+      L"[Console]::Write(\"$e]9;9;$p$b\"); \"$e[90m> $e[0m\" }; "
       // Lista de órdenes para colorear la caja de entrada; se escribe en segundo plano.
       L"$null = Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -MaxTriggerCount 1 -Action { "
       L"try { $f = Join-Path $env:TEMP ('warp-lite-cmds-' + $PID + '.txt'); "
@@ -2083,6 +2084,11 @@ static void RunScriptStep() {
   } else if (s == L"submit" && p) {
     if (EditorActive(p)) SubmitEditor(p);
     delay = 2000;
+  } else if (s.rfind(L"hover:", 0) == 0 && p) {  // hover:col,fila (como Ctrl sobre un enlace)
+    int c = 0, r = 0;
+    swscanf(s.c_str() + 6, L"%d,%d", &c, &r);
+    g_link = LinkAt(p, p->content.left + kPad + c * g_cellW + 1, p->content.top + kPad + r * g_cellH + 1);
+    Toast(g_link.url.empty() ? L"(sin enlace)" : g_link.url);
   } else if (s.rfind(L"lang:", 0) == 0) {
     for (int i = 0; i < kLangCount; i++)
       if (ToUtf8(s.substr(5)) == kLangCodes[i]) g_lang = i;

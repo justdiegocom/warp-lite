@@ -164,26 +164,23 @@ static int Uninstall(bool fromTemp) {
     if (g_silent) args += L" --silent";
     if (CopyFileW(self, copy.c_str(), FALSE)) {
       SHELLEXECUTEINFOW sei{sizeof sei};
-      sei.fMask = SEE_MASK_NOCLOSEPROCESS;
       sei.lpFile = copy.c_str();
       sei.lpParameters = args.c_str();
       sei.nShow = SW_SHOWNORMAL;
-      if (ShellExecuteExW(&sei)) {
-        if (g_silent && sei.hProcess) WaitForSingleObject(sei.hProcess, 30000);  // para scripts
-        if (sei.hProcess) CloseHandle(sei.hProcess);
-        return 0;
-      }
+      if (ShellExecuteExW(&sei)) return 0;
     }
     fromTemp = true;  // sin copia: se intenta desde aquí (uninstall.exe quedará)
-  } else {
-    Sleep(1500);  // a que termine el uninstall.exe original
   }
   DeleteFileW(StartMenuLink().c_str());
   DeleteFileW(DesktopLink().c_str());
   RegDeleteKeyW(HKEY_CURRENT_USER, kUninstallKey);
   DeleteOldCopies(dir);
   bool ok = DeleteFileW((dir + L"\\warp-lite.exe").c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
-  DeleteFileW((dir + L"\\uninstall.exe").c_str());
+  // uninstall.exe sigue abierto unos instantes (es quien ha lanzado esta copia).
+  for (int i = 0; i < 50 && !DeleteFileW((dir + L"\\uninstall.exe").c_str()) &&
+                  GetLastError() != ERROR_FILE_NOT_FOUND;
+       i++)
+    Sleep(200);
   RemoveDirectoryW(dir.c_str());
   if (ok) Message(Tr(L"warp-lite has been uninstalled.", L"warp-lite se ha desinstalado."));
   else Message(Tr(L"Close warp-lite and try again.", L"Cierra warp-lite y vuelve a intentarlo."), MB_ICONWARNING);

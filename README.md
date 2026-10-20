@@ -63,8 +63,20 @@ con Tab. Cada panel recuerda su carpeta al reabrir. Con `WARPLITE_SHELL` (otra s
 
 ## Instalar en Windows
 
-`tools/install.ps1` (junto a `warp-lite.exe`): copia el programa a `%LOCALAPPDATA%\Programs\warp-lite`
-y crea accesos directos en el menú Inicio y en el escritorio. Sin permisos de administrador.
+`dist/warp-lite-setup.exe`: instala para el usuario actual (sin administrador) en
+`%LOCALAPPDATA%\Programs\warp-lite`, crea accesos en Inicio y escritorio y aparece en «Aplicaciones
+instaladas» con su desinstalador (conserva sesiones y ajustes). `--silent` para hacerlo sin preguntas.
+Icono propio en `assets/` (`warp-lite.ico`, incrustado en los dos `.exe`). `tools/wintest-setup.ps1` lo prueba.
+
+## Idioma, colores y enlaces
+
+- Interfaz en inglés por defecto; clic derecho en la zona vacía de la barra de título → Language.
+- La orden de la caja sale en verde si existe (alias, funciones y cmdlets de PowerShell, programas del
+  PATH, rutas) y con subrayado rojo discontinuo si no, como en Warp. La lista de PowerShell se genera
+  en segundo plano al arrancar (evento OnIdle) para no retrasar el prompt.
+- La shell recibe `TERM=xterm-256color` y `COLORTERM=truecolor` (como Warp) para que ssh/tmux usen color.
+  libvterm lleva un parche para el atenuado (SGR 2).
+- Ctrl + ratón sobre un enlace http(s) lo subraya; Ctrl+clic lo abre, aunque esté partido en varias filas.
 
 ## Licencias
 
