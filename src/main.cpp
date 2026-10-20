@@ -297,6 +297,7 @@ struct FindState {
   std::wstring query;
   std::vector<FindMatch> matches;
   int cur = -1;
+  RECT rc{}, prev{}, next{}, close{};  // bar and its buttons, from the last paint
 };
 static FindState g_find;
 
@@ -2130,6 +2131,7 @@ static void OpenFind(Pane* p) {
 static void CloseFind() {
   g_find.open = false;
   g_find.matches.clear();
+  g_find.cur = -1;
   InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -3749,17 +3751,36 @@ static void Panel(HDC dc, RECT r) {
 
 static void DrawFindBar(HDC dc) {
   Pane* p = g_find.p;
+  g_find.rc = g_find.prev = g_find.next = g_find.close = RECT{};
   if (!g_find.open || !p || !g_live.count(p) || p != CurTab().active) return;
   RECT c = p->content;
   int w = std::min<int>(Px(340), c.right - c.left - Px(16));
   RECT r{c.right - w - Px(8), c.top + Px(8), c.right - Px(8), c.top + Px(8) + Px(34)};
+  g_find.rc = r;
   Panel(dc, r);
   SetBkMode(dc, TRANSPARENT);
+  // Previous, next and close buttons at the right end.
+  int bw = Px(26);
+  g_find.close = RECT{r.right - Px(4) - bw, r.top + Px(4), r.right - Px(4), r.bottom - Px(4)};
+  g_find.next = RECT{g_find.close.left - bw, g_find.close.top, g_find.close.left, g_find.close.bottom};
+  g_find.prev = RECT{g_find.next.left - bw, g_find.close.top, g_find.next.left, g_find.close.bottom};
+  POINT mp;
+  GetCursorPos(&mp);
+  ScreenToClient(g_hwnd, &mp);
+  bool any = !g_find.matches.empty();
+  SelectObject(dc, g_iconFont);
+  const RECT* btn[3] = {&g_find.prev, &g_find.next, &g_find.close};
+  const wchar_t* glyph[3] = {L"\uE70E", L"\uE70D", L"\uE711"};  // ChevronUp, ChevronDown, Cancel
+  for (int k = 0; k < 3; k++) {
+    bool on = k == 2 || any;
+    if (on && PtInRect(btn[k], mp)) Fill(dc, *btn[k], RGB(0x3a, 0x3a, 0x3a));
+    Text(dc, glyph[k], *btn[k], on ? kFg : RGB(0x5a, 0x5a, 0x5a), DT_CENTER);
+  }
   SelectObject(dc, g_uiFont);
   std::wstring count = g_find.query.empty() ? L""
                        : g_find.matches.empty() ? T(S_NO_RESULTS)
                        : std::to_wstring(g_find.cur + 1) + L"/" + std::to_wstring(g_find.matches.size());
-  RECT cr{r.right - Px(110), r.top, r.right - Px(10), r.bottom};
+  RECT cr{g_find.prev.left - Px(90), r.top, g_find.prev.left - Px(6), r.bottom};
   Text(dc, count, cr, kTabText, DT_RIGHT);
   RECT qr{r.left + Px(10), r.top, cr.left - Px(6), r.bottom};
   SelectObject(dc, g_fonts[0]);
@@ -4857,6 +4878,14 @@ static void RunScriptStep() {
     FindStep(1);
   } else if (s == L"find-close") {
     CloseFind();
+  } else if (s.rfind(L"find-click:", 0) == 0) {  // find-click:prev|next|close — clicks that button
+    std::wstring b = s.substr(11);
+    const RECT& r = b == L"prev" ? g_find.prev : b == L"next" ? g_find.next : g_find.close;
+    SendMessageW(g_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM((r.left + r.right) / 2, (r.top + r.bottom) / 2));
+    SendMessageW(g_hwnd, WM_LBUTTONUP, 0, MAKELPARAM((r.left + r.right) / 2, (r.top + r.bottom) / 2));
+  } else if (s == L"find-state") {
+    ScriptLog(L"find: " + std::wstring(g_find.open ? L"open " : L"closed ") + std::to_wstring(g_find.cur + 1) + L"/" +
+              std::to_wstring(g_find.matches.size()));
   } else if (s == L"prime") {
     PrimeBack();
   } else if (s == L"bench" || s == L"verify") {
@@ -5408,6 +5437,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
+      if (POINT pt{x, y}; g_find.open && PtInRect(&g_find.rc, pt)) {  // find bar: previous, next, close
+        if (msg == WM_LBUTTONDOWN) {
+          if (PtInRect(&g_find.prev, pt)) FindStep(-1);
+          else if (PtInRect(&g_find.next, pt)) FindStep(1);
+          else if (PtInRect(&g_find.close, pt)) CloseFind();
+        }
+        return 0;
+      }
       if (g_comp.open) {  // menú de autocompletado: clic en una opción la elige; fuera, se cierra
         POINT pt{x, y};
         if (PtInRect(&g_comp.rc, pt)) {
@@ -5513,6 +5550,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetHover(hit, tab);
         TRACKMOUSEEVENT tme{sizeof tme, TME_LEAVE, hwnd, 0};
         TrackMouseEvent(&tme);
+      }
+      if (g_find.open) {  // repaint the find bar when the hovered button changes
+        static int findHover = -1;
+        POINT pt{x, y};
+        int h = PtInRect(&g_find.prev, pt) ? 0 : PtInRect(&g_find.next, pt) ? 1 : PtInRect(&g_find.close, pt) ? 2 : -1;
+        if (h != findHover) findHover = h, InvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_tabDrag >= 0) {  // arrastrando una pestaña: sobre otra se cambian de sitio; fuera, a otra ventana
         POINT sp{x, y};
