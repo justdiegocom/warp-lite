@@ -951,12 +951,216 @@ static void CyclePane(int dir) {
 }
 
 // ---------------------------------------------------------------------------
+// Claude Code y Codex: si estaban abiertos al cerrar, al reabrir no se relanza la orden tal cual
+// (empezaría una conversación nueva) sino que se reanuda la conversación de ese panel.
+
+static std::string JsonStr(const std::string& j, const std::string& key, size_t from);
+
+enum { AGENT_NONE, AGENT_CLAUDE, AGENT_CODEX };
+
+// Trocea una orden por espacios respetando las comillas; cada trozo queda tal como se escribió.
+static std::vector<std::string> SplitArgs(const std::string& s) {
+  std::vector<std::string> out;
+  std::string cur;
+  char q = 0;
+  for (char c : s) {
+    if (q) {
+      if (c == q) q = 0;
+    } else if (c == '"' || c == '\'') {
+      q = c;
+    } else if (c == ' ' || c == '\t') {
+      if (!cur.empty()) out.push_back(cur), cur.clear();
+      continue;
+    }
+    cur += c;
+  }
+  if (!cur.empty()) out.push_back(cur);
+  return out;
+}
+
+static int AgentKind(const std::string& cmd) {
+  std::vector<std::string> a = SplitArgs(cmd);
+  size_t i = !a.empty() && a[0] == "&" ? 1 : 0;
+  if (i >= a.size()) return AGENT_NONE;
+  std::string exe = a[i];
+  exe.erase(std::remove(exe.begin(), exe.end(), '"'), exe.end());
+  exe.erase(std::remove(exe.begin(), exe.end(), '\''), exe.end());
+  size_t slash = exe.find_last_of("\\/");
+  if (slash != std::string::npos) exe = exe.substr(slash + 1);
+  std::transform(exe.begin(), exe.end(), exe.begin(), [](char c) { return (char)tolower((unsigned char)c); });
+  for (const char* ext : {".exe", ".cmd", ".ps1", ".bat"})
+    if (exe.size() > strlen(ext) && exe.compare(exe.size() - strlen(ext), strlen(ext), ext) == 0) exe.resize(exe.size() - strlen(ext));
+  return exe == "claude" ? AGENT_CLAUDE : exe == "codex" ? AGENT_CODEX : AGENT_NONE;
+}
+
+// La orden para reanudar: el mismo programa con sus opciones (--model, --yolo…), sin el texto
+// inicial ni lo que ya elegía sesión, y con la sesión dada (vacía: la última de esa carpeta).
+// Vacía si no es una conversación interactiva (claude -p, codex exec, subórdenes…).
+static std::string ResumeCommand(const std::string& cmd, const std::string& session) {
+  int kind = AgentKind(cmd);
+  if (kind == AGENT_NONE) return "";
+  std::vector<std::string> a = SplitArgs(cmd);
+  size_t i = a[0] == "&" ? 1 : 0;
+  std::string head = (i ? "& " : "") + a[i];
+  // Opciones sin valor (lo que va detrás es texto, no su valor) y las que se quitan.
+  static const std::set<std::string> flagsClaude = {"--dangerously-skip-permissions", "--verbose", "--debug", "-d", "--ide",
+                                                    "--chrome", "--no-chrome", "--strict-mcp-config", "--fork-session"};
+  static const std::set<std::string> flagsCodex = {"--yolo", "--dangerously-bypass-approvals-and-sandbox", "--full-auto",
+                                                   "--search", "--oss", "--no-alt-screen", "--last", "--all"};
+  static const std::set<std::string> dropClaude = {"-c", "--continue", "-r", "--resume", "--session-id", "--fork-session"};
+  static const std::set<std::string> dropCodex = {"--last", "--all"};
+  static const std::set<std::string> otherClaude = {"mcp", "config", "update", "doctor", "install", "migrate-installer",
+                                                    "setup-token", "plugin", "plugins", "agents", "auth", "login", "logout"};
+  static const std::set<std::string> otherCodex = {"exec", "e", "review", "login", "logout", "mcp", "mcp-server", "app-server",
+                                                   "apply", "a", "sandbox", "debug", "cloud", "completion", "features", "fork", "help"};
+  const auto& flags = kind == AGENT_CLAUDE ? flagsClaude : flagsCodex;
+  const auto& drop = kind == AGENT_CLAUDE ? dropClaude : dropCodex;
+  std::string opts;
+  bool sawWord = false;
+  for (size_t k = i + 1; k < a.size(); k++) {
+    const std::string& t = a[k];
+    if (t.size() > 1 && t[0] == '-') {
+      std::string name = t.substr(0, t.find('='));
+      if (kind == AGENT_CLAUDE && (name == "-p" || name == "--print")) return "";
+      bool takesValue = t.find('=') == std::string::npos && !flags.count(name) &&
+                        !(kind == AGENT_CLAUDE && (name == "-c" || name == "--continue")) && k + 1 < a.size() &&
+                        a[k + 1][0] != '-';
+      // claude -r sin id abre el selector: solo se come lo siguiente si parece un id.
+      if (kind == AGENT_CLAUDE && (name == "-r" || name == "--resume") && takesValue)
+        takesValue = a[k + 1].find(' ') == std::string::npos && a[k + 1].size() >= 8;
+      if (!drop.count(name)) opts += " " + t + (takesValue ? " " + a[k + 1] : "");
+      if (takesValue) k++;
+      continue;
+    }
+    if (!sawWord) {  // primera palabra: ¿una suborden?
+      sawWord = true;
+      if (kind == AGENT_CODEX && t == "resume") continue;
+      if (kind == AGENT_CODEX && otherCodex.count(t)) return "";
+      if (kind == AGENT_CLAUDE && otherClaude.count(t)) return "";
+    }
+    // Texto inicial o id de sesión: fuera.
+  }
+  if (kind == AGENT_CLAUDE) return head + opts + (session.empty() ? " --continue" : " --resume " + session);
+  return head + opts + (session.empty() ? " resume --last" : " resume " + session);
+}
+
+struct AgentSession {
+  std::string id;
+  FILETIME mtime;
+};
+
+static bool NewerFirst(const AgentSession& x, const AgentSession& y) { return CompareFileTime(&x.mtime, &y.mtime) > 0; }
+
+static std::wstring EnvDir(const wchar_t* var, const wchar_t* fallback) {
+  wchar_t buf[MAX_PATH];
+  DWORD n = GetEnvironmentVariableW(var, buf, MAX_PATH);
+  if (n > 0 && n < MAX_PATH) return buf;
+  n = GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH);
+  return n > 0 && n < MAX_PATH ? std::wstring(buf) + fallback : L"";
+}
+
+// Conversaciones de Claude Code en esa carpeta, de la más reciente a la más antigua:
+// %USERPROFILE%\.claude\projects\<carpeta con todo lo que no es letra o cifra cambiado por «-»>\<id>.jsonl
+static std::vector<AgentSession> ClaudeSessions(const std::wstring& cwd) {
+  std::vector<AgentSession> out;
+  std::wstring root = EnvDir(L"CLAUDE_CONFIG_DIR", L"\\.claude");
+  if (root.empty() || cwd.empty()) return out;
+  std::wstring name = cwd;
+  for (wchar_t& c : name)
+    if (!iswascii(c) || !iswalnum(c)) c = L'-';
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((root + L"\\projects\\" + name + L"\\*.jsonl").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return out;
+  do {
+    std::wstring f = fd.cFileName;
+    if (f.size() == 36 + 6 && f[8] == L'-' && f[13] == L'-')  // <uuid>.jsonl
+      out.push_back({ToUtf8(f.substr(0, 36)), fd.ftLastWriteTime});
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+  std::sort(out.begin(), out.end(), NewerFirst);
+  return out;
+}
+
+// Conversaciones de Codex en esa carpeta (las de la última semana): %USERPROFILE%\.codex\sessions\
+// AAAA\MM\DD\rollout-…-<id>.jsonl, cuya primera línea dice su carpeta («cwd»).
+static std::vector<AgentSession> CodexSessions(const std::wstring& cwd) {
+  std::vector<AgentSession> out;
+  std::wstring root = EnvDir(L"CODEX_HOME", L"\\.codex");
+  if (root.empty() || cwd.empty()) return out;
+  FILETIME now;
+  GetSystemTimeAsFileTime(&now);
+  std::set<std::wstring> days;
+  for (int d = 0; d < 8; d++) {
+    ULARGE_INTEGER u{{now.dwLowDateTime, now.dwHighDateTime}};
+    u.QuadPart -= (ULONGLONG)d * 24 * 3600 * 10000000ULL;
+    FILETIME ft{u.LowPart, u.HighPart}, lt;
+    SYSTEMTIME st;
+    for (int local = 0; local < 2; local++) {  // las carpetas van por fecha local o UTC según la versión
+      if (local ? !FileTimeToLocalFileTime(&ft, &lt) || !FileTimeToSystemTime(&lt, &st) : !FileTimeToSystemTime(&ft, &st)) continue;
+      wchar_t b[32];
+      swprintf(b, 32, L"\\%04d\\%02d\\%02d\\", st.wYear, st.wMonth, st.wDay);
+      days.insert(b);
+    }
+  }
+  for (const std::wstring& day : days) {
+    std::wstring dir = root + L"\\sessions" + day;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"rollout-*.jsonl").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) continue;
+    do {
+      FILE* f = _wfopen((dir + fd.cFileName).c_str(), L"rb");
+      if (!f) continue;
+      std::string head(4096, '\0');
+      head.resize(fread(head.data(), 1, head.size(), f));
+      fclose(f);
+      head = head.substr(0, head.find('\n'));
+      if (JsonStr(head, "source", 0) == "exec") continue;  // codex exec: no es interactiva
+      std::string dir8 = JsonStr(head, "cwd", 0), id = JsonStr(head, "id", 0);
+      for (size_t k = 0; (k = dir8.find("\\\\", k)) != std::string::npos; k++) dir8.erase(k, 1);
+      if (id.empty() || _wcsicmp(ToWide(dir8).c_str(), cwd.c_str()) != 0) continue;
+      out.push_back({id, fd.ftLastWriteTime});
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  std::sort(out.begin(), out.end(), NewerFirst);
+  return out;
+}
+
+// Para cada panel con Claude Code o Codex en marcha, la orden que lo reanuda. Si hay varios en la
+// misma carpeta, el que escribió hace menos se queda con la conversación tocada hace menos.
+static std::map<Pane*, std::string> g_resumeCmd;
+
+static void ComputeResumes() {
+  g_resumeCmd.clear();
+  std::map<std::pair<int, std::wstring>, std::vector<Pane*>> groups;
+  for (auto& t : g_tabs) {
+    std::vector<Pane*> ls;
+    Leaves(t.root, ls);
+    for (Pane* p : ls)
+      if (!p->runningCmd.empty() && !ResumeCommand(p->lastCmd, "").empty()) {
+        std::wstring key = p->cwd;
+        std::transform(key.begin(), key.end(), key.begin(), towlower);
+        groups[{AgentKind(p->lastCmd), key}].push_back(p);
+      }
+  }
+  for (auto& [key, panes] : groups) {
+    std::sort(panes.begin(), panes.end(), [](Pane* x, Pane* y) { return (int)(x->lastOut - y->lastOut) > 0; });
+    std::wstring cwd = panes[0]->cwd;
+    std::vector<AgentSession> s = key.first == AGENT_CLAUDE ? ClaudeSessions(cwd) : CodexSessions(cwd);
+    for (size_t k = 0; k < panes.size(); k++) g_resumeCmd[panes[k]] = ResumeCommand(panes[k]->lastCmd, k < s.size() ? s[k].id : "");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Sesión: pestañas, divisiones y última orden de cada panel
 
 static void SaveNode(std::ostringstream& o, Node* n) {
   if (n->leaf()) {
-    // «run»: tenía algo en marcha (p. ej. ssh + tmux) y se vuelve a lanzar al reabrir.
-    o << "L " << HexEncode(n->pane->lastCmd) << " " << HexEncode(ToUtf8(n->pane->cwd))
+    // «run»: tenía algo en marcha (p. ej. ssh + tmux) y se vuelve a lanzar al reabrir; Claude Code
+    // y Codex, con la orden que reanuda su conversación.
+    auto r = g_resumeCmd.find(n->pane);
+    const std::string& cmd = r != g_resumeCmd.end() && !n->pane->runningCmd.empty() ? r->second : n->pane->lastCmd;
+    o << "L " << HexEncode(cmd) << " " << HexEncode(ToUtf8(n->pane->cwd))
       << (n->pane->runningCmd.empty() || n->pane->lastCmd.empty() ? "" : " run") << "\n";
   } else {
     o << "S " << (n->vertical ? 1 : 0) << " " << n->ratio << "\n";
@@ -997,6 +1201,7 @@ static void SaveSession() {
                (wp.showCmd == SW_SHOWMINIMIZED && (wp.flags & WPF_RESTORETOMAXIMIZED));
     o << "win " << r.left << " " << r.top << " " << r.right << " " << r.bottom << " " << (max ? 1 : 0) << "\n";
   }
+  ComputeResumes();
   for (auto& t : g_tabs) {
     std::vector<Pane*> ls;
     Leaves(t.root, ls);
@@ -1572,6 +1777,7 @@ static void Detach(int tabIdx, Pane* single, POINT screen) {
   RECT win{screen.x - Px(120), screen.y - Px(20), screen.x - Px(120) + w, screen.y - Px(20) + h};
   int ai = single ? 0 : (int)(std::find(moved.begin(), moved.end(), t.active) - moved.begin());
   std::ostringstream o;
+  ComputeResumes();
   o << SessionHeader(0, &win, false) << "tab " << ai << " " << HexEncode(ToUtf8(single ? L"" : t.name)) << "\n";
   SaveNode(o, root);
   std::wstring file = NewWindowFile();
@@ -3974,6 +4180,18 @@ static void RunScriptStep() {
     ScriptLog(L"http-get: " + std::wstring(ok ? L"ok " : L"error ") + std::to_wstring(data.size()) + L" " +
               ToWide(Sha256Hex(data).substr(0, 12)) + L" " + why);
     delay = 3000;
+  } else if (s.rfind(L"resume-cmd:", 0) == 0) {  // cómo se reanudaría esa orden (Claude Code / Codex)
+    std::string r = ResumeCommand(ToUtf8(s.substr(11)), "ID");
+    ScriptLog(L"resume-cmd: " + (r.empty() ? L"(no)" : ToWide(r)));
+    delay = 50;
+  } else if (s == L"resume") {  // lo que guardaría la sesión para cada panel con Claude Code o Codex
+    UpdateRunning();
+    ComputeResumes();
+    std::vector<std::wstring> v;
+    for (auto& [q, r] : g_resumeCmd) v.push_back(ToWide(r));
+    std::sort(v.begin(), v.end());
+    for (auto& r : v) ScriptLog(L"resume: " + r);
+    if (v.empty()) ScriptLog(L"resume: (nada)");
   } else if (s == L"tabs") {  // orden de las pestañas (por su nombre) y cuál está activa
     std::wstring r = L"tabs:";
     for (int i = 0; i < (int)g_tabs.size(); i++) r += L" " + (i == g_activeTab ? L"*" + g_tabs[i].name : g_tabs[i].name);
