@@ -3502,16 +3502,37 @@ static std::array<int, 3> ParseVersion(std::wstring v) {
   return r;
 }
 
+// Versión (FILEVERSION) leída de los bytes del archivo. No vale GetFileVersionInfo: si este
+// proceso se arrancó desde esa misma ruta, Windows devuelve la del módulo ya cargado (la vieja),
+// aunque el instalador haya puesto otro archivo en su sitio.
 static std::wstring ExeVersion(const std::wstring& path) {
-  DWORD dummy = 0, n = GetFileVersionInfoSizeW(path.c_str(), &dummy);
-  if (!n) return L"";
-  std::vector<char> buf(n);
-  VS_FIXEDFILEINFO* fi = nullptr;
-  UINT len = 0;
-  if (!GetFileVersionInfoW(path.c_str(), 0, n, buf.data()) || !VerQueryValueW(buf.data(), L"\\", (void**)&fi, &len) || !fi)
-    return L"";
-  return std::to_wstring(HIWORD(fi->dwFileVersionMS)) + L"." + std::to_wstring(LOWORD(fi->dwFileVersionMS)) + L"." +
-         std::to_wstring(HIWORD(fi->dwFileVersionLS));
+  HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                         OPEN_EXISTING, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return L"";
+  LARGE_INTEGER size{};
+  std::string data;
+  if (GetFileSizeEx(f, &size) && size.QuadPart > 0 && size.QuadPart < (64 << 20)) {
+    data.resize((size_t)size.QuadPart);
+    DWORD got = 0;
+    if (!ReadFile(f, data.data(), (DWORD)data.size(), &got, nullptr)) got = 0;
+    data.resize(got);
+  }
+  CloseHandle(f);
+  // VS_FIXEDFILEINFO: firma 0xFEEF04BD, versión de la estructura (1.0), FileVersionMS y LS. Se busca
+  // desde el final (los recursos van al final; la constante de aquí también está en el código).
+  for (size_t i = data.size() >= 16 ? (data.size() - 16) & ~(size_t)3 : 0; i + 16 <= data.size(); i -= 4) {
+    uint32_t sig, ver, ms, ls;
+    memcpy(&sig, data.data() + i, 4);
+    memcpy(&ver, data.data() + i + 4, 4);
+    if (sig != 0xFEEF04BD || ver != 0x00010000) {
+      if (i == 0) break;
+      continue;
+    }
+    memcpy(&ms, data.data() + i + 8, 4);
+    memcpy(&ls, data.data() + i + 12, 4);
+    return std::to_wstring(HIWORD(ms)) + L"." + std::to_wstring(LOWORD(ms)) + L"." + std::to_wstring(HIWORD(ls));
+  }
+  return L"";
 }
 
 static std::wstring InstalledExe() {
