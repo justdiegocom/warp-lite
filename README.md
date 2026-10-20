@@ -78,6 +78,7 @@ Icono propio en `assets/` (`warp-lite.ico`, incrustado en los dos `.exe`). `tool
 ## Idioma, colores y enlaces
 
 - Interfaz en inglés por defecto; clic derecho en la zona vacía de la barra de título → Language.
+  En ese mismo menú, «Start with Windows» (valor `Warp` en `HKCU\...\Run`; el desinstalador lo quita).
 - La orden de la caja sale en verde si existe (alias, funciones y cmdlets de PowerShell, programas del
   PATH, rutas) y con subrayado rojo discontinuo si no, como en Warp. La lista de PowerShell se genera
   en segundo plano al arrancar (evento OnIdle) para no retrasar el prompt.

@@ -188,16 +188,16 @@ static std::wstring g_toast;
 
 // Textos de la interfaz: inglés por defecto; se cambia con clic derecho en la barra de título.
 enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, S_FIND, S_NO_RESULTS,
-           S_SEARCH_DIRS, S_PARENT_DIR, S_RENAME, S_HIDE, S_CLOSE_TAB, S_SHOW_ALL, S_HIDDEN_N, S_COUNT };
+           S_SEARCH_DIRS, S_PARENT_DIR, S_RENAME, S_HIDE, S_CLOSE_TAB, S_SHOW_ALL, S_HIDDEN_N, S_STARTUP, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
      L"Search directories…", L".. (Parent directory)", L"Rename", L"Hide tab", L"Close tab", L"Show all",
-     L"%d hidden"},
+     L"%d hidden", L"Start with Windows"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
-     L"Mostrar todas", L"%d ocultas"},
+     L"Mostrar todas", L"%d ocultas", L"Iniciar con Windows"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -3016,6 +3016,8 @@ static bool SaveScreenshot(const std::wstring& path) {
 //   type:<texto> enter splitR splitD tab close-pane left right up down swap-<dir> rename:<nombre>
 //   zoom:<%> move:x,y,w,h maximize rename-start rename-type:<texto> shot:<fichero.bmp> wait quit
 
+static void SetStartWithWindows(bool on);
+
 static void RunScriptStep() {
   if (g_scriptPos >= g_script.size()) return;
   std::wstring s = g_script[g_scriptPos++];
@@ -3097,6 +3099,8 @@ static void RunScriptStep() {
     GetWindowRect(g_hwnd, &wr);
     Detach(g_activeTab, nullptr, POINT{wr.left + 200, wr.top + 120});
     delay = 3000;
+  } else if (s.rfind(L"startup:", 0) == 0) {
+    SetStartWithWindows(s.substr(8) == L"on");
   } else if (s == L"close") {  // como pulsar la X de esta ventana
     PostMessage(g_hwnd, WM_CLOSE, 0, 0);
     return;
@@ -3151,6 +3155,31 @@ static UINT WindowDpi(HWND h) {
   return fn ? fn(h) : 96;
 }
 
+// Iniciar con Windows: valor «Warp» en HKCU\...\Run (por usuario, sin administrador).
+static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+static bool StartsWithWindows() {
+  HKEY k;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_READ, &k) != ERROR_SUCCESS) return false;
+  bool on = RegQueryValueExW(k, L"Warp", nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+  RegCloseKey(k);
+  return on;
+}
+
+static void SetStartWithWindows(bool on) {
+  HKEY k;
+  if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+  if (on) {
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring v = L"\"" + std::wstring(exe) + L"\"";
+    RegSetValueExW(k, L"Warp", 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+  } else {
+    RegDeleteValueW(k, L"Warp");
+  }
+  RegCloseKey(k);
+}
+
 static int SysMetric(int idx, UINT dpi) {
   typedef int(WINAPI * PFN)(int, UINT);
   static PFN fn = (PFN)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi");
@@ -3198,14 +3227,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return HTCLIENT;
     }
     case WM_NCRBUTTONUP:
-      if (wp == HTCAPTION) {  // clic derecho en la barra de título: idioma
+      if (wp == HTCAPTION) {  // clic derecho en la barra de título: idioma e iniciar con Windows
         HMENU menu = CreatePopupMenu(), sub = CreatePopupMenu();
         for (int i = 0; i < kLangCount; i++)
           AppendMenuW(sub, MF_STRING | (i == g_lang ? MF_CHECKED : 0), 100 + i, kLangNames[i]);
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, T(S_LANGUAGE));
+        AppendMenuW(menu, MF_STRING | (StartsWithWindows() ? MF_CHECKED : 0), 1, T(S_STARTUP));
         int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), 0, hwnd,
                                  nullptr);
         DestroyMenu(menu);
+        if (cmd == 1) SetStartWithWindows(!StartsWithWindows());
         if (cmd >= 100 && cmd < 100 + kLangCount) {
           g_lang = cmd - 100;
           SaveSession();

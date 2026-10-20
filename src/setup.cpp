@@ -181,6 +181,12 @@ static int Uninstall(bool fromTemp) {
   DeleteFileW(StartMenuLink().c_str());
   DeleteFileW(DesktopLink().c_str());
   RegDeleteKeyW(HKEY_CURRENT_USER, kUninstallKey);
+  HKEY run;  // «Iniciar con Windows»
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_WRITE, &run) ==
+      ERROR_SUCCESS) {
+    RegDeleteValueW(run, L"Warp");
+    RegCloseKey(run);
+  }
   DeleteOldCopies(dir);
   DeleteFileW((dir + L"\\warp-lite.exe").c_str());  // nombre antiguo
   bool ok = DeleteFileW((dir + L"\\Warp.exe").c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
