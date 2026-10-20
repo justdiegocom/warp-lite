@@ -20,7 +20,9 @@ A small, fast terminal for Windows with the look and shortcuts of [Warp](https:/
 
 ## Install
 
-Download `warp-lite-setup.exe` from [Releases](https://github.com/justdiegocom/warp-lite/releases/latest) and run it (per-user, no admin). It shows up as **Warp** in the Start menu and in *Installed apps*. Right-click the title bar for the language and *Start with Windows*.
+Download `warp-lite-setup.exe` from [Releases](https://github.com/justdiegocom/warp-lite/releases/latest) and run it (per-user, no admin). It shows up as **Warp** in the Start menu and in *Installed apps*. Right-click the title bar for the language, *Start with Windows*, *Check for updates* and *Update automatically*.
+
+**Updates:** Warp checks this repo's latest release at startup and every 6 hours. With *Update automatically* (on by default) the new installer is downloaded, verified against the release's SHA-256 and installed in the background; a small notice offers *Restart* when it's ready. Otherwise the notice offers *Install*. It never restarts on its own.
 
 ## Build
 
