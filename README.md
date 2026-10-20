@@ -7,6 +7,8 @@ A small, fast terminal for Windows with the look and shortcuts of [Warp](https:/
 ## Features
 
 - **Tabs and split panes** with Warp's shortcuts: `Ctrl+Shift+D` split right, `Ctrl+Shift+E` split down, `Ctrl+Alt+Arrows` move between panes, `Ctrl+Shift+T` new tab, `Ctrl+Shift+W` close.
+- **Jump to any terminal** with `Ctrl+Shift+K`: every pane of every window, with what it's running and its folder; type to filter, `Enter` to go there. Tabs running Claude Code are named after their conversation.
+- **Open Warp here** in the Explorer right-click menu (on a folder, a drive or inside a folder): a new tab opens already in that folder. On Windows 11 it's under *Show more options*.
 - **Input box** at the bottom with the current folder (click it to switch folders), history, and the command coloured green if it exists or underlined in red if not.
 - **Tab completion** like Warp's menu: commands, `-parameters` and paths (`↑/↓` or `Tab` to move, `Enter` to pick).
 - **Picks up where you left off**: tabs, splits, folders and windows come back after a restart. Your last command is waiting in the input box, and anything that was still running (e.g. `ssh … tmux`) is relaunched. Claude Code and Codex resume the exact conversation each pane had (`claude --resume <id>`, `codex resume <id>`), even with several of them open in the same folder, instead of starting a new one.

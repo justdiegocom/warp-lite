@@ -174,6 +174,7 @@ struct Pane {
   // Restauración tras reiniciar.
   std::string restoreCmd;
   DWORD spawnTick = 0;
+  std::wstring agentName;  // nombre de la conversación de Claude Code que corre aquí (título de la pestaña)
   std::atomic<DWORD> firstOut{0}, lastOut{0};
 };
 
@@ -218,7 +219,7 @@ enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, 
            S_SEARCH_DIRS, S_PARENT_DIR, S_RENAME, S_HIDE, S_CLOSE_TAB, S_SHOW_ALL, S_HIDDEN_N, S_STARTUP,
            S_LOADING, S_KIND_CMD, S_KIND_DIR, S_KIND_FILE, S_KIND_PARAM, S_UPD_AVAIL, S_UPD_INSTALLING, S_UPD_READY,
            S_UPD_FAILED, S_UPD_INSTALL, S_UPD_RESTART, S_UPD_RETRY, S_UPD_CHECK, S_UPD_AUTO, S_UPD_LATEST, S_UPD_CHECKING,
-           S_UPD_OFFLINE, S_UPD_DOWNLOADING, S_COUNT };
+           S_UPD_OFFLINE, S_UPD_DOWNLOADING, S_SWITCH, S_OTHER_WINDOW, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
@@ -226,7 +227,7 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"%d hidden", L"Start with Windows", L"Loading…", L"Command", L"Folder", L"File", L"Parameter",
      L"Warp %s is available", L"Installing %s…", L"Updated to %s", L"Couldn't update to %s", L"Install", L"Restart",
      L"Retry", L"Check for updates", L"Update automatically", L"Warp is up to date", L"Checking for updates…",
-     L"Couldn't check for updates", L"Downloading %s…"},
+     L"Couldn't check for updates", L"Downloading %s…", L"Search terminals…", L"other window"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
@@ -234,7 +235,7 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Parámetro", L"Warp %s disponible", L"Instalando %s…", L"Actualizado a %s", L"No se pudo actualizar a %s",
      L"Instalar", L"Reiniciar", L"Reintentar", L"Buscar actualizaciones", L"Actualizar automáticamente",
      L"Warp está al día", L"Buscando actualizaciones…", L"No se pudo comprobar si hay actualizaciones",
-     L"Descargando %s…"},
+     L"Descargando %s…", L"Buscar terminales…", L"otra ventana"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -256,6 +257,12 @@ static std::wstring g_sessionPath;
 static std::wstring g_windowDir;
 static bool g_keepSession = false;  // al cerrar, conservar la sesión (salir de todo / apagar Windows)
 static UINT g_msgQuitAll;           // mensaje registrado: «cerrar todas guardándolas»
+static UINT g_msgListPanes, g_msgFocusPane;  // selector de terminales entre ventanas (Ctrl+Shift+K)
+static std::wstring g_openDir;      // --cd <carpeta> («Abrir Warp aquí»): pestaña nueva ya en ella
+// Las ventanas de un mismo Warp (mismo %APPDATA%\warp-lite, o la misma carpeta en las pruebas) se
+// reconocen por esta marca: así las pruebas nunca tocan las ventanas de verdad.
+static const ULONG_PTR kCopyOpenDir = 0x57434400, kCopyPaneList = 0x574c5300;
+static const wchar_t* kInstanceProp = L"warp-lite-instance";
 static bool g_focused = true;
 
 // Selección (coordenadas de vista dentro de un panel).
@@ -851,8 +858,9 @@ static Pane* SplitActive(bool vertical) {
   return np;
 }
 
-static Pane* NewTab(int at = -1) {
+static Pane* NewTab(int at = -1, const std::wstring& dir = L"") {
   Pane* p = NewPane();
+  p->cwd = dir;
   Node* n = new Node();
   n->pane = p;
   p->node = n;
@@ -1167,15 +1175,17 @@ static std::vector<DWORD> Descendants(const std::map<DWORD, std::vector<DWORD>>&
 
 // Claude Code apunta en %USERPROFILE%\.claude\sessions\<pid>.json la conversación de cada proceso
 // (también tras /clear o /resume): con eso cada panel sabe exactamente cuál es la suya.
-static std::string ClaudeSessionOfPid(DWORD pid) {
+static std::string ClaudeSessionJson(DWORD pid) {
   std::wstring root = EnvDir(L"CLAUDE_CONFIG_DIR", L"\\.claude");
   FILE* f = root.empty() ? nullptr : _wfopen((root + L"\\sessions\\" + std::to_wstring(pid) + L".json").c_str(), L"rb");
   if (!f) return "";
   std::string j(8192, '\0');
   j.resize(fread(j.data(), 1, j.size(), f));
   fclose(f);
-  return JsonStr(j, "sessionId", 0);
+  return j;
 }
+
+static std::string ClaudeSessionOfPid(DWORD pid) { return JsonStr(ClaudeSessionJson(pid), "sessionId", 0); }
 
 // Codex tiene abierto el archivo de su conversación mientras corre: el Restart Manager de Windows
 // dice qué procesos lo tienen abierto.
@@ -1778,6 +1788,7 @@ static void ActivateTab(int i) {
 }
 
 static void OpenFind(Pane* p);
+static void OpenSwitcher();
 
 static int HiddenCount() {
   int n = 0;
@@ -1933,6 +1944,7 @@ static bool HandleShortcut(WPARAM vk) {
       case 'C': CopySelection(); return true;
       case 'V': Paste(act); return true;
       case 'F': OpenFind(act); return true;  // Ctrl+Shift+F: el de Warp
+      case 'K': OpenSwitcher(); return true;  // Ctrl+Shift+K: saltar a cualquier terminal
       case 'Q': EnumWindows(SendQuitAll, 0); return true;  // cerrar todas las ventanas guardándolas
       case VK_OEM_4: CyclePane(-1); InvalidateRect(g_hwnd, nullptr, FALSE); return true;  // Ctrl+Shift+{
       case VK_OEM_6: CyclePane(+1); InvalidateRect(g_hwnd, nullptr, FALSE); return true;  // Ctrl+Shift+}
@@ -2236,6 +2248,207 @@ static void PickChar(wchar_t c) {
   if (c < 0x20) return;
   g_pick.filter += c;
   PickFilter();
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static std::wstring Lower(std::wstring s);
+
+// ---------------------------------------------------------------------------
+// Ventanas del mismo Warp
+
+static HANDLE InstanceKey() {
+  wchar_t buf[MAX_PATH];
+  std::wstring k;
+  if (GetEnvironmentVariableW(L"WARPLITE_SESSION", buf, MAX_PATH)) {
+    k = buf;
+    k = k.substr(0, k.find_last_of(L"\\/") == std::wstring::npos ? 0 : k.find_last_of(L"\\/"));
+  } else if (GetEnvironmentVariableW(L"WARPLITE_DIR", buf, MAX_PATH)) {
+    k = buf;
+  } else if (GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) {
+    k = std::wstring(buf) + L"\\warp-lite";
+  }
+  uint32_t h = 2166136261u;  // FNV-1a
+  for (wchar_t c : k) h = (h ^ (uint32_t)towlower(c)) * 16777619u;
+  return (HANDLE)(ULONG_PTR)(h | 1);
+}
+
+// Las otras ventanas de este Warp, de la de delante a la de detrás.
+static std::vector<HWND> SiblingWindows() {
+  struct Ctx {
+    HANDLE key;
+    std::vector<HWND> out;
+  } ctx{InstanceKey(), {}};
+  EnumWindows(
+      [](HWND h, LPARAM lp) -> BOOL {
+        Ctx* c = (Ctx*)lp;
+        wchar_t cls[32];
+        if (h != g_hwnd && GetClassNameW(h, cls, 32) && !wcscmp(cls, L"WarpLite") && GetPropW(h, kInstanceProp) == c->key)
+          c->out.push_back(h);
+        return TRUE;
+      },
+      (LPARAM)&ctx);
+  return ctx.out;
+}
+
+static void BringToFront(HWND h) {
+  if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+  SetForegroundWindow(h);
+}
+
+// «Abrir Warp aquí»: pestaña nueva en esa carpeta, detrás de la activa.
+static void OpenDirTab(const std::wstring& dir) {
+  NewTab(g_tabs.empty() ? -1 : g_activeTab + 1, dir);
+  SaveSession();
+  BringToFront(g_hwnd);
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// ---------------------------------------------------------------------------
+// Selector de terminales (Ctrl+Shift+K): todas las de todas las ventanas, con su conversación de
+// Claude, su carpeta y lo que tienen en marcha; se escribe para filtrar y Enter salta a ella.
+
+struct SwitchItem {
+  HWND hwnd;  // ventana (la propia o la de otro proceso)
+  int tab, pane;
+  std::wstring title, cwd, running;
+};
+struct Switcher {
+  bool open = false;
+  std::wstring filter;
+  std::vector<SwitchItem> all, shown;
+  int sel = 0, top = 0;
+  RECT rc{};
+};
+static Switcher g_sw;
+
+// Una línea por panel: pestaña, panel, título, carpeta y orden en marcha, separados por tabuladores.
+static std::wstring PaneListText() {
+  auto clean = [](std::wstring t) {
+    for (wchar_t& c : t)
+      if (c == L'\t' || c == L'\n' || c == L'\r') c = L' ';
+    return t;
+  };
+  std::wstring out;
+  for (int i = 0; i < (int)g_tabs.size(); i++) {
+    std::vector<Pane*> ls;
+    Leaves(g_tabs[i].root, ls);
+    for (int j = 0; j < (int)ls.size(); j++) {
+      Pane* p = ls[j];
+      std::wstring title = !p->agentName.empty() ? p->agentName
+                           : ls.size() == 1 && !g_tabs[i].name.empty() ? g_tabs[i].name : ShortTitle(p);
+      out += std::to_wstring(i) + L"\t" + std::to_wstring(j) + L"\t" + clean(title) + L"\t" + clean(p->cwd) + L"\t" +
+             clean(p->runningCmd) + L"\n";
+    }
+  }
+  return out;
+}
+
+static void AddPaneList(HWND from, const std::wstring& text) {
+  size_t a = 0;
+  while (a < text.size()) {
+    size_t e = text.find(L'\n', a);
+    if (e == std::wstring::npos) e = text.size();
+    std::vector<std::wstring> f;
+    for (size_t b = a; b <= e;) {
+      size_t t = text.find(L'\t', b);
+      if (t == std::wstring::npos || t > e) t = e;
+      f.push_back(text.substr(b, t - b));
+      b = t + 1;
+    }
+    if (f.size() >= 5) g_sw.all.push_back({from, _wtoi(f[0].c_str()), _wtoi(f[1].c_str()), f[2], f[3], f[4]});
+    a = e + 1;
+  }
+}
+
+static void SwFilter() {
+  std::wstring f = Lower(g_sw.filter);
+  g_sw.shown.clear();
+  for (auto& it : g_sw.all)
+    if (f.empty() || Lower(it.title + L" " + it.cwd + L" " + it.running).find(f) != std::wstring::npos) g_sw.shown.push_back(it);
+  g_sw.sel = 0;
+  g_sw.top = 0;
+  // Sin filtro, la seleccionada es la terminal en la que se está.
+  if (f.empty() && !g_tabs.empty()) {
+    std::vector<Pane*> ls;
+    Leaves(CurTab().root, ls);
+    int pj = (int)(std::find(ls.begin(), ls.end(), CurTab().active) - ls.begin());
+    for (int i = 0; i < (int)g_sw.shown.size(); i++)
+      if (g_sw.shown[i].hwnd == g_hwnd && g_sw.shown[i].tab == g_activeTab && g_sw.shown[i].pane == pj) g_sw.sel = i;
+  }
+}
+
+static void OpenSwitcher() {
+  g_sw = Switcher{};
+  g_sw.open = true;
+  AddPaneList(g_hwnd, PaneListText());
+  // Las otras ventanas contestan con WM_COPYDATA mientras se espera aquí.
+  for (HWND h : SiblingWindows()) {
+    DWORD_PTR r;
+    SendMessageTimeoutW(h, g_msgListPanes, (WPARAM)g_hwnd, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 500, &r);
+  }
+  SwFilter();
+  if (g_sw.sel >= kPickRows) g_sw.top = g_sw.sel - kPickRows + 1;
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void CloseSwitcher() {
+  g_sw.open = false;
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void FocusPane(int tab, int pane) {
+  if (tab < 0 || tab >= (int)g_tabs.size()) return;
+  ActivateTab(tab);
+  std::vector<Pane*> ls;
+  Leaves(g_tabs[tab].root, ls);
+  if (pane >= 0 && pane < (int)ls.size()) g_tabs[tab].active = ls[pane];
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void SwChoose(int i) {
+  if (i < 0 || i >= (int)g_sw.shown.size()) return;
+  SwitchItem it = g_sw.shown[i];
+  CloseSwitcher();
+  if (it.hwnd == g_hwnd) {
+    FocusPane(it.tab, it.pane);
+  } else if (IsWindow(it.hwnd)) {
+    PostMessageW(it.hwnd, g_msgFocusPane, it.tab, it.pane);
+    BringToFront(it.hwnd);
+  }
+}
+
+static bool SwKey(WPARAM vk) {
+  int n = (int)g_sw.shown.size();
+  switch (vk) {
+    case VK_ESCAPE: CloseSwitcher(); return true;
+    case VK_RETURN: SwChoose(g_sw.sel); return true;
+    case VK_UP: g_sw.sel = std::max(0, g_sw.sel - 1); break;
+    case VK_DOWN: g_sw.sel = std::min(n - 1, g_sw.sel + 1); break;
+    case VK_PRIOR: g_sw.sel = std::max(0, g_sw.sel - kPickRows); break;
+    case VK_NEXT: g_sw.sel = std::min(n - 1, g_sw.sel + kPickRows); break;
+    case VK_BACK:
+      if (!g_sw.filter.empty()) g_sw.filter.pop_back();
+      SwFilter();
+      break;
+    case 'K':
+      if ((GetKeyState(VK_CONTROL) & 0x8000) && (GetKeyState(VK_SHIFT) & 0x8000)) {
+        CloseSwitcher();  // el mismo atajo lo cierra
+        return true;
+      }
+      return false;
+    default: return false;
+  }
+  g_sw.sel = std::max(0, g_sw.sel);
+  if (g_sw.sel < g_sw.top) g_sw.top = g_sw.sel;
+  if (g_sw.sel >= g_sw.top + kPickRows) g_sw.top = g_sw.sel - kPickRows + 1;
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+  return true;
+}
+
+static void SwChar(wchar_t c) {
+  if (c < 0x20) return;
+  g_sw.filter += c;
+  SwFilter();
   InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -3321,6 +3534,7 @@ static void DrawDividers(HDC dc, Node* n) {
 }
 
 static std::wstring ShortTitle(Pane* p) {
+  if (!p->agentName.empty()) return p->agentName;
   if (!p->runningCmd.empty()) return p->runningCmd;
   std::wstring t = p->title;
   if (t.empty()) t = L"Terminal";
@@ -3348,6 +3562,23 @@ static void UpdateRunning() {
     std::wstring want;
     if (exe) want = p->runningCmd.empty() ? (p->submittedCmd.empty() ? *exe : ToWide(p->submittedCmd)) : p->runningCmd;
     if (want != p->runningCmd) p->runningCmd = want, changed = true;
+  }
+  // Claude Code: la pestaña toma el nombre de la conversación (el que le pone Claude o /rename),
+  // no el derivado de la carpeta, que no dice nada nuevo.
+  std::map<DWORD, std::vector<DWORD>> kids;
+  bool haveKids = false;
+  for (Pane* p : g_live) {
+    std::wstring name;
+    if (!p->runningCmd.empty() && AgentKind(p->lastCmd) == AGENT_CLAUDE) {
+      if (!haveKids) kids = ChildrenByParent(), haveKids = true;
+      for (DWORD pid : Descendants(kids, p->pid)) {
+        std::string j = ClaudeSessionJson(pid);
+        if (j.empty()) continue;
+        if (JsonStr(j, "nameSource", 0) != "derived") name = ToWide(JsonStr(j, "name", 0));
+        break;
+      }
+    }
+    if (name != p->agentName) p->agentName = name, changed = true;
   }
   if (changed) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
@@ -3530,6 +3761,53 @@ static void DrawPicker(HDC dc) {
   SetBkMode(dc, OPAQUE);
 }
 
+static void DrawSwitcher(HDC dc, int cw) {
+  if (!g_sw.open) {
+    g_sw.rc = RECT{};
+    return;
+  }
+  int rowH = Px(30), n = std::min<int>(kPickRows, (int)g_sw.shown.size());
+  int h = Px(40) + std::max(1, n) * rowH + Px(6);
+  int w = std::min<int>(Px(620), cw - Px(32));
+  RECT r{(cw - w) / 2, TabBarH() + Px(12), (cw - w) / 2 + w, TabBarH() + Px(12) + h};
+  g_sw.rc = r;
+  Panel(dc, r);
+  SetBkMode(dc, TRANSPARENT);
+  SelectObject(dc, g_uiFont);
+  RECT fr{r.left + Px(12), r.top, r.right - Px(12), r.top + Px(40)};
+  if (g_sw.filter.empty()) Text(dc, T(S_SWITCH), fr, RGB(0x8a, 0x8a, 0x8a), DT_LEFT);
+  else Text(dc, g_sw.filter, fr, kFg, DT_LEFT | DT_END_ELLIPSIS);
+  Fill(dc, RECT{r.left + 1, r.top + Px(40) - 1, r.right - 1, r.top + Px(40)}, kChipBorder);
+  if (g_sw.shown.empty()) {
+    RECT ir{r.left + Px(16), r.top + Px(40), r.right - Px(8), r.top + Px(40) + rowH};
+    Text(dc, T(S_NO_RESULTS), ir, kTabText, DT_LEFT);
+  }
+  for (int i = 0; i < n; i++) {
+    int idx = g_sw.top + i;
+    if (idx >= (int)g_sw.shown.size()) break;
+    const SwitchItem& it = g_sw.shown[idx];
+    RECT ir{r.left + Px(4), r.top + Px(40) + i * rowH + Px(2), r.right - Px(4), r.top + Px(40) + (i + 1) * rowH};
+    bool sel = idx == g_sw.sel;
+    if (sel) Fill(dc, ir, kAccent);
+    // Punto verde: tiene algo en marcha (Claude, ssh…).
+    int cx = ir.left + Px(12), cy = (ir.top + ir.bottom) / 2;
+    if (!it.running.empty()) Fill(dc, RECT{cx - Px(3), cy - Px(3), cx + Px(3), cy + Px(3)}, RGB(0x4e, 0xc9, 0x6b));
+    // A la derecha la carpeta (solo su último trozo) y si es de otra ventana.
+    std::wstring right = it.cwd;
+    size_t cut = right.find_last_of(L'\\');
+    if (cut != std::wstring::npos && cut + 1 < right.size()) right = right.substr(cut + 1);
+    if (it.hwnd != g_hwnd) right += L"  \u00b7  " + std::wstring(T(S_OTHER_WINDOW));
+    SIZE sz{};
+    GetTextExtentPoint32W(dc, right.c_str(), (int)right.size(), &sz);
+    int rw = std::min<int>(sz.cx, (ir.right - ir.left) / 2);
+    RECT rr{ir.right - Px(10) - rw, ir.top, ir.right - Px(10), ir.bottom};
+    Text(dc, right, rr, sel ? kFg : RGB(0x8a, 0x8a, 0x8a), DT_RIGHT | DT_END_ELLIPSIS);
+    RECT tr{ir.left + Px(26), ir.top, rr.left - Px(12), ir.bottom};
+    Text(dc, it.title, tr, sel ? kFg : RGB(0xd0, 0xd0, 0xd0), DT_LEFT | DT_END_ELLIPSIS);
+  }
+  SetBkMode(dc, OPAQUE);
+}
+
 // Aviso de actualización: una tarjeta pequeña abajo a la derecha, con su acción y una ×.
 static void DrawUpdateNotice(HDC dc, int w, int h) {
   g_upd.rc = g_upd.action = g_upd.close = RECT{};
@@ -3638,6 +3916,7 @@ static void Render(HDC dc, int w, int h) {
   DrawFindBar(dc);
   DrawPicker(dc);
   DrawCompletion(dc);
+  DrawSwitcher(dc, w);
   DrawUpdateNotice(dc, w, h);
   if (g_dropTarget) {  // destino al arrastrar un panel por su cabecera
     HBRUSH b = CreateSolidBrush(kAccent);
@@ -3671,7 +3950,7 @@ static void PaintDirty() {
   DWORD now = GetTickCount();
   g_lastFrame = now;
   if (!g_backDC || g_tabs.empty() || IsIconic(g_hwnd)) return;
-  bool overlay = g_find.open || g_pick.open || g_comp.open || (g_upd.stage != UPD_NONE && !g_upd.hidden) || g_dragPane || g_link.p || g_renameTab >= 0;
+  bool overlay = g_find.open || g_pick.open || g_sw.open || g_comp.open || (g_upd.stage != UPD_NONE && !g_upd.hidden) || g_dragPane || g_link.p || g_renameTab >= 0;
   if (overlay || (g_titleDirty && now - g_lastFull >= 250)) {  // títulos: como mucho 4 veces por segundo
     g_titleDirty = false;
     InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -4307,6 +4586,26 @@ static void RunScriptStep() {
     std::sort(v.begin(), v.end());
     for (auto& r : v) ScriptLog(L"resume: " + r);
     if (v.empty()) ScriptLog(L"resume: (nada)");
+  } else if (s == L"switcher") {  // abre el selector de terminales y apunta lo que lista
+    OpenSwitcher();
+    std::wstring r = L"switcher:";
+    for (auto& it : g_sw.shown) {
+      std::wstring dir = it.cwd.substr(it.cwd.find_last_of(L'\\') == std::wstring::npos ? 0 : it.cwd.find_last_of(L'\\') + 1);
+      r += L" [" + it.title + L" | " + dir + (it.hwnd == g_hwnd ? L"" : L" | otra") + L"]";
+    }
+    ScriptLog(r + L" sel=" + std::to_wstring(g_sw.sel));
+    delay = 300;
+  } else if (s.rfind(L"sw-type:", 0) == 0) {
+    for (wchar_t c : s.substr(8)) SwChar(c);
+    delay = 200;
+  } else if (s == L"active") {  // terminal activa: pestaña, título y carpeta (y si la ventana está delante)
+    Pane* a = CurTab().active;
+    ScriptLog(L"active: tab " + std::to_wstring(g_activeTab) + L" [" + ShortTitle(a) + L"] " + a->cwd +
+              (GetForegroundWindow() == g_hwnd ? L" (delante)" : L""));
+  } else if (s == L"titles") {  // título de cada pestaña
+    std::wstring r = L"titles:";
+    for (auto& t : g_tabs) r += L" [" + (t.name.empty() ? ShortTitle(t.active) : t.name) + L"]";
+    ScriptLog(r);
   } else if (s == L"tabs") {  // orden de las pestañas (por su nombre) y cuál está activa
     std::wstring r = L"tabs:";
     for (int i = 0; i < (int)g_tabs.size(); i++) r += L" " + (i == g_activeTab ? L"*" + g_tabs[i].name : g_tabs[i].name);
@@ -4509,7 +4808,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
       g_hwnd = hwnd;
       ApplyDpi(WindowDpi(hwnd));
-      if (!LoadSession()) NewTab();
+      SetPropW(hwnd, kInstanceProp, InstanceKey());
+      if (!LoadSession() && g_openDir.empty()) NewTab();
+      if (!g_openDir.empty()) NewTab(g_tabs.empty() ? -1 : g_activeTab + 1, g_openDir);
       SetTimer(hwnd, TIMER_RESTORE, 250, nullptr);
       if (!g_script.empty()) SetTimer(hwnd, TIMER_SCRIPT, 3000, nullptr);
       if (!GetEnvironmentVariableW(L"WARPLITE_NO_UPDATE", nullptr, 0)) SetTimer(hwnd, TIMER_UPDATE, 20000, nullptr);
@@ -4633,6 +4934,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CHAR:
     case WM_SYSCHAR: {
       if (g_tabs.empty()) return 0;
+      if (g_sw.open) {
+        if (msg == WM_CHAR) SwChar((wchar_t)wp);
+        return 0;
+      }
       if (g_pick.open) {
         if (msg == WM_CHAR) PickChar((wchar_t)wp);
         return 0;
@@ -4736,6 +5041,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           return 0;
         }
         CompClose();
+      }
+      if (g_sw.open) {  // selector de terminales: elegir o cerrar
+        POINT pt{x, y};
+        if (msg == WM_LBUTTONDOWN && PtInRect(&g_sw.rc, pt) && y >= g_sw.rc.top + Px(40))
+          SwChoose(g_sw.top + (y - g_sw.rc.top - Px(40)) / Px(30));
+        else if (!PtInRect(&g_sw.rc, pt)) CloseSwitcher();
+        return 0;
       }
       if (g_pick.open) {  // selector de carpetas abierto: elegir o cerrar
         POINT pt{x, y};
@@ -4983,6 +5295,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     PostMessageW(hwnd, WM_CLOSE, 0, 0);
     return 0;
   }
+  if (msg == g_msgListPanes && g_msgListPanes) {  // otra ventana abre el selector: se le mandan los paneles
+    HWND to = (HWND)wp;
+    if (!IsWindow(to) || GetPropW(to, kInstanceProp) != InstanceKey()) return 0;
+    std::wstring t = PaneListText();
+    COPYDATASTRUCT cd{kCopyPaneList, (DWORD)(t.size() * sizeof(wchar_t)), (void*)t.data()};
+    SendMessageW(to, WM_COPYDATA, (WPARAM)hwnd, (LPARAM)&cd);
+    return 0;
+  }
+  if (msg == g_msgFocusPane && g_msgFocusPane) {  // elegida en el selector de otra ventana
+    FocusPane((int)wp, (int)lp);
+    return 0;
+  }
+  if (msg == WM_COPYDATA) {
+    auto* cd = (COPYDATASTRUCT*)lp;
+    std::wstring t(cd->lpData ? (const wchar_t*)cd->lpData : L"", cd->cbData / sizeof(wchar_t));
+    if (cd->dwData == kCopyOpenDir) {  // «Abrir Warp aquí» desde el Explorador, con Warp ya abierto
+      DWORD a = GetFileAttributesW(t.c_str());
+      if (!IsLocalDir(t) || a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) return FALSE;
+      OpenDirTab(t);
+      return TRUE;
+    }
+    if (cd->dwData == kCopyPaneList && g_sw.open) {
+      AddPaneList((HWND)wp, t);
+      return TRUE;
+    }
+    return FALSE;
+  }
   return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -5071,6 +5410,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
       for (int t = 0; t < 200 && FindWindowW(L"WarpLite", nullptr); t++) Sleep(100);
   for (int i = 1; i + 1 < argc; i++) {
     if (!wcscmp(argv[i], L"--window")) windowArg = argv[++i];
+    else if (!wcscmp(argv[i], L"--cd")) g_openDir = argv[++i];
     else if (!wcscmp(argv[i], L"--script")) {
       std::wstring s = argv[++i];
       size_t pos;
@@ -5081,6 +5421,29 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   LocalFree(argv);
   g_msgQuitAll = RegisterWindowMessageW(L"warp-lite-quit-all");
   g_msgUpdated = RegisterWindowMessageW(L"warp-lite-updated");
+  g_msgListPanes = RegisterWindowMessageW(L"warp-lite-list-panes");
+  g_msgFocusPane = RegisterWindowMessageW(L"warp-lite-focus-pane");
+  if (!g_openDir.empty()) {
+    // El Explorador pasa "C:\" y Windows lo lee como «C:"»: se arregla la barra del final.
+    while (!g_openDir.empty() && (g_openDir.back() == L' ' || g_openDir.back() == L'\t')) g_openDir.pop_back();
+    if (!g_openDir.empty() && g_openDir.back() == L'"') g_openDir.back() = L'\\';
+    if (g_openDir.size() > 3 && g_openDir.back() == L'\\') g_openDir.pop_back();
+    if (g_openDir.size() == 2 && g_openDir[1] == L':') g_openDir += L'\\';
+    DWORD a = GetFileAttributesW(g_openDir.c_str());
+    if (!IsLocalDir(g_openDir) || a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) g_openDir.clear();
+  }
+  if (!g_openDir.empty() && windowArg.empty()) {
+    // Warp ya abierto: la pestaña se abre en su ventana de delante y este proceso termina.
+    std::vector<HWND> open = SiblingWindows();
+    if (!open.empty()) {
+      DWORD pid = 0;
+      GetWindowThreadProcessId(open[0], &pid);
+      AllowSetForegroundWindow(pid);
+      COPYDATASTRUCT cd{kCopyOpenDir, (DWORD)(g_openDir.size() * sizeof(wchar_t)), (void*)g_openDir.data()};
+      DWORD_PTR r = 0;
+      if (SendMessageTimeoutW(open[0], WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 5000, &r) && r) return 0;
+    }
+  }
   {
     wchar_t self[MAX_PATH], buf[64];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -5139,6 +5502,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   MSG m;
   while (GetMessageW(&m, nullptr, 0, 0)) {
     bool keyDown = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN;
+    if (g_sw.open && keyDown) {
+      if (!SwKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
+      continue;
+    }
     if (g_pick.open && keyDown) {
       if (!PickKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
       continue;

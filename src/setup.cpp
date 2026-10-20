@@ -29,7 +29,7 @@ __asm__(".section .rdata,\"dr\"\n.balign 4\n"
 extern "C" const unsigned char warp_lite_exe[], warp_lite_exe_end[];
 
 static const wchar_t* kUninstallKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\warp-lite";
-static const wchar_t* kVersion = L"0.3.6";
+static const wchar_t* kVersion = L"0.3.7";
 // Nombre visible (se llamó warp-lite; la carpeta de instalación y la clave del registro lo conservan).
 static const wchar_t* kAppName = L"Warp";
 static bool g_silent = false;
@@ -106,6 +106,26 @@ static void SetDword(HKEY k, const wchar_t* name, DWORD v) {
   RegSetValueExW(k, name, 0, REG_DWORD, (const BYTE*)&v, sizeof v);
 }
 
+// «Open Warp here» («Abrir Warp aquí» con Windows en español) en el menú contextual del Explorador: sobre una carpeta, una unidad y el fondo
+// de una carpeta abierta. Warp abre una pestaña ya en esa carpeta (--cd).
+static const wchar_t* const kContextKeys[] = {L"Software\\Classes\\Directory\\shell\\warp-lite",
+                                              L"Software\\Classes\\Directory\\Background\\shell\\warp-lite",
+                                              L"Software\\Classes\\Drive\\shell\\warp-lite"};
+
+static void RegisterContextMenu(const std::wstring& exe) {
+  for (const wchar_t* key : kContextKeys) {
+    HKEY k, c;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS) continue;
+    SetString(k, nullptr, Tr(L"Open Warp here", L"Abrir Warp aquí"));
+    SetString(k, L"Icon", L"\"" + exe + L"\",0");
+    if (RegCreateKeyExW(k, L"command", 0, nullptr, 0, KEY_WRITE, nullptr, &c, nullptr) == ERROR_SUCCESS) {
+      SetString(c, nullptr, L"\"" + exe + L"\" --cd \"%V\"");
+      RegCloseKey(c);
+    }
+    RegCloseKey(k);
+  }
+}
+
 static int Install() {
   std::wstring dir = InstallDir(), exe = dir + L"\\Warp.exe", uninst = dir + L"\\uninstall.exe";
   if (!Ask(Tr(L"Install Warp for this user?", L"¿Instalar Warp para este usuario?"))) return 1;
@@ -149,6 +169,7 @@ static int Install() {
     SetDword(k, L"EstimatedSize", (DWORD)((warp_lite_exe_end - warp_lite_exe) / 1024 + 600));
     RegCloseKey(k);
   }
+  RegisterContextMenu(exe);
   if (!g_silent &&
       MessageBoxW(nullptr, Tr(L"Warp is installed. Open it now?", L"Warp está instalado. ¿Abrirlo ahora?"),
                   kAppName, MB_YESNO | MB_ICONINFORMATION) == IDYES)
@@ -181,6 +202,7 @@ static int Uninstall(bool fromTemp) {
   DeleteFileW(StartMenuLink().c_str());
   DeleteFileW(DesktopLink().c_str());
   RegDeleteKeyW(HKEY_CURRENT_USER, kUninstallKey);
+  for (const wchar_t* key : kContextKeys) RegDeleteTreeW(HKEY_CURRENT_USER, key);
   HKEY run;  // «Iniciar con Windows»
   if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_WRITE, &run) ==
       ERROR_SUCCESS) {
