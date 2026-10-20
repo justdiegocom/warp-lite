@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <deque>
 #include <map>
+#include <unordered_map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -41,9 +42,12 @@ __asm__(".section .rdata,\"dr\"\n.balign 4\n"
         ".global hack_bold\nhack_bold:\n.incbin \"third_party/hack/Hack-Bold.ttf\"\n.global hack_bold_end\nhack_bold_end:\n"
         ".global hack_italic\nhack_italic:\n.incbin \"third_party/hack/Hack-Italic.ttf\"\n.global hack_italic_end\nhack_italic_end:\n"
         ".global hack_bolditalic\nhack_bolditalic:\n.incbin \"third_party/hack/Hack-BoldItalic.ttf\"\n"
-        ".global hack_bolditalic_end\nhack_bolditalic_end:\n.text\n");
+        ".global hack_bolditalic_end\nhack_bolditalic_end:\n"
+        // Iconos de Nerd Fonts (MIT), para los símbolos que Hack no tiene.
+        ".global nerd_symbols\nnerd_symbols:\n.incbin \"third_party/nerd-symbols/SymbolsNerdFontMono-Regular.ttf\"\n"
+        ".global nerd_symbols_end\nnerd_symbols_end:\n.text\n");
 extern "C" const unsigned char hack_regular[], hack_regular_end[], hack_bold[], hack_bold_end[], hack_italic[],
-    hack_italic_end[], hack_bolditalic[], hack_bolditalic_end[];
+    hack_italic_end[], hack_bolditalic[], hack_bolditalic_end[], nerd_symbols[], nerd_symbols_end[];
 
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
@@ -75,6 +79,7 @@ static const COLORREF kCloseHover = RGB(0xc4, 0x2b, 0x1c);
 static const COLORREF kChipBg = RGB(0x1c, 0x1c, 0x1c);
 static const COLORREF kFindBg = RGB(0xc9, 0xa2, 0x27);   // coincidencia
 static const COLORREF kFindCur = RGB(0xff, 0x8c, 0x1a);  // coincidencia actual
+static const COLORREF kUrl = RGB(0xc2, 0xd9, 0xf5);     // URLs: blanco azulado
 static const COLORREF kCmdOk = RGB(0x4e, 0xd1, 0x8f);   // orden que existe
 static const COLORREF kCmdBad = RGB(0xf0, 0x55, 0x55);  // orden desconocida
 static const COLORREF kChipBorder = RGB(0x3a, 0x3a, 0x3a);
@@ -2284,6 +2289,43 @@ static void OnMouseWheel(int x, int y, int delta) {
 // ---------------------------------------------------------------------------
 // Dibujo
 
+// Respaldo por carácter, como Warp: lo que Hack no tiene (⎿ de Claude, iconos de Nerd Fonts,
+// emoji, CJK…) se dibuja con la primera de estas fuentes que lo tenga.
+static const wchar_t* const kFallbackFaces[] = {L"Symbols Nerd Font Mono", L"Segoe UI Symbol", L"Cascadia Mono",
+                                                L"Consolas", L"Segoe UI Emoji", L"MS Gothic", L"Malgun Gothic",
+                                                L"Microsoft YaHei", L"Nirmala UI", L"Segoe UI"};
+static const int kFallbackCount = sizeof kFallbackFaces / sizeof kFallbackFaces[0];
+static HFONT g_fallback[kFallbackCount];
+static HDC g_measureDC;
+static std::unordered_map<uint32_t, uint8_t> g_fbCache;  // 0 = Hack; i = g_fallback[i-1]
+
+static bool FontHas(HFONT f, uint32_t cp) {
+  if (cp >= 0x10000) return false;  // GDI solo informa del plano básico
+  SelectObject(g_measureDC, f);
+  wchar_t ch = (wchar_t)cp;
+  WORD gi = 0xFFFF;
+  return GetGlyphIndicesW(g_measureDC, &ch, 1, &gi, GGI_MARK_NONEXISTING_GLYPHS) != GDI_ERROR && gi != 0xFFFF;
+}
+
+static int FallbackFor(uint32_t cp) {
+  if (cp < 0x2000 && cp != 0) {  // latín, griego, cirílico…: Hack los tiene casi todos
+    if (cp < 0x370) return 0;
+  }
+  auto it = g_fbCache.find(cp);
+  if (it != g_fbCache.end()) return it->second;
+  int r = 0;
+  if (cp >= 0xF0000) r = 1;                         // iconos de Nerd Fonts en el plano privado suplementario
+  else if (cp >= 0x10000) r = 5;                    // emoji y demás fuera del plano básico
+  else if (!FontHas(g_fonts[0], cp))
+    for (int i = 0; i < kFallbackCount; i++)
+      if (FontHas(g_fallback[i], cp)) {
+        r = i + 1;
+        break;
+      }
+  g_fbCache[cp] = (uint8_t)r;
+  return r;
+}
+
 static void MakeFonts() {
   for (auto& f : g_fonts)
     if (f) DeleteObject(f), f = nullptr;
@@ -2321,6 +2363,12 @@ static void MakeFonts() {
   SelectObject(dc, old);
   ReleaseDC(nullptr, dc);
   g_cellW = std::max(1, (int)sz.cx);
+  if (!g_measureDC) g_measureDC = CreateCompatibleDC(nullptr);
+  for (int i = 0; i < kFallbackCount; i++) {
+    if (g_fallback[i]) DeleteObject(g_fallback[i]);
+    g_fallback[i] = CreateFontW(h, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
+                                CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, kFallbackFaces[i]);
+  }
   // Altura de línea de Warp: 1,2 × tamaño de letra (DEFAULT_UI_LINE_HEIGHT_RATIO).
   g_cellH = std::max((int)tm.tmHeight, (int)(MulDiv(g_fontPx, ScaledDpi(), 96) * 1.2 + 0.5));
   g_textDy = (g_cellH - (int)tm.tmHeight) / 2;
@@ -2338,13 +2386,44 @@ static void Fill(HDC dc, RECT r, COLORREF c) {
   ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &r, nullptr, 0, nullptr);
 }
 
+static std::wstring RowText(Pane* p, int row);
+
+// Celdas de la fila que forman parte de una URL http(s) (también la continuación de una URL
+// partida desde la fila anterior). Con el lock tomado.
+static std::vector<char> UrlMask(Pane* p, int row) {
+  static const std::wstring kStop = L" \t\"'<>`|()[]{}";
+  std::vector<char> m(p->cols, 0);
+  std::wstring t = RowText(p, row);
+  auto mark = [&](const std::wstring& s, std::vector<char>* out) {
+    bool tail = false;  // la última URL llega al final de la fila
+    for (size_t at = 0; (at = s.find(L"http", at)) != std::wstring::npos;) {
+      if (s.compare(at, 7, L"http://") && s.compare(at, 8, L"https://")) { at += 4; continue; }
+      size_t end = s.find_first_of(kStop, at);
+      if (end == std::wstring::npos) end = s.size(), tail = true;
+      while (end > at && wcschr(L".,;:!?", s[end - 1])) end--;
+      if (out) for (size_t i = at; i < end; i++) (*out)[i] = 1;
+      at = end;
+    }
+    return tail;
+  };
+  mark(t, &m);
+  VTermScreenCell last;
+  if (row > 0 && t[0] != L' ' && (CellAt(p, row - 1, p->cols - 1, &last), last.chars[0] && last.chars[0] != ' ') &&
+      mark(RowText(p, row - 1), nullptr)) {  // continuación
+    size_t end = t.find_first_of(kStop);
+    for (size_t i = 0; i < (end == std::wstring::npos ? t.size() : end); i++) m[i] = 1;
+  }
+  return m;
+}
+
 struct Style {
   COLORREF fg, bg;
   int font;
+  int fb;  // fuente de respaldo (0 = Hack)
   int underline;
   bool strike;
   bool operator!=(const Style& o) const {
-    return fg != o.fg || bg != o.bg || font != o.font || underline != o.underline || strike != o.strike;
+    return fg != o.fg || bg != o.bg || font != o.font || fb != o.fb || underline != o.underline || strike != o.strike;
   }
 };
 
@@ -2445,6 +2524,7 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
       if (drawn.right == drawn.left) drawn = rr;
       else UnionRect(&drawn, &drawn, &rr);
     }
+    std::vector<char> url = UrlMask(p, row);
     int col = 0;
     while (col < p->cols) {
       int start = col;
@@ -2459,7 +2539,7 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
           continue;
         }
         Style s;
-        s.fg = ResolveColor(p, c.fg, true);
+        s.fg = url[col] && VTERM_COLOR_IS_DEFAULT_FG(&c.fg) ? kUrl : ResolveColor(p, c.fg, true);
         s.bg = ResolveColor(p, c.bg, false);
         if (c.attrs.dim)  // atenuado (SGR 2): a medio camino entre texto y fondo
           s.fg = RGB((GetRValue(s.fg) + GetRValue(s.bg)) / 2, (GetGValue(s.fg) + GetGValue(s.bg)) / 2,
@@ -2468,6 +2548,7 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
         if (InSelection(p, row, col)) s.bg = kSelBg;
         if (int f = FindMark(p, row, col)) s.bg = f == 2 ? kFindCur : kFindBg, s.fg = RGB(0, 0, 0);
         s.font = (c.attrs.bold ? 1 : 0) | (c.attrs.italic ? 2 : 0);
+        s.fb = c.chars[0] ? FallbackFor(c.chars[0]) : 0;
         s.underline = c.attrs.underline;
         s.strike = c.attrs.strike;
         if (col != start && s != st) break;
@@ -2486,7 +2567,7 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
         col += w;
       }
       RECT r{ox + start * g_cellW, y, ox + col * g_cellW, y + g_cellH};
-      SelectObject(dc, g_fonts[st.font]);
+      SelectObject(dc, st.fb ? g_fallback[st.fb - 1] : g_fonts[st.font]);
       SetTextColor(dc, st.fg);
       SetBkColor(dc, st.bg);
       ExtTextOutW(dc, r.left, y + g_textDy, ETO_OPAQUE | ETO_CLIPPED, &r, txt.c_str(), (UINT)txt.size(), dx.data());
@@ -3660,7 +3741,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   struct { const unsigned char *a, *b; } fonts[] = {{hack_regular, hack_regular_end},
                                                      {hack_bold, hack_bold_end},
                                                      {hack_italic, hack_italic_end},
-                                                     {hack_bolditalic, hack_bolditalic_end}};
+                                                     {hack_bolditalic, hack_bolditalic_end},
+                                                     {nerd_symbols, nerd_symbols_end}};
   for (auto& f : fonts) {
     DWORD n = 0;
     AddFontMemResourceEx((void*)f.a, (DWORD)(f.b - f.a), nullptr, &n);

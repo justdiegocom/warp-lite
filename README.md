@@ -34,6 +34,10 @@ Fuente: Hack a 13 px, la de Warp por defecto, incluida en el `.exe` (`third_part
 
 La cabecera de cada panel (y su pestaña) muestra la orden en marcha mientras corre un programa, como en Warp (p. ej. `ssh frhm1`); al terminar vuelve al título de la shell.
 
+Los caracteres que Hack no tiene (el `⎿` de Claude, iconos de Nerd Fonts, emoji, CJK…) se dibujan con
+la primera fuente de respaldo que los tenga: «Symbols Nerd Font Mono» (incluida, `third_party/nerd-symbols`,
+MIT), Segoe UI Symbol, Cascadia, Segoe UI Emoji… Las URL de la salida van en blanco azulado.
+
 Al dividir o cerrar, los paneles de una misma fila o columna se reparten el espacio a partes iguales, como en Warp.
 
 Ratón: arrastrar la cabecera de un panel y soltarla sobre otro los intercambia, arrastrar los divisores para redimensionar, arrastrar para seleccionar, clic derecho copia (si hay
