@@ -2764,6 +2764,11 @@ static void PrimeBack() {
 
 // Pruebas: ¿lo pintado fila a fila coincide con un pintado completo? Devuelve píxeles distintos.
 static long VerifyPartial() {
+  // Con los paneles bloqueados no entra salida nueva entre las dos imágenes (el lock es reentrante).
+  std::vector<Pane*> locked(g_live.begin(), g_live.end());
+  for (Pane* p : locked) EnterCriticalSection(&p->cs);
+  PaintDirty();
+  long r = [&] {
   RECT rc;
   GetClientRect(g_hwnd, &rc);
   int w = rc.right, h = rc.bottom;
@@ -2789,6 +2794,9 @@ static long VerifyPartial() {
       for (int x = std::max(0, (int)p->content.left); x < std::min(w, (int)p->content.right); x++)
         diff += (a[(size_t)y * w + x] & 0xffffff) != (b[(size_t)y * w + x] & 0xffffff);
   return diff;
+  }();
+  for (Pane* p : locked) LeaveCriticalSection(&p->cs);
+  return r;
 }
 
 // Mide el tiempo de dibujo (paso «bench» de las pruebas): pintado completo y solo filas cambiadas.
