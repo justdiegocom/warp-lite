@@ -83,7 +83,7 @@ static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
 enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT };
-enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3 };
+enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4 };
 
 // ---------------------------------------------------------------------------
 // Modelo: pestañas -> árbol de paneles
@@ -147,6 +147,9 @@ struct Pane {
   std::map<std::wstring, bool> existsMemo;
   int histPos = -1;
   RECT input{};
+  // Filas que han cambiado desde el último dibujo (con el lock): solo esas se repintan.
+  std::vector<char> dirtyRows;
+  bool fullDirty = true;
   RECT chip{};          // apartado de la carpeta (clic: selector de carpetas)
   bool resumeRun = false;  // al reabrir, volver a lanzar la orden (estaba en marcha al cerrar)
   int lineRow = -1, lineCol = -1;
@@ -368,25 +371,47 @@ static void FlushOut(Pane* p) {
   LeaveCriticalSection(&p->writeCs);
 }
 
-static int CbMoveCursor(VTermPos pos, VTermPos, int, void* user) {
-  ((Pane*)user)->cursor = pos;
+static void MarkRow(Pane* p, int r) {
+  if (r >= 0 && r < (int)p->dirtyRows.size()) p->dirtyRows[r] = 1;
+}
+
+static int CbMoveCursor(VTermPos pos, VTermPos old, int, void* user) {
+  Pane* p = (Pane*)user;
+  MarkRow(p, old.row);
+  MarkRow(p, pos.row);
+  p->cursor = pos;
   return 1;
 }
+
+static int CbDamage(VTermRect r, void* user) {
+  Pane* p = (Pane*)user;
+  for (int row = r.start_row; row < r.end_row; row++) MarkRow(p, row);
+  return 1;
+}
+
+static std::atomic<bool> g_titleDirty{false};  // cambió un título: hay que repintar cabeceras y pestañas
 
 static int CbSetTermProp(VTermProp prop, VTermValue* v, void* user) {
   Pane* p = (Pane*)user;
   switch (prop) {
-    case VTERM_PROP_CURSORVISIBLE: p->cursorVisible = v->boolean; break;
+    case VTERM_PROP_CURSORVISIBLE:
+      p->cursorVisible = v->boolean;
+      MarkRow(p, p->cursor.row);
+      break;
     case VTERM_PROP_ALTSCREEN:
       p->altScreen = v->boolean;
       p->scrollOff = 0;
+      p->fullDirty = true;
       if (p->integrated) PostMessage(g_hwnd, WM_APP_LAYOUT, 0, (LPARAM)p);  // la caja se oculta a pantalla completa
       break;
     case VTERM_PROP_MOUSE: p->mouseMode = v->number; break;
     case VTERM_PROP_TITLE:
       if (v->string.initial) p->titleBuf.clear();
       p->titleBuf.append(v->string.str, v->string.len);
-      if (v->string.final) p->title = ToWide(p->titleBuf);
+      if (v->string.final) {
+        std::wstring t = ToWide(p->titleBuf);
+        if (t != p->title) p->title = t, g_titleDirty = true;
+      }
       break;
     default: break;
   }
@@ -412,7 +437,7 @@ static int CbPushLine(int cols, const VTermScreenCell* cells, void* user) {
   Pane* p = (Pane*)user;
   p->sb.emplace_back(cells, cells + cols);
   if (p->sb.size() > kScrollback) p->sb.pop_front();
-  if (p->scrollOff > 0) p->scrollOff = std::min<int>(p->scrollOff + 1, (int)p->sb.size());
+  if (p->scrollOff > 0) p->scrollOff = std::min<int>(p->scrollOff + 1, (int)p->sb.size()), p->fullDirty = true;
   return 1;
 }
 
@@ -447,6 +472,7 @@ static Pane* NewPane() {
   static VTermScreenCallbacks cbs = [] {
     VTermScreenCallbacks c{};
     c.movecursor = CbMoveCursor;
+    c.damage = CbDamage;
     c.settermprop = CbSetTermProp;
     c.sb_pushline = CbPushLine;
     c.sb_popline = CbPopLine;
@@ -460,6 +486,8 @@ static Pane* NewPane() {
     return f;
   }();
   vterm_screen_set_unrecognised_fallbacks(p->scr, &fallbacks, p);
+  vterm_screen_set_damage_merge(p->scr, VTERM_DAMAGE_ROW);  // un aviso por fila cambiada
+  p->dirtyRows.assign(p->rows, 1);
   vterm_screen_enable_altscreen(p->scr, 1);
   vterm_screen_enable_reflow(p->scr, true);
   VTermState* st = vterm_obtain_state(p->vt);
@@ -523,6 +551,7 @@ static DWORD WINAPI ReaderThread(LPVOID arg) {
   while (ReadFile(p->outR, buf, sizeof buf, &n, nullptr) && n) {
     EnterCriticalSection(&p->cs);
     vterm_input_write(p->vt, buf, n);
+    vterm_screen_flush_damage(p->scr);  // la fila en curso también (spinners que reescriben una línea)
     bool reply = !p->outBuf.empty();
     LeaveCriticalSection(&p->cs);
     if (reply) FlushOut(p);
@@ -643,6 +672,8 @@ static void ResizePane(Pane* p, RECT r) {
   p->rows = rows;
   EnterCriticalSection(&p->cs);
   vterm_set_size(p->vt, rows, cols);
+  p->dirtyRows.assign(rows, 1);
+  p->fullDirty = true;
   LeaveCriticalSection(&p->cs);
   if (p->hpc) pResizePseudoConsole(p->hpc, COORD{(SHORT)cols, (SHORT)rows});
 }
@@ -2158,17 +2189,27 @@ static void MouseToApp(Pane* p, int x, int y, int button, bool pressed) {
   FlushOut(p);
 }
 
+// Rueda: tantas líneas por golpe como diga Windows (3 por defecto), sumando los medios golpes de
+// touchpads y ruedas finas. En tmux/apps con ratón, un evento de rueda por línea (como Warp).
 static void OnMouseWheel(int x, int y, int delta) {
+  static int acc = 0;
   Pane* p = PaneAt(x, y);
   if (!p) return;
-  int lines = 3 * (delta > 0 ? 1 : -1);
+  UINT perNotch = 3;
+  SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &perNotch, 0);
+  if (perNotch == 0 || perNotch > 100) perNotch = 3;
+  acc += delta;
+  int units = acc * (int)perNotch / WHEEL_DELTA;
+  if (!units) return;
+  acc -= units * WHEEL_DELTA / (int)perNotch;
+  int n = abs(units);
   if (p->mouseMode) {
-    MouseToApp(p, x, y, delta > 0 ? 4 : 5, true);
+    for (int i = 0; i < n; i++) MouseToApp(p, x, y, units > 0 ? 4 : 5, true);
   } else if (p->altScreen) {
-    for (int i = 0; i < 3; i++) SendKey(p, delta > 0 ? VTERM_KEY_UP : VTERM_KEY_DOWN, VTERM_MOD_NONE);
+    for (int i = 0; i < n; i++) SendKey(p, units > 0 ? VTERM_KEY_UP : VTERM_KEY_DOWN, VTERM_MOD_NONE);
   } else {
     EnterCriticalSection(&p->cs);
-    p->scrollOff = std::clamp(p->scrollOff + lines, 0, (int)p->sb.size());
+    p->scrollOff = std::clamp(p->scrollOff + units, 0, (int)p->sb.size());
     LeaveCriticalSection(&p->cs);
   }
   InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -2319,14 +2360,25 @@ static void DrawInput(HDC dc, Pane* p, bool active, bool focus) {
 
 static void DrawLinkUnderline(HDC dc, Pane* p);
 
-static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
+// Dibuja el panel. Con onlyDirty, solo las filas que han cambiado (salida de la shell); devuelve
+// el rectángulo repintado para copiarlo a la ventana.
+static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirty = false) {
   EnterCriticalSection(&p->cs);
-  Fill(dc, p->content, kBg);
+  bool full = !onlyDirty || p->fullDirty || p->scrollOff > 0 || (int)p->dirtyRows.size() != p->rows;
+  RECT drawn{};
+  if (full) Fill(dc, p->content, kBg), drawn = p->content;
   int ox = p->content.left + kPad, oy = p->content.top + kPad;
   std::wstring txt;
   std::vector<INT> dx;
   for (int row = 0; row < p->rows; row++) {
     int y = oy + row * g_cellH;
+    if (!full) {
+      if (!p->dirtyRows[row]) continue;
+      RECT rr{p->content.left, y, p->content.right, y + g_cellH};
+      Fill(dc, rr, kBg);
+      if (drawn.right == drawn.left) drawn = rr;
+      else UnionRect(&drawn, &drawn, &rr);
+    }
     int col = 0;
     while (col < p->cols) {
       int start = col;
@@ -2378,10 +2430,15 @@ static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
       }
     }
   }
-  DrawInput(dc, p, active, showFocus);
-  DrawLinkUnderline(dc, p);
+  if (full) {
+    DrawInput(dc, p, active, showFocus);
+    DrawLinkUnderline(dc, p);
+  }
+  bool cursorRowDrawn = full || (p->cursor.row < (int)p->dirtyRows.size() && p->dirtyRows[p->cursor.row]);
+  std::fill(p->dirtyRows.begin(), p->dirtyRows.end(), 0);
+  p->fullDirty = false;
   // Cursor (no se dibuja mientras se escribe en la caja de entrada)
-  if (active && p->cursorVisible && p->scrollOff == 0 && !EditorActive(p)) {
+  if (cursorRowDrawn && active && p->cursorVisible && p->scrollOff == 0 && !EditorActive(p)) {
     RECT cr{ox + p->cursor.col * g_cellW, oy + p->cursor.row * g_cellH, 0, 0};
     cr.right = cr.left + g_cellW;
     cr.bottom = cr.top + g_cellH;
@@ -2401,6 +2458,7 @@ static void DrawPane(HDC dc, Pane* p, bool active, bool showFocus) {
     }
   }
   LeaveCriticalSection(&p->cs);
+  return drawn;
 }
 
 static void DrawLinkUnderline(HDC dc, Pane* p) {
@@ -2652,6 +2710,116 @@ static void Render(HDC dc, int w, int h) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Pintado: búfer fijo; la salida de la shell solo repinta sus filas, como mucho a 60 fps.
+
+static HDC g_backDC;
+static HBITMAP g_backBmp;
+static int g_backW, g_backH;
+static DWORD g_lastFrame, g_lastFull;
+static bool g_frameTimer;
+
+static void EnsureBack(HDC ref, int w, int h) {
+  if (g_backDC && w == g_backW && h == g_backH) return;
+  if (!g_backDC) g_backDC = CreateCompatibleDC(ref);
+  HBITMAP bmp = CreateCompatibleBitmap(ref, std::max(1, w), std::max(1, h));
+  HGDIOBJ old = SelectObject(g_backDC, bmp);
+  if (g_backBmp) DeleteObject(g_backBmp);
+  else (void)old;
+  g_backBmp = bmp;
+  g_backW = w, g_backH = h;
+}
+
+static void PaintDirty() {
+  DWORD now = GetTickCount();
+  g_lastFrame = now;
+  if (!g_backDC || g_tabs.empty() || IsIconic(g_hwnd)) return;
+  bool overlay = g_find.open || g_pick.open || g_dragPane || g_link.p || g_renameTab >= 0;
+  if (overlay || (g_titleDirty && now - g_lastFull >= 250)) {  // títulos: como mucho 4 veces por segundo
+    g_titleDirty = false;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+    return;
+  }
+  if (g_titleDirty && !g_frameTimer) SetTimer(g_hwnd, TIMER_FRAME, 250, nullptr), g_frameTimer = true;
+  std::vector<Pane*> ls;
+  Leaves(CurTab().root, ls);
+  HDC wdc = GetDC(g_hwnd);
+  for (Pane* p : ls) {
+    RECT u = DrawPane(g_backDC, p, p == CurTab().active, g_focused, true);
+    if (u.right > u.left) BitBlt(wdc, u.left, u.top, u.right - u.left, u.bottom - u.top, g_backDC, u.left, u.top, SRCCOPY);
+  }
+  ReleaseDC(g_hwnd, wdc);
+}
+
+// Pruebas: prepara el búfer como tras un WM_PAINT (en la sesión de pruebas Windows no pinta).
+static void PrimeBack() {
+  RECT rc;
+  GetClientRect(g_hwnd, &rc);
+  HDC wdc = GetDC(g_hwnd);
+  EnsureBack(wdc, rc.right, rc.bottom);
+  ReleaseDC(g_hwnd, wdc);
+  Render(g_backDC, rc.right, rc.bottom);
+  g_lastFull = GetTickCount();
+}
+
+// Pruebas: ¿lo pintado fila a fila coincide con un pintado completo? Devuelve píxeles distintos.
+static long VerifyPartial() {
+  RECT rc;
+  GetClientRect(g_hwnd, &rc);
+  int w = rc.right, h = rc.bottom;
+  BITMAPINFO bi{};
+  bi.bmiHeader = {sizeof bi.bmiHeader, w, -h, 1, 32, BI_RGB};
+  std::vector<uint32_t> a((size_t)w * h), b((size_t)w * h);
+  GetDIBits(g_backDC, g_backBmp, 0, h, a.data(), &bi, DIB_RGB_COLORS);
+  HDC tmp = CreateCompatibleDC(g_backDC);
+  HBITMAP bmp = CreateCompatibleBitmap(g_backDC, w, h);
+  HGDIOBJ old = SelectObject(tmp, bmp);
+  Render(tmp, w, h);
+  SelectObject(tmp, old);
+  GetDIBits(tmp, bmp, 0, h, b.data(), &bi, DIB_RGB_COLORS);
+  DeleteObject(bmp);
+  DeleteDC(tmp);
+  // Solo la zona de texto de los paneles: lo demás (cabeceras, caja) lo pinta WM_PAINT, que en la
+  // sesión de pruebas no llega.
+  long diff = 0;
+  std::vector<Pane*> ls;
+  Leaves(CurTab().root, ls);
+  for (Pane* p : ls)
+    for (int y = std::max(0, (int)p->content.top); y < std::min(h, (int)p->content.bottom); y++)
+      for (int x = std::max(0, (int)p->content.left); x < std::min(w, (int)p->content.right); x++)
+        diff += (a[(size_t)y * w + x] & 0xffffff) != (b[(size_t)y * w + x] & 0xffffff);
+  return diff;
+}
+
+// Mide el tiempo de dibujo (paso «bench» de las pruebas): pintado completo y solo filas cambiadas.
+static std::wstring Bench() {
+  RECT rc;
+  GetClientRect(g_hwnd, &rc);
+  HDC wdc = GetDC(g_hwnd);
+  EnsureBack(wdc, rc.right, rc.bottom);
+  ReleaseDC(g_hwnd, wdc);
+  LARGE_INTEGER f, a, b, c;
+  QueryPerformanceFrequency(&f);
+  QueryPerformanceCounter(&a);
+  for (int i = 0; i < 20; i++) Render(g_backDC, rc.right, rc.bottom);
+  QueryPerformanceCounter(&b);
+  std::vector<Pane*> ls;
+  Leaves(CurTab().root, ls);
+  for (int i = 0; i < 20; i++)
+    for (Pane* p : ls) {
+      EnterCriticalSection(&p->cs);
+      MarkRow(p, p->cursor.row);
+      LeaveCriticalSection(&p->cs);
+      DrawPane(g_backDC, p, p == CurTab().active, true, true);
+    }
+  QueryPerformanceCounter(&c);
+  wchar_t out[200];
+  swprintf(out, 200, L"%dx%d, %d paneles: completo %.2f ms, solo filas %.3f ms", (int)rc.right, (int)rc.bottom,
+           (int)ls.size(), (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart / 20,
+           (c.QuadPart - b.QuadPart) * 1000.0 / f.QuadPart / 20);
+  return out;
+}
+
 static bool SaveScreenshot(const std::wstring& path) {
   RECT rc;
   GetClientRect(g_hwnd, &rc);
@@ -2738,6 +2906,17 @@ static void RunScriptStep() {
     FindStep(1);
   } else if (s == L"find-close") {
     CloseFind();
+  } else if (s == L"prime") {
+    PrimeBack();
+  } else if (s == L"bench" || s == L"verify") {
+    std::wstring r = s == L"bench" ? Bench() : L"píxeles distintos entre pintado por filas y completo: " + std::to_wstring(VerifyPartial());
+    std::string u = ToUtf8(r) + "\n";
+    HANDLE fh = CreateFileW((g_sessionPath + L".bench").c_str(), FILE_APPEND_DATA, 0, nullptr, OPEN_ALWAYS, 0, nullptr);
+    if (fh != INVALID_HANDLE_VALUE) {
+      DWORD w;
+      WriteFile(fh, u.data(), (DWORD)u.size(), &w, nullptr);
+      CloseHandle(fh);
+    }
   } else if (s == L"paste" && p) {
     Paste(p);
   } else if (s == L"detach-tab") {
@@ -2867,7 +3046,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       g_hwnd = hwnd;
       ApplyDpi(WindowDpi(hwnd));
       if (!LoadSession()) NewTab();
-      SetTimer(hwnd, TIMER_RESTORE, 100, nullptr);
+      SetTimer(hwnd, TIMER_RESTORE, 250, nullptr);
       if (!g_script.empty()) SetTimer(hwnd, TIMER_SCRIPT, 3000, nullptr);
       return 0;
     }
@@ -2899,7 +3078,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_APP_DIRTY:
       g_dirtyPosted = false;
-      InvalidateRect(hwnd, nullptr, FALSE);
+      if (GetTickCount() - g_lastFrame < 16) {  // como mucho 60 fotogramas por segundo
+        if (!g_frameTimer) SetTimer(hwnd, TIMER_FRAME, 16, nullptr), g_frameTimer = true;
+      } else {
+        PaintDirty();
+      }
       return 0;
     case WM_APP_EXITED: {
       Pane* p = (Pane*)lp;
@@ -2907,7 +3090,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     }
     case WM_TIMER:
-      if (wp == TIMER_TOAST) {
+      if (wp == TIMER_FRAME) {
+        KillTimer(hwnd, TIMER_FRAME);
+        g_frameTimer = false;
+        PaintDirty();
+      } else if (wp == TIMER_TOAST) {
         KillTimer(hwnd, TIMER_TOAST);
         g_toast.clear();
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -2916,7 +3103,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RunScriptStep();
       } else if (wp == TIMER_RESTORE) {
         static int ticks = 0;
-        if (++ticks % 5 == 0) {
+        if (++ticks % 4 == 0) {  // cada segundo
           UpdateRunning();
           for (Pane* p : g_live) LoadShellCommands(p);
         }
@@ -2941,15 +3128,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       HDC dc = BeginPaint(hwnd, &ps);
       RECT rc;
       GetClientRect(hwnd, &rc);
-      HDC mem = CreateCompatibleDC(dc);
-      HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-      HGDIOBJ old = SelectObject(mem, bmp);
-      Render(mem, rc.right, rc.bottom);
-      BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-      SelectObject(mem, old);
-      DeleteObject(bmp);
-      DeleteDC(mem);
+      EnsureBack(dc, rc.right, rc.bottom);
+      Render(g_backDC, rc.right, rc.bottom);
+      BitBlt(dc, 0, 0, rc.right, rc.bottom, g_backDC, 0, 0, SRCCOPY);
       EndPaint(hwnd, &ps);
+      g_lastFrame = g_lastFull = GetTickCount();
+      g_titleDirty = false;
       return 0;
     }
     case WM_ERASEBKGND: return 1;
