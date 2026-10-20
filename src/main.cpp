@@ -3152,9 +3152,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       }
       Node* d = y >= TabBarH() ? DividerAt(CurTab().root, x, y) : nullptr;
       bool onHeader;
-      LPCWSTR cur = d ? (d->vertical ? IDC_SIZEWE : IDC_SIZENS)
-                    : g_link.p ? IDC_HAND
-                    : (y < TabBarH() || HeaderAt(x, y, &onHeader)) ? IDC_ARROW : IDC_IBEAM;
+      // Flecha en todas partes, como Warp; cursor de texto solo en la línea de la caja de entrada
+      // y mano en lo que se puede pulsar (carpeta, enlaces con Ctrl).
+      LPCWSTR cur = IDC_ARROW;
+      if (d) cur = d->vertical ? IDC_SIZEWE : IDC_SIZENS;
+      else if (g_link.p) cur = IDC_HAND;
+      else if (Pane* p = y >= TabBarH() && !HeaderAt(x, y, &onHeader) ? PaneAt(x, y) : nullptr) {
+        POINT pt{x, y};
+        if (PtInRect(&p->chip, pt) && EditorActive(p)) cur = IDC_HAND;
+        else if (PtInRect(&p->input, pt) && y >= p->chip.bottom && EditorActive(p)) cur = IDC_IBEAM;
+      }
       SetCursor(LoadCursor(nullptr, cur));
       return 0;
     }
@@ -3357,7 +3364,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
   wc.lpfnWndProc = WndProc;
   wc.hInstance = inst;
-  wc.hCursor = LoadCursor(nullptr, IDC_IBEAM);
+  wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
   wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));  // assets/warp-lite.ico
   wc.hIconSm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
                                  GetSystemMetrics(SM_CYSMICON), 0);
