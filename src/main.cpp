@@ -175,6 +175,7 @@ struct Pane {
   std::string restoreCmd;
   DWORD spawnTick = 0;
   std::wstring agentName;  // nombre de la conversación de Claude Code que corre aquí (título de la pestaña)
+  int agent = 0;           // AGENT_* que corre aquí, también si se lanzó con un atajo (ver UpdateRunning)
   std::atomic<DWORD> firstOut{0}, lastOut{0};
 };
 
@@ -987,13 +988,32 @@ static std::vector<std::string> SplitArgs(const std::string& s) {
   return out;
 }
 
-static int AgentKind(const std::string& cmd) {
+// El programa que lanza la orden, sin comillas (vacío si no hay).
+static std::string ProgramOf(const std::string& cmd) {
   std::vector<std::string> a = SplitArgs(cmd);
   size_t i = !a.empty() && a[0] == "&" ? 1 : 0;
-  if (i >= a.size()) return AGENT_NONE;
+  if (i >= a.size()) return "";
   std::string exe = a[i];
   exe.erase(std::remove(exe.begin(), exe.end(), '"'), exe.end());
   exe.erase(std::remove(exe.begin(), exe.end(), '\''), exe.end());
+  return exe;
+}
+
+// ¿La orden lanza un .exe? Una shell (cmd, pwsh, wsl…) en la que después se abre Claude no es un
+// atajo suyo: `pwsh --resume <id>` no reanudaría nada.
+static bool LaunchesExe(const std::string& cmd) {
+  static std::map<std::string, bool> memo;
+  std::string exe = ProgramOf(cmd);
+  auto it = memo.find(exe);
+  if (it != memo.end()) return it->second;
+  wchar_t buf[MAX_PATH];
+  DWORD n = exe.empty() ? 0 : SearchPathW(nullptr, ToWide(exe).c_str(), L".exe", MAX_PATH, buf, nullptr);
+  return memo[exe] = n > 4 && n < MAX_PATH && _wcsicmp(buf + n - 4, L".exe") == 0;
+}
+
+static int AgentKind(const std::string& cmd) {
+  std::string exe = ProgramOf(cmd);
+  if (exe.empty()) return AGENT_NONE;
   size_t slash = exe.find_last_of("\\/");
   if (slash != std::string::npos) exe = exe.substr(slash + 1);
   std::transform(exe.begin(), exe.end(), exe.begin(), [](char c) { return (char)tolower((unsigned char)c); });
@@ -1005,11 +1025,14 @@ static int AgentKind(const std::string& cmd) {
 // La orden para reanudar: el mismo programa con sus opciones (--model, --yolo…), sin el texto
 // inicial ni lo que ya elegía sesión, y con la sesión dada (vacía: la última de esa carpeta).
 // Vacía si no es una conversación interactiva (claude -p, codex exec, subórdenes…).
-static std::string ResumeCommand(const std::string& cmd, const std::string& session) {
-  int kind = AgentKind(cmd);
+// kind: lo que corre de verdad, que puede venir de un atajo (clauded.cmd con
+// «claude --dangerously-skip-permissions %*», una función de PowerShell…).
+static std::string ResumeCommand(const std::string& cmd, const std::string& session, int kind) {
   if (kind == AGENT_NONE) return "";
+  bool shortcut = AgentKind(cmd) == AGENT_NONE;
   std::vector<std::string> a = SplitArgs(cmd);
-  size_t i = a[0] == "&" ? 1 : 0;
+  size_t i = !a.empty() && a[0] == "&" ? 1 : 0;
+  if (i >= a.size()) return "";
   std::string head = (i ? "& " : "") + a[i];
   // Opciones sin valor (lo que va detrás es texto, no su valor) y las que se quitan.
   static const std::set<std::string> flagsClaude = {"--dangerously-skip-permissions", "--verbose", "--debug", "-d", "--ide",
@@ -1041,6 +1064,8 @@ static std::string ResumeCommand(const std::string& cmd, const std::string& sess
       if (takesValue) k++;
       continue;
     }
+    // Con un atajo no se sabe si las palabras son el texto inicial o suyas: se relanza tal cual.
+    if (shortcut) return "";
     if (!sawWord) {  // primera palabra: ¿una suborden?
       sawWord = true;
       if (kind == AGENT_CODEX && t == "resume") continue;
@@ -1051,6 +1076,10 @@ static std::string ResumeCommand(const std::string& cmd, const std::string& sess
   }
   if (kind == AGENT_CLAUDE) return head + opts + (session.empty() ? " --continue" : " --resume " + session);
   return head + opts + (session.empty() ? " resume --last" : " resume " + session);
+}
+
+static std::string ResumeCommand(const std::string& cmd, const std::string& session) {
+  return ResumeCommand(cmd, session, AgentKind(cmd));
 }
 
 // ¿Ya elige conversación? (claude --resume/--continue, codex resume)
@@ -1225,10 +1254,10 @@ static void ComputeResumes() {
     std::vector<Pane*> ls;
     Leaves(t.root, ls);
     for (Pane* p : ls)
-      if (!p->runningCmd.empty() && !ResumeCommand(p->lastCmd, "").empty()) {
+      if (!p->runningCmd.empty() && !ResumeCommand(p->lastCmd, "", p->agent).empty()) {
         std::wstring key = p->cwd;
         std::transform(key.begin(), key.end(), key.begin(), towlower);
-        groups[{AgentKind(p->lastCmd), key}].push_back(p);
+        groups[{p->agent, key}].push_back(p);
         if (!haveKids) kids = ChildrenByParent(), haveKids = true;
       }
   }
@@ -1253,7 +1282,7 @@ static void ComputeResumes() {
         rest.push_back(p);
         continue;
       }
-      std::string cmd = ResumeCommand(p->lastCmd, id);
+      std::string cmd = ResumeCommand(p->lastCmd, id, key.first);
       // Claude abierto sin escribirle nada: esa conversación no existe todavía y --resume fallaría.
       bool exists = key.first != AGENT_CLAUDE ||
                     std::any_of(s.begin(), s.end(), [&](const AgentSession& a) { return a.id == id; });
@@ -1265,7 +1294,7 @@ static void ComputeResumes() {
       while (k < s.size() && taken.count(s[k].id)) k++;
       std::string id = k < s.size() ? s[k++].id : "";
       if (!id.empty()) taken.insert(id);
-      g_resumeCmd[p] = ResumeCommand(p->lastCmd, id);
+      g_resumeCmd[p] = ResumeCommand(p->lastCmd, id, key.first);
     }
   }
 }
@@ -3549,9 +3578,14 @@ static void UpdateRunning() {
   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   if (snap == INVALID_HANDLE_VALUE) return;
   std::vector<std::pair<DWORD, std::wstring>> children;  // (padre, exe)
+  std::map<DWORD, std::vector<DWORD>> kids;
+  std::map<DWORD, std::wstring> exes;
   PROCESSENTRY32W pe{sizeof pe};
-  for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+  for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
     if (_wcsicmp(pe.szExeFile, L"conhost.exe") != 0) children.push_back({pe.th32ParentProcessID, pe.szExeFile});
+    if (pe.th32ProcessID != pe.th32ParentProcessID) kids[pe.th32ParentProcessID].push_back(pe.th32ProcessID);
+    exes[pe.th32ProcessID] = pe.szExeFile;
+  }
   CloseHandle(snap);
   bool changed = false;
   for (Pane* p : g_live) {
@@ -3563,21 +3597,31 @@ static void UpdateRunning() {
     if (exe) want = p->runningCmd.empty() ? (p->submittedCmd.empty() ? *exe : ToWide(p->submittedCmd)) : p->runningCmd;
     if (want != p->runningCmd) p->runningCmd = want, changed = true;
   }
+  // Claude Code o Codex, por el nombre de la orden o, si es un atajo (clauded.cmd, una función de
+  // PowerShell…), por el proceso: Claude apunta el suyo en sessions\<pid>.json y Codex es codex.exe.
   // Claude Code: la pestaña toma el nombre de la conversación (el que le pone Claude o /rename),
   // no el derivado de la carpeta, que no dice nada nuevo.
-  std::map<DWORD, std::vector<DWORD>> kids;
-  bool haveKids = false;
   for (Pane* p : g_live) {
     std::wstring name;
-    if (!p->runningCmd.empty() && AgentKind(p->lastCmd) == AGENT_CLAUDE) {
-      if (!haveKids) kids = ChildrenByParent(), haveKids = true;
-      for (DWORD pid : Descendants(kids, p->pid)) {
-        std::string j = ClaudeSessionJson(pid);
-        if (j.empty()) continue;
-        if (JsonStr(j, "nameSource", 0) != "derived") name = ToWide(JsonStr(j, "name", 0));
-        break;
-      }
+    int agent = AGENT_NONE;
+    if (!p->runningCmd.empty()) {
+      int named = agent = AgentKind(p->lastCmd);
+      if (named != AGENT_CODEX)
+        for (DWORD pid : Descendants(kids, p->pid)) {
+          std::string j = ClaudeSessionJson(pid);
+          if (!j.empty()) {
+            agent = AGENT_CLAUDE;
+            if (JsonStr(j, "nameSource", 0) != "derived") name = ToWide(JsonStr(j, "name", 0));
+            break;
+          }
+          if (named == AGENT_NONE && _wcsicmp(exes[pid].c_str(), L"codex.exe") == 0) {
+            agent = AGENT_CODEX;
+            break;
+          }
+        }
+      if (named == AGENT_NONE && agent != AGENT_NONE && LaunchesExe(p->lastCmd)) agent = AGENT_NONE, name.clear();
     }
+    p->agent = agent;
     if (name != p->agentName) p->agentName = name, changed = true;
   }
   if (changed) InvalidateRect(g_hwnd, nullptr, FALSE);
