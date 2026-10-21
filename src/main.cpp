@@ -5842,11 +5842,17 @@ static bool HttpGet(const std::wstring& url, std::string& out, size_t maxBytes, 
         if (!ok && err) *err = L"HTTP " + std::to_wstring(status);
         DWORD total = 0;
         sz = sizeof total;
-        if (pct && !WinHttpQueryHeaders(r, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
-                                        &total, &sz, WINHTTP_NO_HEADER_INDEX))
+        if (!WinHttpQueryHeaders(r, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                                 &total, &sz, WINHTTP_NO_HEADER_INDEX))
           total = 0;
         DWORD avail = 0;
-        while (ok && WinHttpQueryDataAvailable(r, &avail) && avail) {
+        while (ok) {
+          // A dropped connection ends the body early: that is an error, not the end of the file.
+          if (!WinHttpQueryDataAvailable(r, &avail)) {
+            ok = fail(L"read");
+            break;
+          }
+          if (!avail) break;
           size_t at = out.size();
           if (at + avail > maxBytes) {
             ok = fail(L"too big");
@@ -5860,6 +5866,10 @@ static bool HttpGet(const std::wstring& url, std::string& out, size_t maxBytes, 
             int v = (int)std::min<uint64_t>(100, out.size() * 100ull / total);
             if (pct->exchange(v) != v) PostMessage(g_hwnd, WM_APP_UPDPROG, 0, 0);
           }
+        }
+        if (ok && total && out.size() != total) {
+          if (err) *err = L"cut off at " + std::to_wstring(out.size()) + L" of " + std::to_wstring(total);
+          ok = false;
         }
       }
       else fail(L"send");
@@ -5956,7 +5966,14 @@ static DWORD WINAPI InstallThread(LPVOID arg) {
     std::string data;
     std::wstring why;
     g_updPhase = 0, g_updPct = -1;
-    if (!HttpGet(job->url, data, 64 << 20, g_upd.testUrl, &why, &g_updPct)) {
+    // A flaky connection can cut the download: try again a few times before giving up.
+    bool got = false;
+    for (int attempt = 0; attempt < 3 && !got; attempt++) {
+      if (attempt) Sleep(2000);
+      data.clear(), why.clear();
+      got = HttpGet(job->url, data, 64 << 20, g_upd.testUrl, &why, &g_updPct);
+    }
+    if (!got) {
       job->error = L"download: " + why;
     } else if (Sha256Hex(data) != ToUtf8(job->sha)) {
       job->error = L"checksum";
