@@ -75,7 +75,12 @@ static PFN_ClosePseudoConsole pClosePseudoConsole;
 
 static const COLORREF kBg = RGB(0x05, 0x05, 0x05);
 static const COLORREF kFg = RGB(0xff, 0xff, 0xff);
-static const COLORREF kTermFg = RGB(0xcc, 0xcc, 0xcc);  // default terminal text, as in Windows Terminal / cmd
+// Default terminal text (title-bar menu → Text brightness): #CCCCCC is Windows Terminal's and cmd's; the default is a
+// step brighter, between it and the white of the versions before DirectWrite.
+static const COLORREF kTextLevels[] = {RGB(0xaa, 0xaa, 0xaa), RGB(0xcc, 0xcc, 0xcc), RGB(0xdd, 0xdd, 0xdd),
+                                       RGB(0xee, 0xee, 0xee), RGB(0xff, 0xff, 0xff)};
+static const int kTextLevelCount = 5, kTextDefault = 2;
+static COLORREF g_termFg = kTextLevels[kTextDefault];
 static const COLORREF kTitleBg = RGB(0x11, 0x11, 0x11);
 static const COLORREF kTabActiveBg = RGB(0x24, 0x24, 0x24);
 static const COLORREF kTabText = RGB(0x9b, 0x9b, 0x9b);
@@ -226,7 +231,8 @@ enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, 
            S_SEARCH_DIRS, S_PARENT_DIR, S_RENAME, S_HIDE, S_CLOSE_TAB, S_SHOW_ALL, S_HIDDEN_N, S_STARTUP,
            S_LOADING, S_KIND_CMD, S_KIND_DIR, S_KIND_FILE, S_KIND_PARAM, S_UPD_AVAIL, S_UPD_INSTALLING, S_UPD_READY,
            S_UPD_FAILED, S_UPD_INSTALL, S_UPD_RESTART, S_UPD_RETRY, S_UPD_CHECK, S_UPD_AUTO, S_UPD_LATEST, S_UPD_CHECKING,
-           S_UPD_OFFLINE, S_UPD_DOWNLOADING, S_SWITCH, S_OTHER_WINDOW, S_FONT_MENU, S_OTHER_FONTS, S_FONT_FAILED, S_COUNT };
+           S_UPD_OFFLINE, S_UPD_DOWNLOADING, S_SWITCH, S_OTHER_WINDOW, S_FONT_MENU, S_OTHER_FONTS, S_FONT_FAILED,
+           S_FONT_SIZE, S_TEXT_BRIGHTNESS, S_DEFAULT, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
@@ -235,7 +241,7 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Warp %s is available", L"Installing %s…", L"Updated to %s", L"Couldn't update to %s", L"Install", L"Restart",
      L"Retry", L"Check for updates", L"Update automatically", L"Warp is up to date", L"Checking for updates…",
      L"Couldn't check for updates", L"Downloading %s…", L"Search terminals…", L"other window", L"Font",
-     L"Other installed", L"Couldn't download %s"},
+     L"Other installed", L"Couldn't download %s", L"Font size", L"Text brightness", L"default"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
@@ -244,7 +250,7 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Instalar", L"Reiniciar", L"Reintentar", L"Buscar actualizaciones", L"Actualizar automáticamente",
      L"Warp está al día", L"Buscando actualizaciones…", L"No se pudo comprobar si hay actualizaciones",
      L"Descargando %s…", L"Buscar terminales…", L"otra ventana", L"Fuente", L"Otras instaladas",
-     L"No se pudo descargar %s"},
+     L"No se pudo descargar %s", L"Tamaño de letra", L"Brillo del texto", L"predeterminado"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -576,7 +582,7 @@ static Pane* NewPane() {
   vterm_screen_enable_reflow(p->scr, true);
   VTermState* st = vterm_obtain_state(p->vt);
   VTermColor fg, bg;
-  vterm_color_rgb(&fg, GetRValue(kTermFg), GetGValue(kTermFg), GetBValue(kTermFg));
+  vterm_color_rgb(&fg, GetRValue(g_termFg), GetGValue(g_termFg), GetBValue(g_termFg));
   vterm_color_rgb(&bg, GetRValue(kBg), GetGValue(kBg), GetBValue(kBg));
   vterm_state_set_default_colors(st, &fg, &bg);
   for (int i = 0; i < 16; i++) {
@@ -3250,6 +3256,7 @@ static const wchar_t* const kFallbackFaces[] = {L"Symbols Nerd Font Mono", L"Seg
                                                 L"Consolas", L"Segoe UI Emoji", L"MS Gothic", L"Malgun Gothic",
                                                 L"Microsoft YaHei", L"Nirmala UI", L"Segoe UI"};
 static const int kFallbackCount = sizeof kFallbackFaces / sizeof kFallbackFaces[0];
+static const int kEmojiFace = 4;  // Segoe UI Emoji
 static HFONT g_fallback[kFallbackCount];
 static HDC g_measureDC;
 static std::unordered_map<uint32_t, uint8_t> g_fbCache;  // 0 = Hack; i = g_fallback[i-1]
@@ -3270,7 +3277,7 @@ static int FallbackFor(uint32_t cp) {
   if (it != g_fbCache.end()) return it->second;
   int r = 0;
   if (cp >= 0xF0000) r = 1;                         // iconos de Nerd Fonts en el plano privado suplementario
-  else if (cp >= 0x10000) r = 5;                    // emoji y demás fuera del plano básico
+  else if (cp >= 0x10000) r = kEmojiFace + 1;       // emoji y demás fuera del plano básico
   else if (!FontHas(g_fonts[0], cp))
     for (int i = 0; i < kFallbackCount; i++)
       if (FontHas(g_fallback[i], cp)) {
@@ -3281,16 +3288,266 @@ static int FallbackFor(uint32_t cp) {
   return r;
 }
 
+// Emoji presentation in the basic plane: a wide symbol (✅ ⭐ ⚡…) or one followed by VS16 (❤️ ⚠️…), if Segoe UI Emoji
+// has it. The rest of the emoji are past U+FFFF and go to it anyway.
+static bool EmojiPresentation(const VTermScreenCell& c) {
+  uint32_t cp = c.chars[0];
+  if (c.chars[1] != 0xFE0F && (c.width != 2 || cp < 0x2190 || cp >= 0x2C00 || cp == 0x2329 || cp == 0x232A)) return false;
+  if (cp < 0xA9 || cp >= 0x10000) return false;
+  static std::unordered_map<uint32_t, bool> has;
+  auto it = has.find(cp);
+  return it != has.end() ? it->second : (has[cp] = FontHas(g_fallback[kEmojiFace], cp));
+}
+
+// Box drawing, block elements and the powerline separators are drawn by the app over the whole cell, like Windows
+// Terminal's builtin glyphs: lines join across rows and columns whatever the font and the line height.
+static bool IsBuiltin(uint32_t c) { return (c >= 0x2500 && c < 0x25A0) || (c >= 0xE0B0 && c < 0xE0C0); }
+
+// Arms of U+2500-U+257F, one hex digit each: up, right, down, left; 0 none, 1 light, 2 heavy, 3 double.
+// 0: dashes, arcs and diagonals, drawn apart.
+static const uint16_t kBoxArms[128] = {
+    0x0101, 0x0202, 0x1010, 0x2020, 0,      0,      0,      0,       // ─━│┃┄┅┆┇
+    0,      0,      0,      0,      0x0110, 0x0210, 0x0120, 0x0220,  // ┈┉┊┋┌┍┎┏
+    0x0011, 0x0012, 0x0021, 0x0022, 0x1100, 0x1200, 0x2100, 0x2200,  // ┐┑┒┓└┕┖┗
+    0x1001, 0x1002, 0x2001, 0x2002, 0x1110, 0x1210, 0x2110, 0x1120,  // ┘┙┚┛├┝┞┟
+    0x2120, 0x2210, 0x1220, 0x2220, 0x1011, 0x1012, 0x2011, 0x1021,  // ┠┡┢┣┤┥┦┧
+    0x2021, 0x2012, 0x1022, 0x2022, 0x0111, 0x0112, 0x0211, 0x0212,  // ┨┩┪┫┬┭┮┯
+    0x0121, 0x0122, 0x0221, 0x0222, 0x1101, 0x1102, 0x1201, 0x1202,  // ┰┱┲┳┴┵┶┷
+    0x2101, 0x2102, 0x2201, 0x2202, 0x1111, 0x1112, 0x1211, 0x1212,  // ┸┹┺┻┼┽┾┿
+    0x2111, 0x1121, 0x2121, 0x2112, 0x2211, 0x1122, 0x1221, 0x2212,  // ╀╁╂╃╄╅╆╇
+    0x1222, 0x2122, 0x2221, 0x2222, 0,      0,      0,      0,       // ╈╉╊╋╌╍╎╏
+    0x0303, 0x3030, 0x0310, 0x0130, 0x0330, 0x0013, 0x0031, 0x0033,  // ═║╒╓╔╕╖╗
+    0x1300, 0x3100, 0x3300, 0x1003, 0x3001, 0x3003, 0x1310, 0x3130,  // ╘╙╚╛╜╝╞╟
+    0x3330, 0x1013, 0x3031, 0x3033, 0x0313, 0x0131, 0x0333, 0x1303,  // ╠╡╢╣╤╥╦╧
+    0x3101, 0x3303, 0x1313, 0x3131, 0x3333, 0,      0,      0,       // ╨╩╪╫╬╭╮╯
+    0,      0,      0,      0,      0x0001, 0x1000, 0x0100, 0x0010,  // ╰╱╲╳╴╵╶╷
+    0x0002, 0x2000, 0x0200, 0x0020, 0x0201, 0x1020, 0x0102, 0x2010,  // ╸╹╺╻╼╽╾╿
+};
+
+// Coverage (0-255) of builtin glyph c in a w x h cell. As in Windows Terminal, a light line is a sixth of the cell width
+// (at least a pixel), a heavy one twice that and a double one two light lines a light line apart; stroke edges fall on
+// whole pixels, the same in every cell, so lines join across rows and columns. Arcs, diagonals and the powerline shapes
+// are antialiased with 4x4 samples per pixel. The shades are patterns, drawn by BuiltinPaint.
+static void BuiltinRaster(uint32_t c, int w, int h, uint8_t* m) {
+  const int lw = std::max(1, (int)std::lround(w / 6.0));
+  const float cx = w / 2.0f, cy = h / 2.0f, t = lw / 2.0f;
+  auto rect = [&](int x0, int y0, int x1, int y1) {
+    x0 = std::max(x0, 0), y0 = std::max(y0, 0), x1 = std::min(x1, w), y1 = std::min(y1, h);
+    for (int y = y0; y < y1 && x0 < x1; y++) std::fill(m + (size_t)y * w + x0, m + (size_t)y * w + x1, (uint8_t)255);
+  };
+  auto shape = [&](auto inside) {
+    for (int y = 0; y < h; y++)
+      for (int x = 0; x < w; x++) {
+        int k = 0;
+        for (int i = 0; i < 16; i++) k += inside(x + (i % 4 + 0.5f) / 4, y + (i / 4 + 0.5f) / 4);
+        uint8_t& v = m[(size_t)y * w + x];
+        v = std::max(v, (uint8_t)(k * 255 / 16));
+      }
+  };
+  // [first, second) of a stroke n light lines wide centred on mid
+  auto stroke = [&](float mid, int n) {
+    int a = (int)std::lround(mid - n * t);
+    return std::make_pair(a, a + n * lw);
+  };
+  auto seg = [](float x, float y, float ax, float ay, float bx, float by) {
+    float dx = bx - ax, dy = by - ay, u = std::clamp(((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy), 0.0f, 1.0f);
+    return std::hypot(x - ax - u * dx, y - ay - u * dy);
+  };
+  float W = (float)w, H = (float)h, diag = std::hypot(W, H);
+  if (c < 0x2580) {
+    int k = (int)c - 0x2500, a = kBoxArms[k];
+    int mx = (int)std::lround(cx), my = (int)std::lround(cy);
+    auto v1 = stroke(cx, 1), h1 = stroke(cy, 1);  // light strokes through the centre
+    if (a) {
+      int U = a >> 12, R = a >> 8 & 15, D = a >> 4 & 15, L = a & 15;
+      if (std::max({U, R, D, L}) < 3) {  // light and heavy: each arm reaches the far side of the widest crossing stroke
+        auto vs = stroke(cx, std::max(U, D)), hs = stroke(cy, std::max(L, R));
+        bool vert = U || D, horz = L || R;
+        if (U) rect(stroke(cx, U).first, 0, stroke(cx, U).second, horz ? hs.second : my);
+        if (D) rect(stroke(cx, D).first, horz ? hs.first : my, stroke(cx, D).second, h);
+        if (L) rect(0, stroke(cy, L).first, vert ? vs.second : mx, stroke(cy, L).second);
+        if (R) rect(vert ? vs.first : mx, stroke(cy, R).first, w, stroke(cy, R).second);
+      } else {
+        // Double lines: a and b are the left/top and right/bottom ones. A single arm stops at the near double line if
+        // they go straight through (╤), at the far one in a corner (╓) and crosses them if it goes on (╪); a double arm
+        // stops at a single line, and its lines meet those of a perpendicular double arm in corners (╔ ╬).
+        auto va = stroke(cx - lw, 1), vb = stroke(cx + lw, 1), ha = stroke(cy - lw, 1), hb = stroke(cy + lw, 1);
+        bool vd = U == 3 || D == 3, hd = L == 3 || R == 3, vthru = U == 3 && D == 3, hthru = L == 3 && R == 3;
+        int vl = U || D ? v1.first : mx, vr = U || D ? v1.second : mx, ht = L || R ? h1.first : my, hbt = L || R ? h1.second : my;
+        if (R == 1) rect(vd ? (L ? v1.first : vthru ? vb.first : va.first) : vl, h1.first, w, h1.second);
+        if (L == 1) rect(0, h1.first, vd ? (R ? v1.second : vthru ? va.second : vb.second) : vr, h1.second);
+        if (D == 1) rect(v1.first, hd ? (U ? h1.first : hthru ? hb.first : ha.first) : ht, v1.second, h);
+        if (U == 1) rect(v1.first, 0, v1.second, hd ? (D ? h1.second : hthru ? ha.second : hb.second) : hbt);
+        if (R == 3) {
+          rect(vd ? (U == 3 ? vb.first : va.first) : vl, ha.first, w, ha.second);
+          rect(vd ? (D == 3 ? vb.first : va.first) : vl, hb.first, w, hb.second);
+        }
+        if (L == 3) {
+          rect(0, ha.first, vd ? (U == 3 ? va.second : vb.second) : vr, ha.second);
+          rect(0, hb.first, vd ? (D == 3 ? va.second : vb.second) : vr, hb.second);
+        }
+        if (D == 3) {
+          rect(va.first, hd ? (L == 3 ? hb.first : ha.first) : ht, va.second, h);
+          rect(vb.first, hd ? (R == 3 ? hb.first : ha.first) : ht, vb.second, h);
+        }
+        if (U == 3) {
+          rect(va.first, 0, va.second, hd ? (L == 3 ? ha.second : hb.second) : hbt);
+          rect(vb.first, 0, vb.second, hd ? (R == 3 ? ha.second : hb.second) : hbt);
+        }
+      }
+    } else if (k < 12 || (k >= 0x4C && k < 0x50)) {  // dashes ┄┅┆┇┈┉┊┋╌╍╎╏: 3, 4 or 2 per cell, as in Windows Terminal
+      int n = k >= 0x4C ? 2 : k < 8 ? 3 : 4, len = k & 2 ? h : w;
+      auto s = stroke(k & 2 ? cx : cy, k & 1 ? 2 : 1);
+      for (int i = 0; i < n; i++) {
+        int a0 = (int)std::lround(len * i / (double)n), a1 = (int)std::lround(len * (3 * i + 2) / (3.0 * n));
+        if (k & 2) rect(s.first, a0, s.second, a1);
+        else rect(a0, s.first, a1, s.second);
+      }
+    } else if (k < 0x71) {  // ╭╮╯╰: a quarter circle between the light lines
+      float X = (v1.first + v1.second) / 2.0f, Y = (h1.first + h1.second) / 2.0f;
+      float r = std::min({5.0f * lw, X, W - X, Y, H - Y});
+      bool right = k == 0x6D || k == 0x70, down = k <= 0x6E;
+      shape([&](float x, float y) {
+        float px = right ? x - X : X - x, py = down ? y - Y : Y - y;  // from the corner towards the arms
+        float d = px < r && py < r ? std::fabs(std::hypot(px - r, py - r) - r)
+                                   : std::min(px >= r ? std::fabs(py) : 1e9f, py >= r ? std::fabs(px) : 1e9f);
+        return d <= t;
+      });
+    } else {  // ╱╲╳
+      shape([&](float x, float y) {
+        return (k != 0x72 && std::fabs(H * x + W * y - W * H) / diag <= t) || (k != 0x71 && std::fabs(H * x - W * y) / diag <= t);
+      });
+    }
+  } else if (c < 0x25A0) {  // block elements; the shades ░▒▓ are left to BuiltinPaint
+    int k = (int)c - 0x2580;
+    auto fx = [&](int n) { return (int)std::lround(w * n / 8.0); };
+    auto fy = [&](int n) { return (int)std::lround(h * n / 8.0); };
+    if (k == 0) rect(0, 0, w, fy(4));               // ▀
+    else if (k <= 8) rect(0, fy(8 - k), w, h);      // ▁▂▃▄▅▆▇█
+    else if (k <= 0xF) rect(0, 0, fx(16 - k), h);   // ▉▊▋▌▍▎▏
+    else if (k == 0x10) rect(fx(4), 0, w, h);       // ▐
+    else if (k == 0x14) rect(0, 0, w, fy(1));       // ▔
+    else if (k == 0x15) rect(fx(7), 0, w, h);       // ▕
+    else if (k >= 0x16) {                           // quadrants ▖▗▘▙▚▛▜▝▞▟: 1 upper left, 2 upper right, 4 lower left, 8 lower right
+      static const uint8_t kQuad[] = {4, 8, 1, 13, 9, 7, 11, 2, 6, 14};
+      int q = kQuad[k - 0x16], qx = fx(4), qy = fy(4);
+      if (q & 1) rect(0, 0, qx, qy);
+      if (q & 2) rect(qx, 0, w, qy);
+      if (q & 4) rect(0, qy, qx, h);
+      if (q & 8) rect(qx, qy, w, h);
+    }
+  } else {  // powerline U+E0B0-U+E0BF
+    switch (c - 0xE0B0) {
+      case 0x0: shape([&](float x, float y) { return x <= W * (1 - std::fabs(2 * y / H - 1)); }); break;
+      case 0x1: shape([&](float x, float y) { return std::min(seg(x, y, 0, 0, W - t, H / 2), seg(x, y, W - t, H / 2, 0, H)) <= t; }); break;
+      case 0x2: shape([&](float x, float y) { return x >= W * std::fabs(2 * y / H - 1); }); break;
+      case 0x3: shape([&](float x, float y) { return std::min(seg(x, y, W, 0, t, H / 2), seg(x, y, t, H / 2, W, H)) <= t; }); break;
+      case 0x4: case 0x6:  // half discs
+        shape([&](float x, float y) {
+          float dx = (c == 0xE0B4 ? x : W - x) / W, dy = 2 * y / H - 1;
+          return dx * dx + dy * dy <= 1;
+        });
+        break;
+      case 0x5: case 0x7:  // half circles: distance to the ellipse, to first order
+        shape([&](float x, float y) {
+          float dx = c == 0xE0B5 ? x : W - x, dy = y - H / 2, a = W - t, b = H / 2 - t;
+          float f = dx * dx / (a * a) + dy * dy / (b * b) - 1, g = 2 * std::hypot(dx / (a * a), dy / (b * b));
+          return std::fabs(f) <= t * std::max(g, 1e-6f);
+        });
+        break;
+      case 0x8: shape([&](float x, float y) { return y * W >= x * H; }); break;            // lower left triangle
+      case 0xA: shape([&](float x, float y) { return y * W >= (W - x) * H; }); break;      // lower right
+      case 0xC: shape([&](float x, float y) { return y * W <= (W - x) * H; }); break;      // upper left
+      case 0xE: shape([&](float x, float y) { return y * W <= x * H; }); break;            // upper right
+      case 0x9: case 0xF: shape([&](float x, float y) { return std::fabs(H * x - W * y) / diag <= t; }); break;
+      default: shape([&](float x, float y) { return std::fabs(H * x + W * y - W * H) / diag <= t; }); break;
+    }
+  }
+}
+
+static uint32_t DibColor(COLORREF c) { return (GetRValue(c) << 16) | (GetGValue(c) << 8) | GetBValue(c); }
+
+static std::vector<uint8_t> g_builtin[176];       // coverage of each builtin glyph at g_builtinW x g_builtinH
+static std::vector<uint16_t> g_builtinSpan[176];  // and the covered columns [first, last) of each of its rows
+static int g_builtinW, g_builtinH;
+
+// Paints builtin glyph c in fg over the cell whose top left corner is (x, y) in the 32-bit pixels px (stride in pixels),
+// inside clip; (ox, oy) is where px's origin is in the window, so the shade patterns line up across cells.
+static void BuiltinPaint(uint32_t* px, int stride, RECT clip, int x, int y, int ox, int oy, uint32_t c, COLORREF fg) {
+  int w = g_cellW, h = g_cellH;
+  if (w != g_builtinW || h != g_builtinH) {
+    for (auto& m : g_builtin) m.clear();
+    for (auto& s : g_builtinSpan) s.clear();
+    g_builtinW = w, g_builtinH = h;
+  }
+  uint32_t f = DibColor(fg);
+  int x0 = std::max(x, (int)clip.left), x1 = std::min(x + w, (int)clip.right);
+  int y0 = std::max(y, (int)clip.top), y1 = std::min(y + h, (int)clip.bottom);
+  if (c >= 0x2591 && c <= 0x2593) {  // ░▒▓: a quarter, half or three quarters of a grid of dots, as in Windows Terminal
+    int dot = std::max(1, (int)std::lround(std::max(w / 12.0, h / 24.0)));
+    for (int yy = y0; yy < y1; yy++)
+      for (int xx = x0; xx < x1; xx++) {
+        int a = (xx + ox) / dot, b = (yy + oy) / dot;
+        if (c == 0x2592 ? (a + b) % 2 == 0 : ((a + 2 * b) % 4 == 0) == (c == 0x2591)) px[(size_t)yy * stride + xx] = f;
+      }
+    return;
+  }
+  int i = c < 0xE000 ? c - 0x2500 : 160 + c - 0xE0B0;
+  std::vector<uint8_t>& m = g_builtin[i];
+  std::vector<uint16_t>& sp = g_builtinSpan[i];
+  if (m.empty()) {
+    m.assign((size_t)w * h, 0), sp.assign((size_t)2 * h, 0);
+    BuiltinRaster(c, w, h, m.data());
+    for (int r = 0; r < h; r++) {
+      int a = 0, b = w;
+      while (a < b && !m[(size_t)r * w + a]) a++;
+      while (b > a && !m[(size_t)r * w + b - 1]) b--;
+      sp[2 * r] = (uint16_t)a, sp[2 * r + 1] = (uint16_t)b;
+    }
+  }
+  for (int yy = y0; yy < y1; yy++) {
+    uint32_t* row = px + (size_t)yy * stride;
+    const uint8_t* mr = m.data() + (size_t)(yy - y) * w - x;
+    int s0 = std::max(x0, x + sp[2 * (yy - y)]), s1 = std::min(x1, x + sp[2 * (yy - y) + 1]);
+    for (int xx = s0; xx < s1; xx++) {
+      unsigned a = mr[xx], d = row[xx];
+      if (a == 255) row[xx] = f;
+      else if (a) {
+        auto ch = [&](int s) { return ((f >> s & 255) * a + (d >> s & 255) * (255 - a) + 127) / 255 << s; };
+        row[xx] = ch(16) | ch(8) | ch(0);
+      }
+    }
+  }
+}
+
+// A builtin glyph with GDI text (WARPLITE_GDI_TEXT or no DirectWrite): the cell is composed over bg and copied.
+static void GdiBuiltin(HDC dc, int x, int y, uint32_t c, COLORREF fg, COLORREF bg) {
+  static std::vector<uint32_t> px;
+  int w = g_cellW, h = g_cellH;
+  px.assign((size_t)w * h, DibColor(bg));
+  BuiltinPaint(px.data(), w, RECT{0, 0, w, h}, 0, 0, x, y, c, fg);
+  BITMAPINFO bi{};
+  bi.bmiHeader = {sizeof bi.bmiHeader, w, -h, 1, 32, BI_RGB};
+  SetDIBitsToDevice(dc, x, y, w, h, 0, 0, 0, h, px.data(), &bi, DIB_RGB_COLORS);
+}
+
 // Terminal text through DirectWrite, like Windows Terminal: grayscale antialiasing, natural measuring and
 // the system's rendering params (gamma, contrast, and the rendering mode DirectWrite picks for the font:
 // natural symmetric for most fonts and sizes). Each row is composed in the DIB of a bitmap render target
 // and copied to the destination DC in one BitBlt, so the GDI back buffer, row painting and screenshots
 // work as before. Without DirectWrite (or with WARPLITE_GDI_TEXT set) the text goes through GDI.
+struct DwLayer {  // one color layer of an emoji
+  UINT16 glyph, palette;  // palette 0xFFFF: the text color
+  COLORREF color;
+  float alpha;
+};
+
 struct DwState {
   IDWriteFactory1* factory = nullptr;
+  IDWriteFactory2* factory2 = nullptr;  // color glyphs (Windows 8.1 and later)
+  IDWriteTextAnalyzer* analyzer = nullptr;
   IDWriteGdiInterop* interop = nullptr;
   IDWriteRenderingParams* params = nullptr;
-  IDWriteRenderingParams* boxParams = nullptr;  // box drawing and blocks: aliased (hinted, one crisp pixel)
   IDWriteBitmapRenderTarget* rt = nullptr;
   HDC dc = nullptr;  // the render target's memory DC: a 32-bit top-down DIB
   uint32_t* bits = nullptr;
@@ -3301,6 +3558,10 @@ struct DwState {
   float em = 0;
   int ascent = 0;   // baseline below the top of the text
   bool on = false;  // fonts bridged: the terminal text goes through DirectWrite
+  bool emojiColor = false;                    // Segoe UI Emoji drawn in color
+  float emoUpem = 0, emoL = 0, emoT = 0, emoR = 0, emoB = 0;  // its em and the box of 😀 (design units, y up)
+  std::unordered_map<UINT16, std::vector<DwLayer>> layers;    // color layers of each emoji glyph
+  std::unordered_map<std::u32string, UINT16> joined;          // glyph of each emoji sequence (0: not joined)
 };
 static DwState g_dw;
 
@@ -3330,10 +3591,6 @@ static bool DwInit() {
   IDWriteBitmapRenderTarget1* rt1 = nullptr;
   if (!create || FAILED(create(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory1), (IUnknown**)&g_dw.factory)) ||
       FAILED(g_dw.factory->GetGdiInterop(&g_dw.interop)) || FAILED(g_dw.factory->CreateRenderingParams(&g_dw.params)) ||
-      FAILED(((IDWriteFactory*)g_dw.factory)
-                 ->CreateCustomRenderingParams(g_dw.params->GetGamma(), g_dw.params->GetEnhancedContrast(),
-                                               g_dw.params->GetClearTypeLevel(), g_dw.params->GetPixelGeometry(),
-                                               DWRITE_RENDERING_MODE_ALIASED, &g_dw.boxParams)) ||
       FAILED(g_dw.interop->CreateBitmapRenderTarget(nullptr, 1, 1, &rt)) ||
       FAILED(rt->QueryInterface(__uuidof(IDWriteBitmapRenderTarget1), (void**)&rt1)) ||
       FAILED(rt1->SetTextAntialiasMode(DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE))) {
@@ -3343,9 +3600,62 @@ static bool DwInit() {
   }
   rt1->Release();
   rt->SetPixelsPerDip(1.0f);  // em sizes are already in pixels
+  // Color emoji and the shaping of emoji sequences; without them emoji are drawn in the text color.
+  if (FAILED(g_dw.factory->QueryInterface(__uuidof(IDWriteFactory2), (void**)&g_dw.factory2))) g_dw.factory2 = nullptr;
+  if (FAILED(g_dw.factory->CreateTextAnalyzer(&g_dw.analyzer))) g_dw.analyzer = nullptr;
   g_dw.rt = rt;
   if (!DwTarget(1, 1)) g_dw.rt = nullptr, rt->Release();
   return g_dw.rt != nullptr;
+}
+
+// The COLR layers of an emoji glyph, as Windows Terminal draws them (empty: it has no color).
+static const std::vector<DwLayer>& DwLayers(UINT16 g) {
+  auto it = g_dw.layers.find(g);
+  if (it != g_dw.layers.end()) return it->second;
+  std::vector<DwLayer>& v = g_dw.layers[g];
+  float zero = 0;
+  DWRITE_GLYPH_RUN run{g_dw.fallback[kEmojiFace], 16.0f, 1, &g, &zero, nullptr, FALSE, 0};
+  IDWriteColorGlyphRunEnumerator* e = nullptr;
+  if (SUCCEEDED(g_dw.factory2->TranslateColorGlyphRun(0, 0, &run, nullptr, DWRITE_MEASURING_MODE_NATURAL, nullptr, 0, &e))) {
+    BOOL more = FALSE;
+    const DWRITE_COLOR_GLYPH_RUN* r = nullptr;
+    while (SUCCEEDED(e->MoveNext(&more)) && more && SUCCEEDED(e->GetCurrentRun(&r)))
+      for (UINT32 k = 0; k < r->glyphRun.glyphCount; k++)
+        v.push_back(DwLayer{r->glyphRun.glyphIndices[k], r->paletteIndex,
+                            RGB(std::lround(r->runColor.r * 255), std::lround(r->runColor.g * 255), std::lround(r->runColor.b * 255)),
+                            r->runColor.a});
+    e->Release();
+  }
+  return v;
+}
+
+// Color emoji: whether the emoji face has color layers, and the box of 😀 (the union of its layers) that every emoji
+// is fitted to its cells by.
+static void DwEmojiSetup() {
+  g_dw.layers.clear(), g_dw.joined.clear(), g_dw.emojiColor = false;
+  IDWriteFontFace* f = g_dw.fallback[kEmojiFace];
+  IDWriteFontFace2* f2 = nullptr;
+  if (!g_dw.on || !g_dw.factory2 || FAILED(f->QueryInterface(__uuidof(IDWriteFontFace2), (void**)&f2))) return;
+  bool color = f2->IsColorFont();
+  f2->Release();
+  DWRITE_FONT_METRICS fm{};
+  f->GetMetrics(&fm);
+  UINT32 ref = 0x1F600;
+  UINT16 gi = 0;
+  float l = 1e9f, t = -1e9f, r = -1e9f, b = 1e9f;
+  auto add = [&](UINT16 g) {
+    DWRITE_GLYPH_METRICS gm{};
+    if (FAILED(f->GetDesignGlyphMetrics(&g, 1, &gm, FALSE))) return;
+    float x0 = (float)gm.leftSideBearing, x1 = (float)gm.advanceWidth - (float)gm.rightSideBearing;
+    float y1 = (float)gm.verticalOriginY - (float)gm.topSideBearing;
+    float y0 = (float)gm.verticalOriginY - (float)gm.advanceHeight + (float)gm.bottomSideBearing;
+    if (x1 > x0 && y1 > y0) l = std::min(l, x0), r = std::max(r, x1), b = std::min(b, y0), t = std::max(t, y1);
+  };
+  if (!color || !fm.designUnitsPerEm || FAILED(f->GetGlyphIndices(&ref, 1, &gi)) || !gi) return;
+  for (const DwLayer& ly : DwLayers(gi)) add(ly.glyph);
+  if (r <= l || t <= b) return;
+  g_dw.emoUpem = (float)fm.designUnitsPerEm, g_dw.emoL = l, g_dw.emoT = t, g_dw.emoR = r, g_dw.emoB = b;
+  g_dw.emojiColor = true;
 }
 
 // DirectWrite faces of the GDI fonts just made: CreateFontFaceFromHdc also sees the embedded and private
@@ -3366,6 +3676,7 @@ static void DwMakeFaces(int em, int ascent) {
   for (int i = 0; i < kFallbackCount; i++) make(g_fallback[i], &g_dw.fallback[i]);
   g_dw.em = (float)em, g_dw.ascent = ascent;
   g_dw.on = ok;
+  DwEmojiSetup();
 }
 
 // Fills r (destination coordinates) in the strip being composed.
@@ -3386,9 +3697,127 @@ static bool DwBegin(RECT r, COLORREF bg) {
   return true;
 }
 
-// One glyph per code point with its advance in px (0 for combining marks), the top of the text at y. Box
-// drawing and block elements go aliased: antialiased, a vertical stroke would be smeared over two gray
-// pixels (Windows Terminal draws them itself, crisp).
+// The script analysis GetGlyphs needs, for one short string.
+struct DwAnalysis : IDWriteTextAnalysisSource, IDWriteTextAnalysisSink {
+  const wchar_t* text;
+  UINT32 len;
+  DWRITE_SCRIPT_ANALYSIS sa{};
+  DwAnalysis(const wchar_t* t, UINT32 n) : text(t), len(n) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** p) override { return *p = nullptr, E_NOINTERFACE; }
+  ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+  ULONG STDMETHODCALLTYPE Release() override { return 1; }
+  HRESULT STDMETHODCALLTYPE GetTextAtPosition(UINT32 pos, const WCHAR** s, UINT32* n) override {
+    *s = pos < len ? text + pos : nullptr, *n = pos < len ? len - pos : 0;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetTextBeforePosition(UINT32 pos, const WCHAR** s, UINT32* n) override {
+    *s = pos && pos <= len ? text : nullptr, *n = pos <= len ? pos : 0;
+    return S_OK;
+  }
+  DWRITE_READING_DIRECTION STDMETHODCALLTYPE GetParagraphReadingDirection() override { return DWRITE_READING_DIRECTION_LEFT_TO_RIGHT; }
+  HRESULT STDMETHODCALLTYPE GetLocaleName(UINT32 pos, UINT32* n, const WCHAR** loc) override {
+    return *n = len - std::min(pos, len), *loc = L"en-us", S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetNumberSubstitution(UINT32 pos, UINT32* n, IDWriteNumberSubstitution** ns) override {
+    return *n = len - std::min(pos, len), *ns = nullptr, S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE SetScriptAnalysis(UINT32, UINT32, const DWRITE_SCRIPT_ANALYSIS* a) override { return sa = *a, S_OK; }
+  HRESULT STDMETHODCALLTYPE SetLineBreakpoints(UINT32, UINT32, const DWRITE_LINE_BREAKPOINT*) override { return S_OK; }
+  HRESULT STDMETHODCALLTYPE SetBidiLevel(UINT32, UINT32, UINT8, UINT8) override { return S_OK; }
+  HRESULT STDMETHODCALLTYPE SetNumberSubstitution(UINT32, UINT32, IDWriteNumberSubstitution*) override { return S_OK; }
+};
+
+// The glyphs the emoji face shapes a sequence into (empty if it can't).
+static std::vector<UINT16> DwShapeEmoji(const uint32_t* cps, size_t n) {
+  std::wstring t;
+  for (size_t i = 0; i < n; i++) AppendUtf16(t, cps[i]);
+  DwAnalysis an(t.c_str(), (UINT32)t.size());
+  UINT16 clusters[32], glyphs[32];
+  DWRITE_SHAPING_TEXT_PROPERTIES tp[32];
+  DWRITE_SHAPING_GLYPH_PROPERTIES gp[32];
+  UINT32 got = 0;
+  if (!g_dw.analyzer || t.size() > 32 || FAILED(g_dw.analyzer->AnalyzeScript(&an, 0, an.len, &an)) ||
+      FAILED(g_dw.analyzer->GetGlyphs(t.c_str(), an.len, g_dw.fallback[kEmojiFace], FALSE, FALSE, &an.sa, nullptr, nullptr,
+                                      nullptr, nullptr, 0, 32, clusters, tp, glyphs, gp, &got)))
+    got = 0;
+  return std::vector<UINT16>(glyphs, glyphs + got);
+}
+
+// The one glyph the emoji face makes of a sequence (ZWJ, skin tone, flag), or 0: the only one with an advance.
+static UINT16 DwJoined(const uint32_t* cps, size_t n) {
+  std::u32string key(cps, cps + n);
+  auto it = g_dw.joined.find(key);
+  if (it != g_dw.joined.end()) return it->second;
+  UINT16& r = g_dw.joined[key];
+  int wide = 0;
+  for (UINT16 g : DwShapeEmoji(cps, n)) {
+    DWRITE_GLYPH_METRICS gm{};
+    if (SUCCEEDED(g_dw.fallback[kEmojiFace]->GetDesignGlyphMetrics(&g, 1, &gm, FALSE)) && gm.advanceWidth) r = g, wide++;
+  }
+  if (wide != 1) r = 0;
+  return r;
+}
+
+// Emoji glyph g in color, fitted to the box from bx (strip coordinates) bw wide and the strip's height: the box of 😀
+// scaled to 7/8 of it (the cell's background, a selection or a find match, shows around the emoji) and centred, the
+// glyph centred on its advance.
+static void DwEmojiGlyph(UINT16 g, float bx, float bw, COLORREF fg) {
+  IDWriteFontFace* face = g_dw.fallback[kEmojiFace];
+  float h = (float)(g_dw.strip.bottom - g_dw.strip.top), bh = g_dw.emoT - g_dw.emoB;
+  float s = std::min(bw / (g_dw.emoR - g_dw.emoL), h / bh) * 0.875f;  // px per design unit
+  DWRITE_GLYPH_METRICS gm{};
+  face->GetDesignGlyphMetrics(&g, 1, &gm, FALSE);
+  float x = bx + (bw - gm.advanceWidth * s) / 2, y = (h - bh * s) / 2 + g_dw.emoT * s, zero = 0;
+  auto draw = [&](UINT16 gi, COLORREF c) {
+    DWRITE_GLYPH_RUN run{face, s * g_dw.emoUpem, 1, &gi, &zero, nullptr, FALSE, 0};
+    g_dw.rt->DrawGlyphRun(x, y, DWRITE_MEASURING_MODE_NATURAL, &run, g_dw.params, c, nullptr);
+  };
+  const std::vector<DwLayer>& ls = DwLayers(g);
+  if (ls.empty()) return draw(g, fg);
+  // A translucent layer is mixed with the cell's background (the strip's top row, filled before the glyphs).
+  uint32_t under = g_dw.bits[std::clamp((int)bx, 0, (int)(g_dw.strip.right - g_dw.strip.left) - 1)];
+  for (const DwLayer& l : ls) {
+    COLORREF c = l.palette == 0xFFFF ? fg : l.color;
+    if (l.palette != 0xFFFF && l.alpha < 1) {
+      auto mix = [&](int fc, int bc) { return (int)std::lround(fc * l.alpha + bc * (1 - l.alpha)); };
+      c = RGB(mix(GetRValue(c), under >> 16 & 255), mix(GetGValue(c), under >> 8 & 255), mix(GetBValue(c), under & 255));
+    }
+    draw(l.glyph, c);
+  }
+}
+
+static bool IsRegional(uint32_t c) { return c >= 0x1F1E6 && c <= 0x1F1FF; }
+
+// Emoji in color, like Windows Terminal. libvterm gives every code point its own cells, so a sequence the font joins
+// into one glyph (ZWJ, skin tone) is drawn in the first two of its cells and the rest stay blank; one it doesn't
+// join (flags in Segoe UI Emoji) is drawn code point by code point.
+static void DwEmoji(float ox, COLORREF fg, const uint32_t* cps, const float* adv, size_t n) {
+  for (size_t i = 0, j; i < n; i = j) {
+    j = i + 1;
+    if (!adv[i]) continue;  // a mark with no character before it in this run
+    float w = adv[i];
+    int chars = 1;
+    for (; j < n; j++) {
+      bool tone = cps[j] >= 0x1F3FB && cps[j] <= 0x1F3FF, flag = chars == 1 && IsRegional(cps[i]) && IsRegional(cps[j]);
+      if (adv[j] && cps[j - 1] != 0x200D && !tone && !flag) break;
+      if (adv[j]) chars++, w += adv[j];
+    }
+    if (UINT16 g = chars > 1 ? DwJoined(cps + i, j - i) : 0) {
+      DwEmojiGlyph(g, ox, std::min(w, 2.0f * g_cellW), fg);
+    } else {
+      float x = ox;
+      for (size_t k = i; k < j; x += adv[k++]) {
+        UINT16 gi = 0;
+        if (adv[k] && SUCCEEDED(g_dw.fallback[kEmojiFace]->GetGlyphIndices(cps + k, 1, &gi))) DwEmojiGlyph(gi, x, adv[k], fg);
+      }
+    }
+    ox += w;
+  }
+}
+
+// One glyph per code point with its advance in px (0 for combining marks), the top of the text at y. Box drawing,
+// block elements and the powerline separators are builtin glyphs over the whole cell (the strip is one cell tall);
+// emoji go to DwEmoji.
 static void DwGlyphs(int x, int y, IDWriteFontFace* face, COLORREF fg, const uint32_t* cps, const float* adv, size_t n) {
   static std::vector<UINT16> idx;
   float ox = (float)(x - g_dw.strip.left);
@@ -3396,20 +3825,27 @@ static void DwGlyphs(int x, int y, IDWriteFontFace* face, COLORREF fg, const uin
   while (n > a && cps[n - 1] == L' ') n--;  // blanks draw nothing
   while (a < n && cps[a] == L' ') ox += adv[a++];
   if (a == n) return;
-  idx.resize(n - a);
-  if (FAILED(face->GetGlyphIndices(cps + a, (UINT32)(n - a), idx.data()))) return;
-  for (size_t k = 0; k < n - a; k++)
-    if (!idx[k] && !adv[a + k]) {  // zero-width character the face lacks (variation selector, ZWJ): no .notdef box
-      UINT32 sp = L' ';
-      face->GetGlyphIndices(&sp, 1, &idx[k]);
-    }
-  auto box = [](uint32_t c) { return c >= 0x2500 && c < 0x25A0; };
+  if (face == g_dw.fallback[kEmojiFace] && g_dw.emojiColor) return DwEmoji(ox, fg, cps + a, adv + a, n - a);
+  RECT clip{0, 0, g_dw.strip.right - g_dw.strip.left, g_dw.strip.bottom - g_dw.strip.top};
   for (size_t i = a, j; i < n; i = j) {
+    if (IsBuiltin(cps[i])) {
+      if (adv[i]) BuiltinPaint(g_dw.bits, g_dw.stride, clip, (int)std::lround(ox), 0, g_dw.strip.left, g_dw.strip.top, cps[i], fg);
+      ox += adv[i];
+      j = i + 1;
+      continue;
+    }
     float w = 0;
-    for (j = i; j < n && box(cps[j]) == box(cps[i]); j++) w += adv[j];
-    DWRITE_GLYPH_RUN run{face, g_dw.em, (UINT32)(j - i), idx.data() + (i - a), adv + i, nullptr, FALSE, 0};
-    g_dw.rt->DrawGlyphRun(ox, (float)(y - g_dw.strip.top + g_dw.ascent), DWRITE_MEASURING_MODE_NATURAL, &run,
-                          box(cps[i]) ? g_dw.boxParams : g_dw.params, fg, nullptr);
+    for (j = i; j < n && !IsBuiltin(cps[j]); j++) w += adv[j];
+    idx.resize(j - i);
+    if (FAILED(face->GetGlyphIndices(cps + i, (UINT32)(j - i), idx.data()))) return;
+    for (size_t k = 0; k < j - i; k++)
+      if (!idx[k] && !adv[i + k]) {  // zero-width character the face lacks (variation selector, ZWJ): no .notdef box
+        UINT32 sp = L' ';
+        face->GetGlyphIndices(&sp, 1, &idx[k]);
+      }
+    DWRITE_GLYPH_RUN run{face, g_dw.em, (UINT32)(j - i), idx.data(), adv + i, nullptr, FALSE, 0};
+    g_dw.rt->DrawGlyphRun(ox, (float)(y - g_dw.strip.top + g_dw.ascent), DWRITE_MEASURING_MODE_NATURAL, &run, g_dw.params,
+                          fg, nullptr);
     ox += w;
   }
 }
@@ -3491,7 +3927,7 @@ static void MakeFonts() {
 }
 
 static COLORREF ResolveColor(Pane* p, VTermColor c, bool fg) {
-  if (fg && VTERM_COLOR_IS_DEFAULT_FG(&c)) return kTermFg;
+  if (fg && VTERM_COLOR_IS_DEFAULT_FG(&c)) return g_termFg;
   if (!fg && VTERM_COLOR_IS_DEFAULT_BG(&c)) return kBg;
   vterm_screen_convert_color_to_rgb(p->scr, &c);
   return RGB(c.rgb.red, c.rgb.green, c.rgb.blue);
@@ -3524,8 +3960,10 @@ struct Style {
   int fb;  // fuente de respaldo (0 = Hack)
   int underline;
   bool strike;
+  bool bi;  // builtin glyph (box drawing, blocks, powerline)
   bool operator!=(const Style& o) const {
-    return fg != o.fg || bg != o.bg || font != o.font || fb != o.fb || underline != o.underline || strike != o.strike;
+    return fg != o.fg || bg != o.bg || font != o.font || fb != o.fb || underline != o.underline || strike != o.strike ||
+           bi != o.bi;
   }
 };
 
@@ -3685,12 +4123,14 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
         if (int f = FindMark(p, row, col)) s.bg = f == 2 ? kFindCur : kFindBg, s.fg = RGB(0, 0, 0);
         s.font = (c.attrs.bold ? 1 : 0) | (c.attrs.italic ? 2 : 0);
         s.fb = c.chars[0] ? FallbackFor(c.chars[0]) : 0;
+        if (s.fb != kEmojiFace + 1 && EmojiPresentation(c)) s.fb = kEmojiFace + 1;
         s.underline = c.attrs.underline;
         s.strike = c.attrs.strike;
+        s.bi = IsBuiltin(c.chars[0]);
         if (col != start && s != st) break;
         st = s;
         int w = std::max(1, (int)c.width);
-        if (comp) {
+        if (comp || st.bi) {
           cps.push_back(c.chars[0] ? c.chars[0] : L' ');
           adv.push_back((float)(g_cellW * w));
           for (int i = 1; i < VTERM_MAX_CHARS_PER_CELL && c.chars[0] && c.chars[i]; i++)
@@ -3712,6 +4152,11 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
         if (st.bg != kBg) DwFill(r, st.bg);
         DwGlyphs(r.left, y + g_textDy, st.fb ? g_dw.fallback[st.fb - 1] : g_dw.faces[st.font], st.fg, cps.data(),
                  adv.data(), cps.size());
+      } else if (st.bi) {  // GDI text: the builtin glyphs too
+        Fill(dc, r, st.bg);
+        float bx = (float)r.left;
+        for (size_t k = 0; k < cps.size(); bx += adv[k++])
+          if (adv[k]) GdiBuiltin(dc, (int)bx, y, cps[k], st.fg, st.bg);
       } else {
         SelectObject(dc, st.fb ? g_fallback[st.fb - 1] : g_fonts[st.font]);
         SetTextColor(dc, st.fg);
@@ -4378,6 +4823,8 @@ static bool SaveScreenshot(const std::wstring& path) {
 //   zoom:<%> move:x,y,w,h maximize rename-start rename-type:<texto> shot:<fichero.bmp> wait quit
 //   auto-update:on|off update-check update-click update-state key:<tab|down|up|enter|esc> edit-text comp drag-tab:<de>,<a> tabs clipboard (estos y hover/hover-text dejan el resultado en <sesión>.bench)
 //   font:<family> font-wait font font-others toast (font, font-others and toast also write to <session>.bench)
+//   cells join:<hex>,<hex>... brightness font-size (these write to <session>.bench) select:<text> brightness:<RRGGBB>
+//   font-size:<px>
 
 static void SetStartWithWindows(bool on);
 
@@ -4761,6 +5208,7 @@ static const int kFontCount = sizeof kFonts / sizeof kFonts[0];
 static const int kBuiltinFonts = 3;  // Hack, Cascadia Mono, Consolas; the downloaded ones go after a separator
 static const wchar_t* kFontUrl = L"https://raw.githubusercontent.com/google/fonts/main/";
 static UINT g_msgFont;              // another window changed the font: reload it from the settings
+static UINT g_msgText;              // another window changed the text brightness: likewise
 static std::wstring g_fontWanted;   // switch to this font when its download finishes
 static std::wstring g_fontError;    // why the last download failed (tests)
 static std::set<std::wstring> g_fontFilesLoaded;  // cached files already added to this process
@@ -4964,6 +5412,52 @@ static void LoadFontSetting() {
   if (!face.empty() && (FontInstalled(face) || LoadFontFiles(face))) g_fontFace = face;
 }
 
+// Text brightness, the default terminal foreground: shared by the windows of this Warp like the font, as RRGGBB.
+static std::wstring TextSettingsPath() {
+  return g_windowDir.empty() ? g_sessionPath + L".brightness" : g_windowDir + L"\\brightness.txt";
+}
+
+static bool ReadTextSetting(COLORREF* c) {
+  char b[8] = {};
+  FILE* f = _wfopen(TextSettingsPath().c_str(), L"rb");
+  if (!f) return false;
+  size_t n = fread(b, 1, 6, f);
+  fclose(f);
+  if (n < 6) return false;
+  for (size_t i = 0; i < 6; i++)
+    if (!isxdigit((unsigned char)b[i])) return false;
+  unsigned long v = strtoul(b, nullptr, 16);
+  *c = RGB(v >> 16 & 255, v >> 8 & 255, v & 255);
+  return true;
+}
+
+// Switches this window to text color c: the panes' default foreground, repainted.
+static void ApplyTextColor(COLORREF c) {
+  g_termFg = c;
+  VTermColor fg;
+  vterm_color_rgb(&fg, GetRValue(c), GetGValue(c), GetBValue(c));
+  for (Pane* p : g_live) {
+    EnterCriticalSection(&p->cs);
+    vterm_state_set_default_colors(vterm_obtain_state(p->vt), &fg, nullptr);
+    p->fullDirty = true;
+    LeaveCriticalSection(&p->cs);
+  }
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Chosen in this window: applied, saved and announced to the other windows of this Warp.
+static void SetTextBrightness(COLORREF c) {
+  ApplyTextColor(c);
+  if (FILE* f = _wfopen(TextSettingsPath().c_str(), L"wb")) {
+    fprintf(f, "%02X%02X%02X\n", GetRValue(c), GetGValue(c), GetBValue(c));
+    fclose(f);
+  }
+  for (HWND h : SiblingWindows()) PostMessageW(h, g_msgText, 0, 0);
+  wchar_t t[16];
+  swprintf(t, 16, L"#%02X%02X%02X", GetRValue(c), GetGValue(c), GetBValue(c));
+  Toast(t);
+}
+
 // Other monospaced families installed in Windows (menu → Font → Other installed), sorted. Without
 // vertical (@) fonts, the ones already in the menu, and the weights of a family (Cascadia Mono SemiBold).
 static std::vector<std::wstring> OtherMonoFonts() {
@@ -5035,6 +5529,17 @@ static std::wstring DwReport() {
     r += L" / " + name + L" " + std::to_wstring(weight);
     if (f->GetSimulations() & DWRITE_FONT_SIMULATIONS_BOLD) r += L" +bold";
     if (f->GetSimulations() & DWRITE_FONT_SIMULATIONS_OBLIQUE) r += L" +oblique";
+  }
+  r += g_dw.emojiColor ? L" / emoji: color" : L" / emoji: mono";
+  // The system's gamma and contrasts, which DirectWrite applies when blending (Windows Terminal reproduces the same
+  // blend in its shader; the grayscale contrast fades out for light text on a dark background).
+  IDWriteRenderingParams1* p1 = nullptr;
+  if (SUCCEEDED(g_dw.params->QueryInterface(__uuidof(IDWriteRenderingParams1), (void**)&p1))) {
+    wchar_t b[96];
+    swprintf(b, 96, L" / gamma %.2f contrast %.2f grayscale %.2f", p1->GetGamma(), p1->GetEnhancedContrast(),
+             p1->GetGrayscaleEnhancedContrast());
+    r += b;
+    p1->Release();
   }
   return r;
 }
@@ -5144,6 +5649,43 @@ static void RunScriptStep() {
   } else if (s == L"find-state") {
     ScriptLog(L"find: " + std::wstring(g_find.open ? L"open " : L"closed ") + std::to_wstring(g_find.cur + 1) + L"/" +
               std::to_wstring(g_find.matches.size()));
+  } else if (s == L"cells" && p) {  // every row with something past U+24FF: column:code points/width of those cells
+    EnterCriticalSection(&p->cs);
+    for (int r = 0; r < p->rows; r++) {
+      std::wstring line;
+      for (int col = 0; col < p->cols; col++) {
+        VTermScreenCell c;
+        CellAt(p, r, col, &c);
+        if (c.chars[0] == (uint32_t)-1 || (c.chars[0] < 0x2500 && !c.chars[1])) continue;
+        wchar_t b[16];
+        line += L" " + std::to_wstring(col) + L":";
+        for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && c.chars[i]; i++) swprintf(b, 16, i ? L"+%X" : L"%X", c.chars[i]), line += b;
+        line += L"/" + std::to_wstring(c.width);
+      }
+      if (!line.empty()) ScriptLog(L"cells " + std::to_wstring(r) + L":" + line);
+    }
+    LeaveCriticalSection(&p->cs);
+  } else if (s.rfind(L"join:", 0) == 0) {  // join:1F44D,1F3FD — the glyphs Segoe UI Emoji shapes those code points into
+    std::vector<uint32_t> cps;
+    for (const wchar_t* q = s.c_str() + 5; *q;) {
+      wchar_t* end = nullptr;
+      cps.push_back((uint32_t)wcstoul(q, &end, 16));
+      q = *end ? end + 1 : end;
+    }
+    std::wstring r = L"join " + s.substr(5) + L":";
+    if (g_dw.on)
+      for (UINT16 g : DwShapeEmoji(cps.data(), cps.size())) r += L" " + std::to_wstring(g);
+    ScriptLog(r + L" joined=" + std::to_wstring(g_dw.on ? DwJoined(cps.data(), cps.size()) : 0));
+  } else if (s.rfind(L"select:", 0) == 0 && p) {  // from the first match of the text to the end of its row
+    for (int r = 0; r < p->rows; r++) {
+      EnterCriticalSection(&p->cs);
+      size_t a = RowText(p, r).find(s.substr(7));
+      LeaveCriticalSection(&p->cs);
+      if (a != std::wstring::npos) {
+        g_selPane = p, g_selA = VTermPos{r, (int)a}, g_selB = VTermPos{r, p->cols - 1}, g_hasSel = true;
+        break;
+      }
+    }
   } else if (s == L"prime") {
     PrimeBack();
   } else if (s == L"bench" || s == L"verify") {
@@ -5310,6 +5852,18 @@ static void RunScriptStep() {
     static int waited = 0;
     if (!g_fontLoading.empty() && ++waited < 200) g_scriptPos--, delay = 300;
     else waited = 0, delay = 300;
+  } else if (s.rfind(L"brightness:", 0) == 0) {  // as if chosen in the title-bar menu (RRGGBB)
+    unsigned long v = wcstoul(s.c_str() + 11, nullptr, 16);
+    SetTextBrightness(RGB(v >> 16 & 255, v >> 8 & 255, v & 255));
+  } else if (s == L"brightness") {
+    wchar_t b[32];
+    swprintf(b, 32, L"brightness: %02X%02X%02X", GetRValue(g_termFg), GetGValue(g_termFg), GetBValue(g_termFg));
+    ScriptLog(b);
+  } else if (s.rfind(L"font-size:", 0) == 0) {  // as if chosen in the title-bar menu
+    SetFontSize(_wtoi(s.c_str() + 10));
+    delay = 600;
+  } else if (s == L"font-size") {
+    ScriptLog(L"font-size: " + std::to_wstring(g_fontPx) + L" " + std::to_wstring(g_cellW) + L"x" + std::to_wstring(g_cellH));
   } else if (s == L"font") {
     ScriptLog(FontReport());
   } else if (s == L"font-others") {  // menu → Font → Other installed
@@ -5431,6 +5985,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         AppendMenuW(fonts, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(fonts, MF_POPUP | (mono.empty() ? MF_GRAYED : 0), (UINT_PTR)others, T(S_OTHER_FONTS));
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)fonts, T(S_FONT_MENU));
+        // Font size of this window (like Ctrl+Shift +/-; a size not in the list shows up in it) and text brightness.
+        HMENU sizes = CreatePopupMenu(), bright = CreatePopupMenu();
+        std::vector<int> px = {11, 12, 13, 14, 15, 16, 18, 20, 22, 24};
+        if (std::find(px.begin(), px.end(), g_fontPx) == px.end()) px.insert(std::upper_bound(px.begin(), px.end(), g_fontPx), g_fontPx);
+        for (int v : px) {
+          std::wstring t = std::to_wstring(v) + L" px" + (v == kDefaultFontPx ? L"  (" + std::wstring(T(S_DEFAULT)) + L")" : L"");
+          AppendMenuW(sizes, MF_STRING | (v == g_fontPx ? MF_CHECKED : 0), 700 + v, t.c_str());
+        }
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)sizes, T(S_FONT_SIZE));
+        for (int i = 0; i < kTextLevelCount; i++) {
+          wchar_t hex[16];
+          COLORREF c = kTextLevels[i];
+          swprintf(hex, 16, L"#%02X%02X%02X", GetRValue(c), GetGValue(c), GetBValue(c));
+          std::wstring t = hex + (i == 1 ? std::wstring(L"  (Windows Terminal)")
+                                         : i == kTextDefault ? L"  (" + std::wstring(T(S_DEFAULT)) + L")" : L"");
+          AppendMenuW(bright, MF_STRING | (c == g_termFg ? MF_CHECKED : 0), 600 + i, t.c_str());
+        }
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)bright, T(S_TEXT_BRIGHTNESS));
         AppendMenuW(menu, MF_STRING | (StartsWithWindows() ? MF_CHECKED : 0), 1, T(S_STARTUP));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         wchar_t upd[160] = L"";
@@ -5457,6 +6029,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (cmd >= 200 && cmd < 200 + kFontCount) SetTerminalFont(kFonts[cmd - 200].face);
         if (cmd >= 1000 && cmd < 1000 + (int)mono.size()) SetTerminalFont(mono[cmd - 1000]);
+        if (cmd >= 600 && cmd < 600 + kTextLevelCount) SetTextBrightness(kTextLevels[cmd - 600]);
+        if (cmd >= 706 && cmd <= 748) SetFontSize(cmd - 700);
         return 0;
       }
       break;
@@ -5988,6 +6562,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       ApplyTerminalFont(face);
     return 0;
   }
+  if (msg == g_msgText && g_msgText) {  // another window changed the text brightness
+    COLORREF c;
+    if (ReadTextSetting(&c) && c != g_termFg) ApplyTextColor(c);
+    return 0;
+  }
   if (msg == WM_COPYDATA) {
     auto* cd = (COPYDATASTRUCT*)lp;
     std::wstring t(cd->lpData ? (const wchar_t*)cd->lpData : L"", cd->cbData / sizeof(wchar_t));
@@ -6105,6 +6684,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   g_msgListPanes = RegisterWindowMessageW(L"warp-lite-list-panes");
   g_msgFocusPane = RegisterWindowMessageW(L"warp-lite-focus-pane");
   g_msgFont = RegisterWindowMessageW(L"warp-lite-font");
+  g_msgText = RegisterWindowMessageW(L"warp-lite-brightness");
   if (!g_openDir.empty()) {
     // El Explorador pasa "C:\" y Windows lo lee como «C:"»: se arregla la barra del final.
     while (!g_openDir.empty() && (g_openDir.back() == L' ' || g_openDir.back() == L'\t')) g_openDir.pop_back();
@@ -6154,6 +6734,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     AddFontMemResourceEx((void*)f.a, (DWORD)(f.b - f.a), nullptr, &n);
   }
   LoadFontSetting();
+  ReadTextSetting(&g_termFg);
 
   WNDCLASSEXW wc{sizeof wc};
   wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
