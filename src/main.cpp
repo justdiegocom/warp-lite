@@ -3333,6 +3333,14 @@ static bool InSelection(Pane* p, int row, int col) {
   return true;
 }
 
+// Claude Code draws block quotes with a bar in front of each line («▎ text»): copied text leaves it out,
+// keeping the indent before it.
+static void StripQuoteBar(std::wstring& line) {
+  size_t i = line.find_first_not_of(L' ');
+  if (i == std::wstring::npos || line[i] < L'\u258C' || line[i] > L'\u258F') return;
+  line.erase(i, i + 1 < line.size() && line[i + 1] == L' ' ? 2 : 1);
+}
+
 static std::wstring SelectionText() {
   Pane* p = g_selPane;
   if (!g_hasSel || !p || !g_live.count(p)) return {};
@@ -3350,6 +3358,7 @@ static std::wstring SelectionText() {
       for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i]; i++) AppendUtf16(line, cell.chars[i]);
     }
     while (!line.empty() && line.back() == L' ') line.pop_back();
+    StripQuoteBar(line);
     out += line;
     if (r != b.row) out += L"\r\n";
   }
@@ -5717,7 +5726,7 @@ static bool SaveScreenshot(const std::wstring& path) {
 //   zoom:<%> move:x,y,w,h maximize rename-start rename-type:<texto> shot:<fichero.bmp> wait quit
 //   auto-update:on|off update-check update-click update-state key:<tab|down|up|enter|esc> edit-text comp drag-tab:<de>,<a> tabs clipboard (estos y hover/hover-text dejan el resultado en <sesión>.bench)
 //   font:<family> font-wait font font-others toast (font, font-others and toast also write to <session>.bench)
-//   cells join:<hex>,<hex>... brightness font-size (these write to <session>.bench) select:<text> brightness:<RRGGBB>
+//   cells join:<hex>,<hex>... brightness font-size (these write to <session>.bench) select:<text> select-to:<text> copy brightness:<RRGGBB>
 //   font-size:<px> link-action:<col>,<row> hover-time:<col>,<row> path-probes (these write to <session>.bench;
 //   hover reports paths as "path <full path>")
 
@@ -6626,6 +6635,18 @@ static void RunScriptStep() {
         break;
       }
     }
+  } else if (s.rfind(L"select-to:", 0) == 0 && p && g_hasSel) {  // extends the selection to the end of the row with the text
+    for (int r = g_selA.row; r < p->rows; r++) {
+      EnterCriticalSection(&p->cs);
+      bool hit = RowText(p, r).find(s.substr(10)) != std::wstring::npos;
+      LeaveCriticalSection(&p->cs);
+      if (hit) {
+        g_selB = VTermPos{r, p->cols - 1};
+        break;
+      }
+    }
+  } else if (s == L"copy") {
+    CopySelection();
   } else if (s == L"prime") {
     PrimeBack();
   } else if (s == L"bench" || s == L"verify") {
