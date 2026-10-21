@@ -2,7 +2,10 @@
 # (spaces dropped at the breaks, 2-space indent, no closing quote) with every row resolving to the whole
 # path, an unquoted path with spaces, paths relative to the pane folder, src\main.cpp:120, file.txt:12:3,
 # a folder, a missing path, a path followed by . or ), file:///, a path the terminal wrapped mid-word, a
-# URL that stays a URL, and what Ctrl+click would do (open / explorer / select; nothing is opened). Also
+# URL that stays a URL, and what Ctrl+click would do (open / explorer / select; nothing is opened). Shares
+# (\\host\share, //host/share) and \\?\ \\.\ device paths are never links and are never even looked up
+# (that would connect to the host and leak the NTLM hash): an existing file through \\localhost\C$, a
+# \\evil\share path, and the path-probes counter of lookups that reached the network (must be 0). Also
 # how long a hover takes with the path cache empty and full. Results in session-rutas.txt.bench.
 $ErrorActionPreference = 'Stop'
 $dir = $PSScriptRoot
@@ -41,16 +44,20 @@ $lines = @(
 )
 [IO.File]::WriteAllLines($sample, $lines, (New-Object Text.UTF8Encoding $true))
 # Rows 17-18: a path the terminal itself wraps at the right edge, mid-word and without indent. Row 19: the
-# same file through \\localhost\C$ if that share answers here (checked on the worker thread: the first
-# hover doesn't wait for it and finds nothing, the next one has the answer).
+# same file through \\localhost\C$ (it exists if that share answers here, and still isn't a link: hovered
+# twice, in case an answer came later). Row 20: \\evil\share and //evil/share. Row 21: \\.\ and \\?\.
 $env:WLT_DIR = $t
 $env:WLT_SAMPLE = $sample
 $env:WLT_FILE = "$t\file.txt"
 $unc = '\\localhost\' + $t.Substring(0, 1) + '$' + $t.Substring(2) + '\file.txt'
-$hasUnc = Test-Path $unc
-$env:WLT_UNC = if ($hasUnc) { "Red $unc" } else { 'Red (no share)' }
-$show = 'edit:cls; Get-Content -Encoding UTF8 $env:WLT_SAMPLE; $w = $Host.UI.RawUI.WindowSize.Width; Write-Host ((''x'' * ($w - 20)) + '' '' + $env:WLT_FILE); Write-Host $env:WLT_UNC'
+"(\\localhost share answers here: $(Test-Path $unc))"
+$env:WLT_UNC = "Red $unc"
+$env:WLT_EVIL = 'Leer \\evil\share\file.txt y //evil/share/x.txt'
+$env:WLT_DEV = "Dev \\.\$t\file.txt o \\?\$t\file.txt"
+$show = 'edit:cls; Get-Content -Encoding UTF8 $env:WLT_SAMPLE; $w = $Host.UI.RawUI.WindowSize.Width; Write-Host ((''x'' * ($w - 20)) + '' '' + $env:WLT_FILE); Write-Host $env:WLT_UNC; Write-Host $env:WLT_EVIL; Write-Host $env:WLT_DEV'
 $cu = ("Red $unc").Length - 3
+$ce = @(8, ('Leer \\evil\share\file.txt y //').Length + 1)
+$cd = @(9, ("Dev \\.\$t\file.txt o \\?\").Length + 1)
 $rod = 3 + [math]::Max(0, $t.IndexOf(' ')) + 2  # row 0, inside the part of $t after its first space
 $c = @{
   final = ("Abre $t\Mis Notas\nota ").Length + 1; ahora = ("Abre $t\Mis Notas\nota final.txt ").Length + 1
@@ -68,10 +75,11 @@ $steps = @(
   'hover:10,5', "hover:$($c.folder),6", "hover:$($c.missing),7", "hover:$($c.saved),8", "hover:$($c.dot),8",
   'hover:6,9', "hover:$($c.tool),10", "hover:$($c.run),10", "hover:$($c.url),11", 'hover:6,12', 'hover:2,18'
 )
-if ($hasUnc) { $steps += @("hover:$cu,19", 'wait', "hover:$cu,19") }
+$steps += @("hover:$cu,19", 'wait', "hover:$cu,19", "hover:$($ce[0]),20", "hover:$($ce[1]),20", "hover:$($cd[0]),21",
+  "hover:$($cd[1]),21")
 $steps += @(
   "link-action:$($c.tool),10", "link-action:$($c.run),10", "link-action:$($c.folder),6", 'link-action:10,5',
-  'link-action:6,12', "link-action:$($c.missing),7",
+  'link-action:6,12', "link-action:$($c.missing),7", "link-action:$cu,19", 'path-probes',
   'hover-time:4,1', 'hover-time:30,15', 'hover-time:2,18',
   'quit'
 )
@@ -90,13 +98,20 @@ $want = @(
   "hover 6,9: path $t\src\main.cpp", "hover $($c.tool),10: path $t\tool.exe", "hover $($c.run),10: path $t\run.ps1",
   "hover $($c.url),11: path $t\file.txt", 'hover 6,12: https://example.com/a/b', "hover 2,18: path $t\file.txt"
 )
-if ($hasUnc) { $want += @("hover $cu,19: $none", "hover $cu,19: path $unc") } else { '(\\localhost share not available: UNC case skipped)' }
+$want += @("hover $cu,19: $none", "hover $cu,19: $none", "hover $($ce[0]),20: $none", "hover $($ce[1]),20: $none",
+  "hover $($cd[0]),21: $none", "hover $($cd[1]),21: $none")
 $want += @(
   "link-action $($c.tool),10: select $t\tool.exe", "link-action $($c.run),10: select $t\run.ps1",
   "link-action $($c.folder),6: explorer $t\src", "link-action 10,5: open $t\file.txt",
-  'link-action 6,12: open https://example.com/a/b', "link-action $($c.missing),7: $none"
+  'link-action 6,12: open https://example.com/a/b', "link-action $($c.missing),7: $none", "link-action $cu,19: $none"
 )
 $fail = 0
+# Lookups so far: some (the local paths above), none of them to the network.
+$probes = @($got | Where-Object { $_ -like 'path-probes:*' })
+$ok = $probes.Count -eq 1 -and $probes[0] -match '^path-probes: (\d+) remote 0$' -and [int]$Matches[1] -gt 0
+if (-not $ok) { $fail++ }
+'{0} {1}' -f $(if ($ok) { 'OK  ' } else { 'FALLO' }), $(if ($probes.Count) { $probes[0] } else { '(falta) path-probes' })
+$got = @($got | Where-Object { $_ -notlike 'path-probes:*' })
 for ($i = 0; $i -lt $want.Count; $i++) {
   $ok = $i -lt $got.Count -and $got[$i] -eq $want[$i]
   if (-not $ok) { $fail++ }

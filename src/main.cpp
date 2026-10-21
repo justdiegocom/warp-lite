@@ -3116,8 +3116,9 @@ static std::vector<UrlSpan> UrlsFrom(Pane* p, int r0, const std::function<const 
 // row break may have been a space or nothing: both are tried. Only paths that exist count, which
 // settles that (the longest one that exists wins) and keeps ordinary words from being links. Answers
 // are cached for a few seconds; local disks are asked right away (a bounded number of calls per
-// hover), shares and network, removable or optical drives on a worker thread, and the link shows up
-// when it answers.
+// hover), removable or optical drives on a worker thread, and the link shows up when it answers.
+// Shares (\\host\share) and network drives are never links: just asking about one would connect to
+// that host and hand it the user's NTLM hash whenever the mouse passes over text a program printed.
 
 static const DWORD kPathCacheMs = 3000;
 static const wchar_t kBreak = 1;               // row break in the joined text: a space or nothing
@@ -3152,20 +3153,31 @@ struct PathChecks {  // a batch of slow checks for the worker
   std::vector<DWORD> attrs;
 };
 
+static bool IsPathSep(wchar_t c) { return c == L'\\' || c == L'/'; }
+
+// Disk lookups for path links, and how many went to the network (must stay 0; the path-probes step
+// reports both). Every lookup goes through here.
+static std::atomic<int> g_pathProbes{0}, g_remoteProbes{0};
+
+static void CountProbe(const std::wstring& full) {
+  g_pathProbes++;
+  wchar_t root[] = {full.empty() ? L'?' : full[0], L':', L'\\', 0};
+  if (full.size() < 2 || full[1] != L':' || GetDriveTypeW(root) == DRIVE_REMOTE) g_remoteProbes++;
+}
+
 static DWORD WINAPI PathCheckThread(LPVOID arg) {
   auto* job = (PathChecks*)arg;
   SetThreadErrorMode(SEM_FAILCRITICALERRORS, nullptr);  // no "insert a disk" box
-  for (auto& f : job->paths) job->attrs.push_back(GetFileAttributesW(f.c_str()));
+  for (auto& f : job->paths) CountProbe(f), job->attrs.push_back(GetFileAttributesW(f.c_str()));
   if (!PostMessage(g_hwnd, WM_APP_PATHS, 0, (LPARAM)job)) delete job;
   return 0;
 }
 
-static bool IsPathSep(wchar_t c) { return c == L'\\' || c == L'/'; }
-
-// 1: local fixed disk (answers at once); 2: share, network, removable or optical drive (may take
-// seconds or wake a disc: asked on the worker); 0: no such drive.
+// 1: local fixed disk (answers at once); 2: removable or optical drive (may take seconds or wake a
+// disc: asked on the worker); 0: no such drive, or a share or network drive (never asked, see above;
+// GetDriveTypeW itself stays local).
 static int DriveSpeed(const std::wstring& full) {
-  if (IsPathSep(full[0])) return 2;
+  if (full.size() < 2 || full[1] != L':') return 0;
   wchar_t d = towupper(full[0]);
   DWORD now = GetTickCount();
   auto it = g_paths.drives.find(d);
@@ -3174,7 +3186,7 @@ static int DriveSpeed(const std::wstring& full) {
     it = g_paths.drives.insert_or_assign(d, TimedAttrs{GetDriveTypeW(root), now}).first;
   }
   UINT t = it->second.attrs;
-  return t == DRIVE_FIXED || t == DRIVE_RAMDISK ? 1 : t == DRIVE_NO_ROOT_DIR || t == DRIVE_UNKNOWN ? 0 : 2;
+  return t == DRIVE_FIXED || t == DRIVE_RAMDISK ? 1 : t == DRIVE_REMOVABLE || t == DRIVE_CDROM ? 2 : 0;
 }
 
 // Attributes of a full path, cached or from the disk: INVALID_FILE_ATTRIBUTES if it doesn't exist,
@@ -3204,6 +3216,7 @@ static DWORD PathAttrs(const std::wstring& full, int& budget, std::vector<std::w
   }
   if (budget <= 0) return kAttrPending;
   budget--;
+  CountProbe(full);
   DWORD a = GetFileAttributesW(full.c_str());
   g_paths.attrs[key] = TimedAttrs{a, now};
   return a;
@@ -3220,6 +3233,7 @@ static const DirList* DirNames(const std::wstring& dir, int& budget) {
   budget--;
   DirList& l = g_paths.dirs[key];
   l = DirList{now, true, {}};
+  CountProbe(dir);
   WIN32_FIND_DATAW fd;
   HANDLE f = FindFirstFileExW((dir + (IsPathSep(dir.back()) ? L"*" : L"\\*")).c_str(), FindExInfoBasic, &fd,
                               FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
@@ -3268,21 +3282,17 @@ static int LineSuffixStart(const std::wstring& s, int a, int e) {
   return e;
 }
 
-// Could this be a path at all? Nothing Windows forbids in a name, a colon only after the drive letter
-// (C:\ or C:/), \\server\share but no \\?\ or \\.\ device paths, no \foo (rooted on whatever drive:
-// usually a Unix path over ssh), not ending in . or a space (Windows would drop them) and not a
-// device name (nul, con, com1…).
+// Could this be a local path at all? Nothing Windows forbids in a name, a colon only after the drive
+// letter (C:\ or C:/), nothing starting with \ or / (\\server\share and //server/share would reach the
+// network, \\?\ and \\.\ are device paths, \foo is rooted on whatever drive: usually a Unix path over
+// ssh), not ending in . or a space (Windows would drop them) and not a device name (nul, con, com1…).
 static bool PathShaped(const std::wstring& s) {
-  if (s.empty() || s.size() > 1024) return false;
+  if (s.empty() || s.size() > 1024 || IsPathSep(s[0])) return false;
   for (size_t i = 0; i < s.size(); i++)
     if (s[i] < 32 || wcschr(L"\"<>|?*\u2502", s[i]) || (s[i] == L':' && i != 1)) return false;
   if (s.size() >= 2 && s[1] == L':') {
     wchar_t d = s[0] | 0x20;
     if (s.size() < 3 || !IsPathSep(s[2]) || d < L'a' || d > L'z') return false;
-  } else if (IsPathSep(s[0])) {
-    if (s.size() < 3 || !IsPathSep(s[1]) || IsPathSep(s[2])) return false;
-    size_t a = s.find_first_of(L"\\/", 2);
-    if (a == std::wstring::npos || a + 1 >= s.size() || IsPathSep(s[a + 1])) return false;
   }
   if (s.back() == L'.' || s.back() == L' ') return false;
   size_t end = s.size();
@@ -3299,10 +3309,12 @@ static bool PathShaped(const std::wstring& s) {
   return true;
 }
 
-// Full form of a path seen in the pane (relative ones against its folder); empty if there's none.
+// Full form of a path seen in the pane (relative ones against its folder); empty if there's none
+// (never \\server\share, see PathShaped).
 static std::wstring FullPath(const std::wstring& s, const std::wstring& cwd) {
+  if (s.empty() || IsPathSep(s[0])) return {};
   std::wstring f = s;
-  if (!(s.size() >= 2 && (s[1] == L':' || IsPathSep(s[0])))) {
+  if (!(s.size() >= 2 && s[1] == L':')) {
     if (cwd.empty()) return {};
     f = cwd + (IsPathSep(cwd.back()) ? L"" : L"\\") + s;
   }
@@ -3443,7 +3455,8 @@ static bool PathAt(const std::vector<PathRow>& rows, int first, VTermPos pos, in
     if (a < te) starts.push_back({a, false});
     if (te - a > 8 && !_wcsnicmp(s.c_str() + a, L"file:///", 8)) starts.push_back({a + 8, true});
     for (int k = a + 1; k < te && starts.size() < 4; k++) {
-      bool drive = k + 2 < te && iswalpha(s[k]) && s[k + 1] == L':' && IsPathSep(s[k + 2]) && !iswalnum(s[k - 1]);
+      bool drive = k + 2 < te && iswalpha(s[k]) && s[k + 1] == L':' && IsPathSep(s[k + 2]) && !iswalnum(s[k - 1]) &&
+                   !IsPathSep(s[k - 1]);  // not inside \\?\C:\… or \\.\C:\…
       bool dup = false;
       for (auto& st : starts) dup = dup || st.first == k;
       if (!dup && (drive || wcschr(L"(\"'=`", s[k - 1]))) starts.push_back({k, false});
@@ -3452,8 +3465,7 @@ static bool PathAt(const std::vector<PathRow>& rows, int first, VTermPos pos, in
       int link = fu ? a : st;
       if (link > hpos) continue;
       int n = (int)s.size();
-      bool abs = fu || (st + 2 < n && iswalpha(s[st]) && s[st + 1] == L':' && IsPathSep(s[st + 2])) ||
-                 (st + 1 < n && IsPathSep(s[st]) && IsPathSep(s[st + 1]));
+      bool abs = fu || (st + 2 < n && iswalpha(s[st]) && s[st + 1] == L':' && IsPathSep(s[st + 2]));
       bool quoted = st > ts && wcschr(L"\"'`", s[st - 1]);
       int cls = abs || quoted ? 0 : 1;
       for (int j = std::max(i, kR); j < (int)tk.size() && j - i < (cls ? 6 : 10); j++)
@@ -3471,7 +3483,7 @@ static bool PathAt(const std::vector<PathRow>& rows, int first, VTermPos pos, in
   auto attrsOf = [&](const std::wstring& t, std::wstring& full) -> DWORD {
     full = FullPath(t, cwd);
     if (full.empty()) return INVALID_FILE_ATTRIBUTES;
-    if (!(t.size() >= 2 && (t[1] == L':' || IsPathSep(t[0])))) {
+    if (!(t.size() >= 2 && t[1] == L':')) {
       size_t sep = t.find_first_of(L"\\/");
       std::wstring head = t.substr(0, sep);
       if (head != L"." && head != L"..") {
@@ -3605,6 +3617,7 @@ static DWORD WINAPI PathOpenThread(LPVOID arg) {
 }
 
 static void OpenPathLink(const LinkHit& h) {
+  if (!DriveSpeed(h.path)) return;  // never a share or network drive (PathAt doesn't return those either)
   auto* job = new PathOpen{h.path, LinkAction(h)};
   HANDLE t = CreateThread(nullptr, 0, PathOpenThread, job, 0, nullptr);
   if (t) CloseHandle(t);
@@ -5359,8 +5372,8 @@ static bool SaveScreenshot(const std::wstring& path) {
 //   auto-update:on|off update-check update-click update-state key:<tab|down|up|enter|esc> edit-text comp drag-tab:<de>,<a> tabs clipboard (estos y hover/hover-text dejan el resultado en <sesión>.bench)
 //   font:<family> font-wait font font-others toast (font, font-others and toast also write to <session>.bench)
 //   cells join:<hex>,<hex>... brightness font-size (these write to <session>.bench) select:<text> brightness:<RRGGBB>
-//   font-size:<px> link-action:<col>,<row> hover-time:<col>,<row> (these write to <session>.bench; hover reports
-//   paths as "path <full path>")
+//   font-size:<px> link-action:<col>,<row> hover-time:<col>,<row> path-probes (these write to <session>.bench;
+//   hover reports paths as "path <full path>")
 
 static void SetStartWithWindows(bool on);
 
@@ -6181,6 +6194,8 @@ static void RunScriptStep() {
     LinkHit h = LinkAt(p, p->content.left + kPad + c * g_cellW + 1, p->content.top + kPad + r * g_cellH + 1);
     ScriptLog(L"link-action " + std::to_wstring(c) + L"," + std::to_wstring(r) + L": " +
               (h.p ? kLinkActions[LinkAction(h)] + std::wstring(L" ") + (h.url.empty() ? h.path : h.url) : L"(sin enlace)"));
+  } else if (s == L"path-probes") {  // disk lookups made for path links so far, and how many reached the network (0)
+    ScriptLog(L"path-probes: " + std::to_wstring(g_pathProbes.load()) + L" remote " + std::to_wstring(g_remoteProbes.load()));
   } else if (s.rfind(L"hover-time:", 0) == 0 && p) {  // hover-time:col,row — µs of that hover with the path cache empty, then full
     int c = 0, r = 0;
     swscanf(s.c_str() + 11, L"%d,%d", &c, &r);
