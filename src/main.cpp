@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -103,7 +104,7 @@ static const int kGap = 1;           // separación entre paneles (px)
 static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
-enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS };
+enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS, WM_APP_PROMPT, WM_APP_NETCHANGE };
 enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6 };
 
 // ---------------------------------------------------------------------------
@@ -127,6 +128,21 @@ struct Tab {
   Pane* active = nullptr;
   std::wstring name;  // puesto a mano (doble clic); vacío = título de la shell
   bool hidden = false;  // oculta (clic derecho → Ocultar); se recupera desde «N ocultas»
+};
+
+// Auto-reconnect of an ssh whose connection dropped (see «Reconnect» below).
+enum { RC_OFF, RC_WAITING, RC_TRYING };
+static const int kNoExit = INT_MIN;  // the prompt did not say how the command exited
+struct Reconnect {
+  std::string cmd;        // command line of the run in flight, as sent from the box ("" for an empty Enter)
+  bool byWarp = false;    // that run was launched by Warp (session restore or a reconnect attempt)
+  int state = RC_OFF;     // RC_WAITING: next attempt at `due`; RC_TRYING: attempt `attempt` is running
+  int attempt = 0;
+  DWORD due = 0, launched = 0, outSeen = 0;
+  bool ended = false;     // the prompt came back: decided a moment later, when ssh's last lines are drawn
+  int exit = kNoExit;
+  DWORD endedAt = 0;
+  std::wstring label;     // status card text last drawn
 };
 
 struct Pane {
@@ -184,6 +200,7 @@ struct Pane {
   std::wstring agentName;  // nombre de la conversación de Claude Code que corre aquí (título de la pestaña)
   int agent = 0;           // AGENT_* que corre aquí, también si se lanzó con un atajo (ver UpdateRunning)
   std::atomic<DWORD> firstOut{0}, lastOut{0};
+  Reconnect recon;
 };
 
 static HWND g_hwnd;
@@ -232,7 +249,7 @@ enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, 
            S_LOADING, S_KIND_CMD, S_KIND_DIR, S_KIND_FILE, S_KIND_PARAM, S_UPD_AVAIL, S_UPD_INSTALLING, S_UPD_READY,
            S_UPD_FAILED, S_UPD_INSTALL, S_UPD_RESTART, S_UPD_RETRY, S_UPD_CHECK, S_UPD_AUTO, S_UPD_LATEST, S_UPD_CHECKING,
            S_UPD_OFFLINE, S_UPD_DOWNLOADING, S_SWITCH, S_OTHER_WINDOW, S_FONT_MENU, S_OTHER_FONTS, S_FONT_FAILED,
-           S_FONT_SIZE, S_TEXT_BRIGHTNESS, S_DEFAULT, S_COUNT };
+           S_FONT_SIZE, S_TEXT_BRIGHTNESS, S_DEFAULT, S_RECONNECTING, S_RECONNECT_WAIT, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
@@ -241,7 +258,8 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Warp %s is available", L"Installing %s…", L"Updated to %s", L"Couldn't update to %s", L"Install", L"Restart",
      L"Retry", L"Check for updates", L"Update automatically", L"Warp is up to date", L"Checking for updates…",
      L"Couldn't check for updates", L"Downloading %s…", L"Search terminals…", L"other window", L"Font",
-     L"Other installed", L"Couldn't download %s", L"Font size", L"Text brightness", L"default"},
+     L"Other installed", L"Couldn't download %s", L"Font size", L"Text brightness", L"default",
+     L"Reconnecting… (attempt %d) — Esc to cancel", L"Reconnecting in %d s (attempt %d) — Esc to cancel"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
@@ -250,7 +268,8 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Instalar", L"Reiniciar", L"Reintentar", L"Buscar actualizaciones", L"Actualizar automáticamente",
      L"Warp está al día", L"Buscando actualizaciones…", L"No se pudo comprobar si hay actualizaciones",
      L"Descargando %s…", L"Buscar terminales…", L"otra ventana", L"Fuente", L"Otras instaladas",
-     L"No se pudo descargar %s", L"Tamaño de letra", L"Brillo del texto", L"predeterminado"},
+     L"No se pudo descargar %s", L"Tamaño de letra", L"Brillo del texto", L"predeterminado",
+     L"Reconectando… (intento %d) — Esc para cancelar", L"Reconectando en %d s (intento %d) — Esc para cancelar"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -494,7 +513,8 @@ static bool IsLocalDir(const std::wstring& d) {
   return d.size() >= 3 && iswalpha(d[0]) && d[1] == L':' && d[2] == L'\\';
 }
 
-// OSC 9;9;<token>;<ruta> (lo emite el prompt de warp-lite): la shell espera una orden en <ruta>.
+// OSC 9;9;<token>;<código de salida>;<ruta> (lo emite el prompt de warp-lite): la shell espera una
+// orden en <ruta>. The exit code is $LASTEXITCODE as an int; empty or invalid means unknown.
 static int CbOsc(int command, VTermStringFragment frag, void* user) {
   Pane* p = (Pane*)user;
   if (command != 9) return 0;
@@ -502,12 +522,18 @@ static int CbOsc(int command, VTermStringFragment frag, void* user) {
   p->oscBuf.append(frag.str, frag.len);
   std::string head = "9;" + p->token + ";";
   if (frag.final && !p->token.empty() && p->oscBuf.rfind(head, 0) == 0) {
-    std::wstring dir = ToWide(p->oscBuf.substr(head.size()));
+    size_t semi = p->oscBuf.find(';', head.size());
+    if (semi == std::string::npos) return 1;
+    std::string code = p->oscBuf.substr(head.size(), semi - head.size());
+    if (code.size() > 11 || code.find_first_not_of("-0123456789") != std::string::npos) code.clear();
+    std::wstring dir = ToWide(p->oscBuf.substr(semi + 1));
     if (!IsLocalDir(dir)) return 1;
     p->cwd = dir;
     bool first = !p->integrated;
+    bool ended = p->integrated && !p->atPrompt;  // a command sent from the box has just finished
     p->integrated = p->atPrompt = true;
     PostMessage(g_hwnd, WM_APP_LAYOUT, first, (LPARAM)p);
+    if (ended) PostMessage(g_hwnd, WM_APP_PROMPT, (WPARAM)(INT_PTR)(code.empty() ? kNoExit : atoi(code.c_str())), (LPARAM)p);
   }
   return 1;
 }
@@ -597,11 +623,12 @@ static Pane* NewPane() {
   return p;
 }
 
-// Prompt de PowerShell que avisa a warp-lite (OSC 9;9;<token>;<ruta>) y deja solo un "> " gris.
+// Prompt de PowerShell que avisa a warp-lite (OSC 9;9;<token>;<código de salida>;<ruta>) y deja solo
+// un "> " gris.
 static std::wstring IntegrationArgs(const std::string& token) {
-  std::wstring prompt = L"function global:prompt { $e = [char]27; $b = [char]7; "
+  std::wstring prompt = L"function global:prompt { $c = $global:LASTEXITCODE -as [int]; $e = [char]27; $b = [char]7; "
                         L"$p = $executionContext.SessionState.Path.CurrentLocation.ProviderPath; "
-                        L"[Console]::Write(\"$e]9;9;" + ToWide(token) + L";$p$b\"); \"$e[90m> $e[0m\" }; ";
+                        L"[Console]::Write(\"$e]9;9;" + ToWide(token) + L";$c;$p$b\"); \"$e[90m> $e[0m\" }; ";
   // El aviso va aparte: PSReadLine redibuja el texto del prompt y no entiende OSC.
   std::wstring script = prompt +
       // Lista de órdenes para colorear la caja de entrada; se escribe en segundo plano.
@@ -1028,14 +1055,19 @@ static bool LaunchesExe(const std::string& cmd) {
   return memo[exe] = n > 4 && n < MAX_PATH && _wcsicmp(buf + n - 4, L".exe") == 0;
 }
 
-static int AgentKind(const std::string& cmd) {
+// The program's name in lower case, without its folder or extension (.exe, .cmd, .ps1, .bat).
+static std::string ProgramName(const std::string& cmd) {
   std::string exe = ProgramOf(cmd);
-  if (exe.empty()) return AGENT_NONE;
   size_t slash = exe.find_last_of("\\/");
   if (slash != std::string::npos) exe = exe.substr(slash + 1);
   std::transform(exe.begin(), exe.end(), exe.begin(), [](char c) { return (char)tolower((unsigned char)c); });
   for (const char* ext : {".exe", ".cmd", ".ps1", ".bat"})
     if (exe.size() > strlen(ext) && exe.compare(exe.size() - strlen(ext), strlen(ext), ext) == 0) exe.resize(exe.size() - strlen(ext));
+  return exe;
+}
+
+static int AgentKind(const std::string& cmd) {
+  std::string exe = ProgramName(cmd);
   return exe == "claude" ? AGENT_CLAUDE : exe == "codex" ? AGENT_CODEX : AGENT_NONE;
 }
 
@@ -1322,11 +1354,12 @@ static void ComputeResumes() {
 static void SaveNode(std::ostringstream& o, Node* n) {
   if (n->leaf()) {
     // «run»: tenía algo en marcha (p. ej. ssh + tmux) y se vuelve a lanzar al reabrir; Claude Code
-    // y Codex, con la orden que reanuda su conversación.
+    // y Codex, con la orden que reanuda su conversación. An ssh waiting to reconnect counts as running.
     auto r = g_resumeCmd.find(n->pane);
     const std::string& cmd = r != g_resumeCmd.end() && !n->pane->runningCmd.empty() ? r->second : n->pane->lastCmd;
+    bool running = !n->pane->runningCmd.empty() || n->pane->recon.state == RC_WAITING;
     o << "L " << HexEncode(cmd) << " " << HexEncode(ToUtf8(n->pane->cwd))
-      << (n->pane->runningCmd.empty() || n->pane->lastCmd.empty() ? "" : " run") << "\n";
+      << (!running || n->pane->lastCmd.empty() ? "" : " run") << "\n";
   } else {
     o << "S " << (n->vertical ? 1 : 0) << " " << n->ratio << "\n";
     SaveNode(o, n->a);
@@ -1704,6 +1737,7 @@ static std::wstring ClipboardAsPaths() {
 }
 
 static void PasteText(Pane* p, std::wstring w);
+static void StopReconnect(Pane* p);
 
 static void Paste(Pane* p) {
   if (!OpenClipboard(g_hwnd)) return;
@@ -1720,6 +1754,7 @@ static void Paste(Pane* p) {
 // Escribe texto como un pegado: en la caja de entrada o, si hay un programa en marcha, a él.
 static void PasteText(Pane* p, std::wstring w) {
   if (w.empty()) return;
+  StopReconnect(p);  // pasting is typing: the user takes over
   if (EditorActive(p)) {  // en la caja de entrada: una sola línea
     std::wstring t;
     for (wchar_t ch : w) {
@@ -2519,6 +2554,8 @@ static void SubmitEditor(Pane* p) {
     p->submittedCmd = u;
     if (u != "exit" && u != "logout") p->lastCmd = u;
   }
+  p->recon = Reconnect{};  // a new run (it also stops a reconnect loop: the user typed something)
+  p->recon.cmd = u;
   p->edit.clear();
   p->caret = 0;
   p->histPos = -1;
@@ -2593,6 +2630,248 @@ static int CommandExists(Pane* p, const std::wstring& tok) {
   if (!ok && !p->cmdsLoaded) return -1;
   p->existsMemo[low] = ok;
   return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect: when the home internet blips, ssh dies with «client_loop: send disconnect: Connection
+// reset» (or «closed by remote host», «Broken pipe»…) and exit code 255, while tmux lives on in the
+// server. Warp launches the same command again, 2, 4, 8, 16 and then every 30 s, until it stays
+// connected. Only ssh to a login shell (or a -N tunnel) and to tmux/screen commands that reattach: any
+// other remote command could repeat what it already did. Never on a normal exit (exit, Ctrl+D, tmux
+// detach: code 0), on «~.», or on errors that retrying won't fix (permission denied, host key). Esc or
+// typing in the pane stops it; the state lives in the pane, so closing it or quitting leaves nothing.
+
+static void ScriptLog(const std::wstring& r);
+
+// Is that command ssh to a login shell or tunnel, or to tmux or screen reattaching a session?
+static bool Reconnectable(const std::string& cmd) {
+  if (ProgramName(cmd) != "ssh") return false;
+  std::vector<std::string> a = SplitArgs(cmd);
+  bool dest = false, opts = true;
+  std::string remote;
+  for (size_t i = !a.empty() && a[0] == "&" ? 2 : 1; i < a.size(); i++) {
+    const std::string& t = a[i];
+    if (opts && t == "--") {
+      opts = false;
+    } else if (opts && t.size() > 1 && t[0] == '-') {  // -t, -tt, -p 22, -p22, -o Opt=x… (also after the host)
+      for (size_t k = 1; k < t.size(); k++)
+        if (strchr("BbcDEeFIiJLlmOoPpRSWw", t[k])) {  // takes a value: the rest of the word or the next one
+          if (k + 1 == t.size()) i++;
+          break;
+        }
+    } else if (!dest) {
+      dest = true;
+    } else {
+      for (; i < a.size(); i++) remote += a[i] + " ";
+    }
+  }
+  if (!dest) return false;
+  for (char& c : remote)
+    if (c == '"' || c == '\'') c = ' ';
+  std::vector<std::string> w = SplitArgs(remote);
+  if (w.empty()) return true;
+  std::string prog = w[0].substr(w[0].find_last_of('/') + 1);
+  if (prog == "tmux") {
+    size_t k = 1;
+    while (k < w.size() && w[k][0] == '-') k += w[k] == "-L" || w[k] == "-S" || w[k] == "-f" || w[k] == "-c" || w[k] == "-T" ? 2 : 1;
+    if (k >= w.size()) return false;  // bare tmux: a new session every time
+    const std::string& sub = w[k];
+    if (sub == "a" || sub == "at" || sub == "att" || sub == "attach" || sub == "attach-session") return true;
+    if (sub != "new" && sub != "new-session") return false;
+    for (size_t j = k + 1; j < w.size(); j++) {  // new -A (also -dA…): attach if the session exists
+      size_t at = w[j].find('A');
+      if (w[j][0] == '-' && at != std::string::npos && w[j].find_first_not_of("dDEPX", 1) == at) return true;
+    }
+    return false;
+  }
+  if (prog == "screen")  // -r, -R, -x, -dR, -DR, -RR…
+    for (size_t j = 1; j < w.size(); j++)
+      if (w[j].size() > 1 && w[j][0] == '-' && w[j].find_first_of("rRx", 1) != std::string::npos) return true;
+  return false;
+}
+
+enum { SSH_OTHER, SSH_FATAL, SSH_LOST, SSH_UNREACHABLE };
+static const wchar_t* const kSshKind[] = {L"other", L"fatal", L"lost", L"unreachable"};
+
+// What ssh's last lines say: an error that retrying won't fix, an established connection that dropped,
+// or a connection that couldn't be made (network or server down).
+static int SshFailure(const std::wstring& text) {
+  std::wstring t = Lower(text);
+  auto has = [&](std::initializer_list<const wchar_t*> l) {
+    return std::any_of(l.begin(), l.end(), [&](const wchar_t* s) { return t.find(s) != std::wstring::npos; });
+  };
+  if (has({L"permission denied", L"host key verification failed", L"remote host identification has changed",
+           L"too many authentication failures", L"authentication failed", L"unable to negotiate",
+           L"bad configuration option", L"usage: ssh"}))
+    return SSH_FATAL;
+  // Before the «lost» ones: «ssh: connect to host fr port 22: Connection timed out».
+  if (has({L"connect to host", L"could not resolve hostname", L"kex_exchange_identification", L"banner exchange",
+           L"connection closed by"}))
+    return SSH_UNREACHABLE;
+  if (has({L"client_loop:", L"closed by remote host", L"read from remote host", L"packet_write_wait", L"write failed",
+           L"broken pipe", L"connection reset", L"connection timed out", L"connection abort", L"not responding"}))
+    return SSH_LOST;
+  return SSH_OTHER;
+}
+
+// ssh's last lines: up to three rows above the prompt that came back, never past the prompt row where
+// the command was typed (with the lock taken).
+static std::wstring SshTail(Pane* p) {
+  int cur = (int)p->sb.size() + p->cursor.row;
+  std::wstring t;
+  for (int line = cur; line >= 0 && line > cur - 4; line--) {
+    std::wstring row = AbsLineText(p, line);
+    if (row.rfind(L"> ", 0) == 0) {
+      if (line == cur) continue;
+      break;
+    }
+    t = row + t;
+  }
+  return t;
+}
+
+// Pruebas (--script): each step of the loop goes to <sesión>.bench.
+static void ReconnectLog(const std::wstring& s) {
+  if (!g_script.empty()) ScriptLog(L"reconnect: " + s);
+}
+
+static DWORD WINAPI NetWatchThread(LPVOID) {
+  typedef DWORD(WINAPI * PFN_NotifyAddrChange)(PHANDLE, LPOVERLAPPED);
+  HMODULE m = LoadLibraryExW(L"iphlpapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  auto notify = m ? (PFN_NotifyAddrChange)GetProcAddress(m, "NotifyAddrChange") : nullptr;
+  while (notify && notify(nullptr, nullptr) == NO_ERROR) {  // blocks until an address changes
+    PostMessage(g_hwnd, WM_APP_NETCHANGE, 0, 0);
+    Sleep(1000);
+  }
+  return 0;
+}
+
+// Network changes (Wi-Fi back, a new address): panes waiting to reconnect try soon instead of waiting
+// out their backoff. Watched from the first reconnect on.
+static void StartNetWatch() {
+  static bool started = false;
+  if (started) return;
+  started = true;
+  if (HANDLE t = CreateThread(nullptr, 0, NetWatchThread, nullptr, 0, nullptr)) CloseHandle(t);
+}
+
+static void OnNetworkChange() {
+  static DWORD last = 0;
+  DWORD now = GetTickCount();
+  if (last && now - last < 10000) return;  // a flapping network doesn't make them hammer
+  int k = 0;
+  for (Pane* p : g_live) {
+    Reconnect& r = p->recon;
+    DWORD due = now + 1500 + 700 * k;  // a moment for DHCP and DNS, and not all panes at once
+    if (r.state != RC_WAITING || (int)(r.due - due) <= 0) continue;
+    r.due = due, k++, last = now;
+    ReconnectLog(L"network changed -> attempt " + std::to_wstring(r.attempt) + L" sooner");
+  }
+}
+
+// Esc or typing in the pane: the loop stops (a later drop starts a new one).
+static void StopReconnect(Pane* p) {
+  Reconnect& r = p->recon;
+  if (r.state == RC_OFF) return;
+  r.state = RC_OFF;
+  r.attempt = 0;
+  r.byWarp = false;  // an attempt still connecting that fails doesn't start the loop again
+  ReconnectLog(L"cancelled");
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// The prompt is back after a command sent from the box (code: its exit code). For an ssh that can
+// reconnect, what happened is decided a moment later, when its last lines are surely on the screen.
+static void CommandEnded(Pane* p, int code) {
+  Reconnect& r = p->recon;
+  if (!Reconnectable(r.cmd)) return;
+  r.ended = true;
+  r.exit = code;
+  r.endedAt = GetTickCount();
+}
+
+static void ScheduleReconnect(Pane* p, const std::wstring& why) {
+  Reconnect& r = p->recon;
+  r.attempt++;
+  DWORD wait = std::min<DWORD>(30000, 1000u << std::min(r.attempt, 5));  // 2, 4, 8, 16, 30, 30… s
+  r.state = RC_WAITING;
+  r.due = r.endedAt + wait + (DWORD)(((uintptr_t)p >> 4) ^ GetTickCount()) % (wait / 10);  // + up to 10 %: panes apart
+  StartNetWatch();
+  ReconnectLog(why + L" -> attempt " + std::to_wstring(r.attempt) + L" in " + std::to_wstring(wait / 1000) + L"s");
+}
+
+static void ClassifyEnd(Pane* p) {
+  Reconnect& r = p->recon;
+  r.ended = false;
+  EnterCriticalSection(&p->cs);
+  std::wstring tail = SshTail(p);
+  LeaveCriticalSection(&p->cs);
+  // 255 is ssh's own error; any other code is the remote command's (0: exit, Ctrl+D, tmux detach).
+  int kind = r.exit != kNoExit && r.exit != 255 ? SSH_OTHER : SshFailure(tail);
+  bool trying = r.state == RC_TRYING;
+  // Couldn't connect at all: again only inside the loop or for Warp's own relaunch (Warp started
+  // before the network), so that a mistyped host isn't retried forever.
+  bool again = kind == SSH_LOST || (kind == SSH_UNREACHABLE && (trying || r.byWarp));
+  std::wstring why = L"exit " + (r.exit == kNoExit ? std::wstring(L"?") : std::to_wstring(r.exit)) + L" " + kSshKind[kind];
+  if (again) return ScheduleReconnect(p, why);
+  r.state = RC_OFF;
+  r.attempt = 0;
+  ReconnectLog(why + (trying ? L" -> stop" : L" -> no"));
+}
+
+// An attempt: the command goes to the shell as if typed in the box and Enter pressed.
+static void LaunchReconnect(Pane* p) {
+  Reconnect r = p->recon;
+  p->edit = ToWide(r.cmd);
+  p->caret = p->edit.size();
+  SubmitEditor(p);  // a new run: p->recon starts over
+  p->recon.byWarp = true;
+  p->recon.state = RC_TRYING;
+  p->recon.attempt = r.attempt;
+  p->recon.launched = GetTickCount();
+  ReconnectLog(L"attempt " + std::to_wstring(r.attempt) + L" launched");
+}
+
+static std::wstring ReconnectLabel(Pane* p) {
+  const Reconnect& r = p->recon;
+  wchar_t b[160] = L"";
+  if (r.state == RC_WAITING)
+    swprintf(b, 160, T(S_RECONNECT_WAIT), (std::max(0, (int)(r.due - GetTickCount())) + 999) / 1000, r.attempt);
+  else if (r.state == RC_TRYING)
+    swprintf(b, 160, T(S_RECONNECTING), r.attempt);
+  return b;
+}
+
+// For the tests: "waiting N" / "trying N" (attempt N), "idle" at the prompt, "running" otherwise.
+static std::wstring ReconnectState(Pane* p) {
+  const Reconnect& r = p->recon;
+  if (r.state != RC_OFF) return (r.state == RC_WAITING ? L"waiting " : L"trying ") + std::to_wstring(r.attempt);
+  return p->atPrompt && !r.ended ? L"idle" : L"running";
+}
+
+// Every 250 ms: decide on the commands that ended, launch the attempts that are due and notice the
+// ones that connected (still running, and talking to us for a few seconds).
+static void ReconnectTick() {
+  DWORD now = GetTickCount();
+  bool repaint = false;
+  for (Pane* p : g_live) {
+    Reconnect& r = p->recon;
+    if (r.ended && now - r.endedAt >= 400) ClassifyEnd(p);
+    if (r.state == RC_WAITING && (int)(now - r.due) >= 0) {
+      if (!p->edit.empty()) StopReconnect(p);  // something is written in the box: the user took over
+      else if (p->atPrompt) LaunchReconnect(p);
+    } else if (r.state == RC_TRYING && !p->atPrompt) {
+      if (!r.outSeen && (int)(p->lastOut - r.launched) > 1500) r.outSeen = now;  // not the echo of the command
+      if ((r.outSeen && now - r.outSeen >= 2500) || now - r.launched >= 45000) {
+        r.state = RC_OFF;
+        r.attempt = 0;
+        ReconnectLog(L"connected");
+      }
+    }
+    std::wstring label = ReconnectLabel(p);
+    if (label != r.label) r.label = label, repaint = true;
+  }
+  if (repaint) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
 // ---------------------------------------------------------------------------
@@ -2927,6 +3206,14 @@ static bool HandleKeyDown(WPARAM vk, LPARAM) {
   if (g_tabs.empty()) return false;
   if (HandleShortcut(vk)) return true;
   Pane* p = CurTab().active;
+  // Any key in a pane that is reconnecting stops it (bare modifiers don't); Esc while waiting does
+  // only that.
+  if (p->recon.state != RC_OFF && vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU && vk != VK_LWIN &&
+      vk != VK_RWIN && vk != VK_CAPITAL) {
+    bool waiting = p->recon.state == RC_WAITING;
+    StopReconnect(p);
+    if (vk == VK_ESCAPE && waiting) return true;
+  }
   if (EditorActive(p)) {
     if (!(GetKeyState(VK_SHIFT) & 0x8000) || (vk != VK_PRIOR && vk != VK_NEXT)) return EditorKey(p, vk);
   }
@@ -4999,6 +5286,22 @@ static void DrawFindBar(HDC dc) {
   SetBkMode(dc, OPAQUE);
 }
 
+// Auto-reconnect status: a small card at the top of the pane.
+static void DrawReconnect(HDC dc, Pane* p) {
+  std::wstring msg = ReconnectLabel(p);
+  if (msg.empty()) return;
+  SelectObject(dc, g_uiFont);
+  SIZE sz{};
+  GetTextExtentPoint32W(dc, msg.c_str(), (int)msg.size(), &sz);
+  RECT c = p->content;
+  int w = std::min<int>(sz.cx + Px(32), c.right - c.left - Px(16)), x = (c.left + c.right - w) / 2;
+  RECT r{x, c.top + Px(8), x + w, c.top + Px(8) + Px(34)};
+  Panel(dc, r);
+  SetBkMode(dc, TRANSPARENT);
+  Text(dc, msg, RECT{r.left + Px(16), r.top, r.right - Px(16), r.bottom}, RGB(0xd0, 0xd0, 0xd0), DT_CENTER | DT_END_ELLIPSIS);
+  SetBkMode(dc, OPAQUE);
+}
+
 static void DrawPicker(HDC dc) {
   Pane* p = g_pick.p;
   if (!g_pick.open || !p || !g_live.count(p)) {
@@ -5198,6 +5501,7 @@ static void Render(HDC dc, int w, int h) {
     DrawPaneHeader(dc, p, p == t.active);
   }
   DrawDividers(dc, t.root);
+  for (Pane* p : ls) DrawReconnect(dc, p);
   DrawFindBar(dc);
   DrawPicker(dc);
   DrawCompletion(dc);
@@ -5235,15 +5539,16 @@ static void PaintDirty() {
   DWORD now = GetTickCount();
   g_lastFrame = now;
   if (!g_backDC || g_tabs.empty() || IsIconic(g_hwnd)) return;
-  bool overlay = g_find.open || g_pick.open || g_sw.open || g_comp.open || (g_upd.stage != UPD_NONE && !g_upd.hidden) || g_dragPane || g_link.p || g_renameTab >= 0;
+  std::vector<Pane*> ls;
+  Leaves(CurTab().root, ls);
+  bool overlay = g_find.open || g_pick.open || g_sw.open || g_comp.open || (g_upd.stage != UPD_NONE && !g_upd.hidden) || g_dragPane || g_link.p || g_renameTab >= 0 ||
+                 std::any_of(ls.begin(), ls.end(), [](Pane* p) { return p->recon.state != RC_OFF; });
   if (overlay || (g_titleDirty && now - g_lastFull >= 250)) {  // títulos: como mucho 4 veces por segundo
     g_titleDirty = false;
     InvalidateRect(g_hwnd, nullptr, FALSE);
     return;
   }
   if (g_titleDirty && !g_frameTimer) SetTimer(g_hwnd, TIMER_FRAME, 250, nullptr), g_frameTimer = true;
-  std::vector<Pane*> ls;
-  Leaves(CurTab().root, ls);
   HDC wdc = GetDC(g_hwnd);
   for (Pane* p : ls) {
     RECT u = DrawPane(g_backDC, p, p == CurTab().active, g_focused, true);
@@ -6326,6 +6631,20 @@ static void RunScriptStep() {
     std::string r = ResumeCommand(ToUtf8(s.substr(11)), "ID");
     ScriptLog(L"resume-cmd: " + (r.empty() ? L"(no)" : ToWide(r)));
     delay = 50;
+  } else if (s.rfind(L"reconnect-cmd:", 0) == 0) {  // would that command be launched again if its connection drops?
+    ScriptLog(L"reconnect-cmd: " + std::wstring(Reconnectable(ToUtf8(s.substr(14))) ? L"yes" : L"no"));
+    delay = 50;
+  } else if (s.rfind(L"reconnect-text:", 0) == 0) {  // what those last lines of ssh mean
+    ScriptLog(L"reconnect-text: " + std::wstring(kSshKind[SshFailure(s.substr(15))]));
+    delay = 50;
+  } else if (s.rfind(L"reconnect-wait:", 0) == 0 && p) {  // until the active pane is in that state (90 s at most)
+    static int waited = 0;
+    if (ReconnectState(p) != s.substr(15) && ++waited < 360) g_scriptPos--, delay = 250;
+    else waited = 0, delay = 300;
+  } else if (s == L"reconnect" && p) {
+    ScriptLog(L"reconnect: " + ReconnectState(p));
+  } else if (s == L"net-change") {  // as if Windows said the network changed
+    OnNetworkChange();
   } else if (s == L"resume") {  // lo que guardaría la sesión para cada panel con Claude Code o Codex
     UpdateRunning();
     ComputeResumes();
@@ -6669,6 +6988,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (p->resumeRun) {  // estaba en marcha al cerrar: se relanza (tmux new -A reengancha)
           p->resumeRun = false;
           SubmitEditor(p);
+          p->recon.byWarp = true;  // if the network isn't up yet (Warp starting with Windows), it reconnects
         } else {
           p->history.push_back(p->edit);
         }
@@ -6689,6 +7009,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_live.count(p)) ClosePane(p);
       return 0;
     }
+    case WM_APP_PROMPT: {  // a command sent from the box has finished (wp: its exit code)
+      Pane* p = (Pane*)lp;
+      if (g_live.count(p)) CommandEnded(p, (int)(INT_PTR)wp);
+      return 0;
+    }
+    case WM_APP_NETCHANGE: OnNetworkChange(); return 0;
     case WM_TIMER:
       if (wp == TIMER_FRAME) {
         KillTimer(hwnd, TIMER_FRAME);
@@ -6712,6 +7038,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           UpdateRunning();
           for (Pane* p : g_live) LoadShellCommands(p);
         }
+        ReconnectTick();
         // Escribe la última orden en el prompt cuando la shell ha terminado de arrancar.
         DWORD now = GetTickCount();
         for (Pane* p : g_live) {
@@ -6775,6 +7102,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       }
       if (cp >= 0xDC00 && cp < 0xE000 && high) cp = 0x10000 + ((high - 0xD800) << 10) + (cp - 0xDC00);
       high = 0;
+      StopReconnect(CurTab().active);  // typing in the pane: the user takes over
       if (EditorActive(CurTab().active)) {
         if (msg == WM_CHAR && cp >= 0x20 && cp != 0x7f) {
           std::wstring t;
