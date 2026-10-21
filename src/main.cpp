@@ -249,7 +249,7 @@ enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, 
            S_LOADING, S_KIND_CMD, S_KIND_DIR, S_KIND_FILE, S_KIND_PARAM, S_UPD_AVAIL, S_UPD_INSTALLING, S_UPD_READY,
            S_UPD_FAILED, S_UPD_INSTALL, S_UPD_RESTART, S_UPD_RETRY, S_UPD_CHECK, S_UPD_AUTO, S_UPD_LATEST, S_UPD_CHECKING,
            S_UPD_OFFLINE, S_UPD_DOWNLOADING, S_SWITCH, S_OTHER_WINDOW, S_FONT_MENU, S_OTHER_FONTS, S_FONT_FAILED,
-           S_FONT_SIZE, S_TEXT_BRIGHTNESS, S_DEFAULT, S_RECONNECTING, S_RECONNECT_WAIT, S_COUNT };
+           S_FONT_SIZE, S_TEXT_BRIGHTNESS, S_DEFAULT, S_RECONNECTING, S_RECONNECT_WAIT, S_REOPEN, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
@@ -259,7 +259,8 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Retry", L"Check for updates", L"Update automatically", L"Warp is up to date", L"Checking for updates…",
      L"Couldn't check for updates", L"Downloading %s…", L"Search terminals…", L"other window", L"Font",
      L"Other installed", L"Couldn't download %s", L"Font size", L"Text brightness", L"default",
-     L"Reconnecting… (attempt %d) — Esc to cancel", L"Reconnecting in %d s (attempt %d) — Esc to cancel"},
+     L"Reconnecting… (attempt %d) — Esc to cancel", L"Reconnecting in %d s (attempt %d) — Esc to cancel",
+     L"Reopen on restart"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
@@ -269,7 +270,8 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Warp está al día", L"Buscando actualizaciones…", L"No se pudo comprobar si hay actualizaciones",
      L"Descargando %s…", L"Buscar terminales…", L"otra ventana", L"Fuente", L"Otras instaladas",
      L"No se pudo descargar %s", L"Tamaño de letra", L"Brillo del texto", L"predeterminado",
-     L"Reconectando… (intento %d) — Esc para cancelar", L"Reconectando en %d s (intento %d) — Esc para cancelar"},
+     L"Reconectando… (intento %d) — Esc para cancelar", L"Reconectando en %d s (intento %d) — Esc para cancelar",
+     L"Abrir al reiniciar"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -288,9 +290,12 @@ static int g_cellW = 8, g_cellH = 16;
 static int g_textDy = 0;  // margen vertical del texto dentro de la celda
 static std::wstring g_sessionPath;
 // Varias ventanas: un proceso por ventana, cada una con su fichero window-<id>.txt en g_windowDir.
+// The main window (window-main.txt, the first one Warp opens) always comes back at the next start;
+// the others only with «Reopen on restart» (g_reopen) or after an update restart (g_restartAll).
 static std::wstring g_windowDir;
-static bool g_keepSession = false;  // al cerrar, conservar la sesión (salir de todo / apagar Windows)
-static UINT g_msgQuitAll;           // mensaje registrado: «cerrar todas guardándolas»
+static bool g_isMain = false, g_reopen = false, g_restartAll = false;
+static bool g_keepSession = false;  // closing for quit-all / Windows shutdown: its last pane closing doesn't discard it
+static UINT g_msgQuitAll;           // mensaje registrado: «cerrar todas» (wParam 1: update restart, all come back)
 static UINT g_msgListPanes, g_msgFocusPane;  // selector de terminales entre ventanas (Ctrl+Shift+K)
 static std::wstring g_openDir;      // --cd <carpeta> («Abrir Warp aquí»): pestaña nueva ya en ella
 // Las ventanas de un mismo Warp (mismo %APPDATA%\warp-lite, o la misma carpeta en las pruebas) se
@@ -918,6 +923,8 @@ static Pane* NewTab(int at = -1, const std::wstring& dir = L"") {
   return p;
 }
 
+static void SaveEmptyMain();
+
 static void ClosePane(Pane* p) {
   int ti = TabIndexOf(p);
   if (ti < 0) return;
@@ -928,7 +935,9 @@ static void ClosePane(Pane* p) {
     delete n;
     DestroyPane(p);
     if (g_tabs.empty()) {
-      // Último panel cerrado: la ventana se cierra y se descarta su sesión (WM_DESTROY).
+      // Último panel cerrado: la ventana se cierra y se descarta su sesión (WM_DESTROY); the main one
+      // keeps its place and settings and comes back with a new tab.
+      if (g_isMain && !g_keepSession) SaveEmptyMain();
       DestroyWindow(g_hwnd);
       return;
     }
@@ -1377,6 +1386,13 @@ static std::string SessionHeader(int active, const RECT* win, bool max) {
   return o.str();
 }
 
+// Last lines of a window file (after the tabs, so older versions still read those): «reopen 0/1»
+// («Reopen on restart»; versions before it wrote no such line) and «restart 1» while it must come
+// back at the next start whatever it says (an update restart, or a tab just moved out to it).
+static std::string SessionFlags(bool reopen, bool restart) {
+  return std::string("reopen ") + (reopen ? "1" : "0") + "\n" + (restart ? "restart 1\n" : "");
+}
+
 static bool WriteSessionFile(const std::wstring& path, const std::string& data) {
   std::wstring tmp = path + L".tmp";
   HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
@@ -1407,6 +1423,7 @@ static void SaveSession() {
     o << "tab " << ai << " " << HexEncode(ToUtf8(t.name)) << (t.hidden ? " hidden" : "") << "\n";
     SaveNode(o, t.root);
   }
+  o << SessionFlags(g_reopen, g_restartAll);
   std::string data = o.str();
   std::wstring tmp = g_sessionPath + L".tmp";
   HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
@@ -1416,6 +1433,19 @@ static void SaveSession() {
   CloseHandle(f);
   MoveFileExW(tmp.c_str(), g_sessionPath.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
+
+// The main window with its last tab closed: only its place, size and settings are kept, and it
+// comes back with a new tab (LoadSession finds no tabs).
+static void SaveEmptyMain() {
+  WINDOWPLACEMENT wp{sizeof wp};
+  if (g_windowDir.empty() || g_sessionPath.empty() || !GetWindowPlacement(g_hwnd, &wp)) return;
+  bool max = wp.showCmd == SW_SHOWMAXIMIZED || (wp.showCmd == SW_SHOWMINIMIZED && (wp.flags & WPF_RESTORETOMAXIMIZED));
+  WriteSessionFile(g_sessionPath, SessionHeader(0, &wp.rcNormalPosition, max) + SessionFlags(g_reopen, false));
+}
+
+// Does this window come back at the next start? The main one always; the others with «Reopen on
+// restart» or after an update restart.
+static bool ReopensAtStart() { return g_isMain || g_reopen || g_restartAll; }
 
 static Node* LoadNode(std::istringstream& in, std::vector<Pane*>& created) {
   std::string kind;
@@ -1505,6 +1535,12 @@ static bool LoadSession() {
       in >> g_winRect.left >> g_winRect.top >> g_winRect.right >> g_winRect.bottom >> m;
       g_winMax = m != 0;
       g_hasWinPos = g_winRect.right - g_winRect.left > 100 && g_winRect.bottom - g_winRect.top > 100;
+      continue;
+    }
+    if (word == "reopen" || word == "restart") {  // «restart» only matters at start (SessionPath)
+      int v = 0;
+      in >> v;
+      if (word == "reopen") g_reopen = v != 0;
       continue;
     }
     if (word != "tab") break;
@@ -1963,15 +1999,19 @@ static int OtherWindows() {
   return n;
 }
 
-static BOOL CALLBACK SendQuitAll(HWND h, LPARAM) {
-  wchar_t cls[32];
-  if (GetClassNameW(h, cls, 32) && !wcscmp(cls, L"WarpLite")) PostMessageW(h, g_msgQuitAll, 0, 0);
-  return TRUE;
+static std::vector<HWND> SiblingWindows();
+
+// Closes every window of this Warp (Ctrl+Shift+Q, the update restart), never those of another one
+// (a test's, or the real one from a test). update: they all come back at the next start.
+static void QuitAll(bool update) {
+  for (HWND h : SiblingWindows()) PostMessageW(h, g_msgQuitAll, update ? 1 : 0, 0);
+  PostMessageW(g_hwnd, g_msgQuitAll, update ? 1 : 0, 0);
 }
 
 // Lleva una pestaña (o un solo panel) a una ventana nueva en el punto de la pantalla donde
 // se suelta: se escribe su sesión, se abre otro warp-lite con ella y aquí se cierra. Lo que
-// estaba en marcha (ssh + tmux) se relanza allí.
+// estaba en marcha (ssh + tmux) se relanza allí. The new window doesn't reopen at restart; its file
+// says «restart 1» only until it saves, so a Warp starting meanwhile opens it instead of discarding it.
 static void Detach(int tabIdx, Pane* single, POINT screen) {
   if (tabIdx < 0 || tabIdx >= (int)g_tabs.size()) return;
   Tab& t = g_tabs[tabIdx];
@@ -1987,6 +2027,7 @@ static void Detach(int tabIdx, Pane* single, POINT screen) {
   ComputeResumes();
   o << SessionHeader(0, &win, false) << "tab " << ai << " " << HexEncode(ToUtf8(single ? L"" : t.name)) << "\n";
   SaveNode(o, root);
+  o << SessionFlags(false, true);
   std::wstring file = NewWindowFile();
   if (!WriteSessionFile(file, o.str())) return;
   LaunchWindow(file);
@@ -2026,7 +2067,7 @@ static bool HandleShortcut(WPARAM vk) {
       case 'V': Paste(act); return true;
       case 'F': OpenFind(act); return true;  // Ctrl+Shift+F: el de Warp
       case 'K': OpenSwitcher(); return true;  // Ctrl+Shift+K: saltar a cualquier terminal
-      case 'Q': EnumWindows(SendQuitAll, 0); return true;  // cerrar todas las ventanas guardándolas
+      case 'Q': QuitAll(false); return true;  // close every window (the main one and «Reopen on restart» ones come back)
       case VK_OEM_4: CyclePane(-1); InvalidateRect(g_hwnd, nullptr, FALSE); return true;  // Ctrl+Shift+{
       case VK_OEM_6: CyclePane(+1); InvalidateRect(g_hwnd, nullptr, FALSE); return true;  // Ctrl+Shift+}
       case VK_PRIOR:
@@ -6017,21 +6058,21 @@ static void OnUpdateInstalled(InstallJob* job) {
 }
 
 // Reiniciar: se abre el Warp instalado (espera a que se cierren todas) y se cierran todas
-// guardándose, como Ctrl+Shift+Q; al abrir, vuelven todas las ventanas.
-static void RestartForUpdate() {
-  std::wstring exe = InstalledExe();
+// guardándose; al abrir vuelven todas las ventanas, also those that don't reopen at a normal start
+// (they keep that, and a later close discards them). exe: the installed one (a test: itself).
+static void RestartForUpdate(const std::wstring& exe) {
   std::wstring cmd = L"\"" + exe + L"\" --relaunch";
   STARTUPINFOW si{sizeof si};
   PROCESS_INFORMATION pi{};
   if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) return;
   CloseHandle(pi.hProcess);
   CloseHandle(pi.hThread);
-  EnumWindows(SendQuitAll, 0);
+  QuitAll(true);
 }
 
 static void UpdateAction() {
   if (g_upd.stage == UPD_AVAILABLE || g_upd.stage == UPD_FAILED) InstallUpdate();
-  else if (g_upd.stage == UPD_READY) RestartForUpdate();
+  else if (g_upd.stage == UPD_READY) RestartForUpdate(InstalledExe());
 }
 
 // ---------------------------------------------------------------------------
@@ -6699,9 +6740,24 @@ static void RunScriptStep() {
   } else if (s == L"close") {  // como pulsar la X de esta ventana
     PostMessage(g_hwnd, WM_CLOSE, 0, 0);
     return;
+  } else if (s == L"quit-all-targets") {  // what quit-all would close (sends nothing): this Warp's other windows
+    int mine = (int)SiblingWindows().size();
+    ScriptLog(L"quit-all-targets: " + std::to_wstring(mine) + L" of this Warp, " + std::to_wstring(OtherWindows() - mine) +
+              L" of others");
   } else if (s == L"quit-all") {
-    EnumWindows(SendQuitAll, 0);
+    QuitAll(false);
     return;
+  } else if (s == L"update-restart") {  // like «Restart» after an update, relaunching this same exe
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    RestartForUpdate(exe);
+    return;
+  } else if (s.rfind(L"reopen:", 0) == 0) {  // as if toggled in the title-bar menu
+    if (!g_isMain) g_reopen = s.substr(7) == L"on", SaveSession();
+  } else if (s == L"window-info") {  // main or not, «Reopen on restart» and its tabs
+    std::wstring r = std::wstring(L"window: ") + (g_isMain ? L"main" : L"other") + L" reopen=" + (g_reopen ? L"1" : L"0");
+    for (auto& t : g_tabs) r += L" [" + (t.name.empty() ? ShortTitle(t.active) : t.name) + L"]";
+    ScriptLog(r);
   } else if (s.rfind(L"hide-tab", 0) == 0) {
     HideTab(g_activeTab);
   } else if (s == L"vtabs") {
@@ -6899,6 +6955,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           AppendMenuW(bright, MF_STRING | (c == g_termFg ? MF_CHECKED : 0), 600 + i, t.c_str());
         }
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)bright, T(S_TEXT_BRIGHTNESS));
+        // This window at the next start: the main one always comes back (checked, can't be changed).
+        if (!g_windowDir.empty())
+          AppendMenuW(menu, MF_STRING | (g_isMain || g_reopen ? MF_CHECKED : 0) | (g_isMain ? MF_GRAYED : 0), 5, T(S_REOPEN));
         AppendMenuW(menu, MF_STRING | (StartsWithWindows() ? MF_CHECKED : 0), 1, T(S_STARTUP));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         wchar_t upd[160] = L"";
@@ -6918,6 +6977,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           if (g_upd.autoUpdate && g_upd.stage == UPD_AVAILABLE) InstallUpdate();
         }
         if (cmd == 4) UpdateAction();
+        if (cmd == 5 && !g_isMain) {
+          g_reopen = !g_reopen;
+          SaveSession();
+        }
         if (cmd >= 100 && cmd < 100 + kLangCount) {
           g_lang = cmd - 100;
           SaveSession();
@@ -7419,8 +7482,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (LOWORD(lp) == HTCLIENT) return TRUE;  // lo fija WM_MOUSEMOVE
       break;
     case WM_CLOSE:
-      // Cerrar con la X guarda la ventana: al volver a abrir Warp vuelven todas. Para descartarla
-      // se cierran sus pestañas (al quedarse vacía se borra su sesión, ver WM_DESTROY).
+      // Closing with the X (or quit-all): the main window and those with «Reopen on restart» are kept
+      // and come back at the next start; the others are discarded (WM_DESTROY).
       SaveSession();
       DestroyWindow(hwnd);
       return 0;
@@ -7429,11 +7492,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       SaveSession();
       return TRUE;
     case WM_ENDSESSION:
-      if (wp) SaveSession();
+      // Windows shutting down or logging off, like Ctrl+Shift+Q (the process may end without WM_DESTROY).
+      if (!wp) g_keepSession = false;  // cancelled
+      else if (ReopensAtStart()) SaveSession();
+      else if (!g_windowDir.empty() && !g_sessionPath.empty()) DeleteFileW(g_sessionPath.c_str());
       return 0;
     case WM_DESTROY: {
-      if (g_tabs.empty() && !g_keepSession && !g_windowDir.empty() && !g_sessionPath.empty())
-        DeleteFileW(g_sessionPath.c_str());  // se cerraron todas sus pestañas: la ventana se descarta
+      // Se cerraron todas sus pestañas: la ventana se descarta (the main one keeps an empty session,
+      // ClosePane). Closed with tabs: only the windows that come back at the next start are kept.
+      bool keep = g_isMain || (ReopensAtStart() && (!g_tabs.empty() || g_keepSession));
+      if (!keep && !g_windowDir.empty() && !g_sessionPath.empty()) DeleteFileW(g_sessionPath.c_str());
       std::vector<Pane*> all(g_live.begin(), g_live.end());
       for (Pane* p : all) DestroyPane(p);
       g_tabs.clear();
@@ -7452,6 +7520,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   }
   if (msg == g_msgQuitAll && g_msgQuitAll) {
     g_keepSession = true;
+    if (wp) g_restartAll = true;  // update restart: this window comes back too, once
     PostMessageW(hwnd, WM_CLOSE, 0, 0);
     return 0;
   }
@@ -7497,11 +7566,40 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 static HANDLE g_windowMutex;
+static const wchar_t* kMainFile = L"\\window-main.txt";  // the main window's, in g_windowDir
+
+static std::wstring FileName(const std::wstring& path) { return path.substr(path.find_last_of(L'\\') + 1); }
+
+// Mutex names of this Warp (instance key): a test's window-main.txt never clashes with the real one.
+static std::wstring InstanceMutex(const std::wstring& what) {
+  wchar_t key[16];
+  swprintf(key, 16, L"%08x", (unsigned)(ULONG_PTR)InstanceKey());
+  return L"Local\\warp-lite-" + std::wstring(key) + L"-" + what;
+}
+
+// Is that file open in another window of this Warp? Also in one of the version before, which named the
+// mutex without the instance key (still open if the new one starts before «Restart»). wait: after an
+// update restart, how long the old windows may still take to exit.
+static bool WindowFileOpen(const std::wstring& file, DWORD wait) {
+  for (const std::wstring& name : {InstanceMutex(FileName(file)), L"Local\\warp-lite-" + FileName(file)}) {
+    HANDLE m = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, name.c_str());
+    if (!m) continue;
+    DWORD r = WaitForSingleObject(m, wait);
+    bool gone = r == WAIT_OBJECT_0 || r == WAIT_ABANDONED;
+    if (gone) ReleaseMutex(m);
+    CloseHandle(m);
+    if (!gone) return true;
+  }
+  return false;
+}
 
 // Cada ventana «posee» su fichero mientras está abierta (mutex con el nombre del fichero).
 static bool ClaimWindowFile(const std::wstring& file) {
-  std::wstring name = L"Local\\warp-lite-" + file.substr(file.find_last_of(L'\\') + 1);
-  HANDLE m = CreateMutexW(nullptr, TRUE, name.c_str());
+  if (HANDLE old = OpenMutexW(SYNCHRONIZE, FALSE, (L"Local\\warp-lite-" + FileName(file)).c_str())) {
+    CloseHandle(old);  // open in a window of the version before
+    return false;
+  }
+  HANDLE m = CreateMutexW(nullptr, TRUE, InstanceMutex(FileName(file)).c_str());
   if (!m) return false;
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
     CloseHandle(m);
@@ -7511,52 +7609,99 @@ static bool ClaimWindowFile(const std::wstring& file) {
   return true;
 }
 
-// Sesión de esta ventana. Sin --window: restaura todas las ventanas guardadas (esta se queda la
-// primera libre y abre las demás); si están todas abiertas, abre una ventana nueva.
-static std::wstring SessionPath(const std::wstring& windowArg) {
+// Does that saved window come back at a start? «reopen 1» or «restart 1» (SessionFlags), or a file of a
+// version before the main window, which reopened them all: then this once too.
+static bool ReopensFile(const std::wstring& file) {
+  HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return false;
+  std::string data(GetFileSize(f, nullptr), 0);
+  DWORD r = 0;
+  ReadFile(f, data.data(), (DWORD)data.size(), &r, nullptr);
+  CloseHandle(f);
+  data.resize(r);
+  return data.rfind("BW1", 0) == 0 && (data.find("\nreopen ") == std::string::npos ||
+                                       data.find("\nreopen 1\n") != std::string::npos ||
+                                       data.find("\nrestart 1\n") != std::string::npos);
+}
+
+// Sesión de esta ventana. Sin --window: la ventana principal (window-main.txt) y las guardadas que
+// vuelven («Reopen on restart», or all of them after an update restart): this one takes the main one
+// if it's free (otherwise the first free one) and opens the others; the rest are discarded. With all
+// of them open, a new window. relaunch: after an update, the old windows may still be exiting.
+static std::wstring SessionPath(const std::wstring& windowArg, bool relaunch) {
   wchar_t buf[MAX_PATH];
+  g_isMain = true;  // a single session file (tests, or no %APPDATA%) is the only window
   if (GetEnvironmentVariableW(L"WARPLITE_SESSION", buf, MAX_PATH)) return buf;  // pruebas: un fichero fijo
   if (GetEnvironmentVariableW(L"WARPLITE_DIR", buf, MAX_PATH)) {
     g_windowDir = buf;
   } else {
     if (!GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) return L"warp-lite-session.txt";
     g_windowDir = std::wstring(buf) + L"\\warp-lite";
-    // Se llamaba better-warp, y antes había una sola sesión: se convierten en la primera ventana.
+    // Se llamaba better-warp, y antes había una sola sesión: se convierten en la primera ventana
+    // (only into a folder without windows: copied on every start, it came back whenever window-1.txt was gone).
     CreateDirectoryW(g_windowDir.c_str(), nullptr);
-    std::wstring single = g_windowDir + L"\\session.txt";
-    CopyFileW((std::wstring(buf) + L"\\BetterWarp\\session.txt").c_str(), single.c_str(), TRUE);
-    if (GetFileAttributesW(single.c_str()) != INVALID_FILE_ATTRIBUTES)
-      MoveFileExW(single.c_str(), (g_windowDir + L"\\window-1.txt").c_str(), 0);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((g_windowDir + L"\\window-*.txt").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+      FindClose(h);
+    } else {
+      std::wstring single = g_windowDir + L"\\session.txt";
+      CopyFileW((std::wstring(buf) + L"\\BetterWarp\\session.txt").c_str(), single.c_str(), TRUE);
+      if (GetFileAttributesW(single.c_str()) != INVALID_FILE_ATTRIBUTES)
+        MoveFileExW(single.c_str(), (g_windowDir + L"\\window-1.txt").c_str(), 0);
+    }
   }
+  g_isMain = false;
   CreateDirectoryW(g_windowDir.c_str(), nullptr);
+  std::wstring mainFile = g_windowDir + kMainFile;
   if (!windowArg.empty()) {
-    ClaimWindowFile(windowArg);
+    // Opened by another window (restoring it, or a tab moved out): if a window has it already, nothing to do.
+    if (!ClaimWindowFile(windowArg)) return L"";
+    g_isMain = !_wcsicmp(windowArg.c_str(), mainFile.c_str());
     return windowArg;
   }
+  // One start at a time (e.g. the shortcut clicked twice): only one of them becomes the main window.
+  HANDLE lock = CreateMutexW(nullptr, FALSE, InstanceMutex(L"start").c_str());
+  if (lock) WaitForSingleObject(lock, 15000);
+  DWORD until = GetTickCount() + (relaunch ? 5000 : 0);
+  auto isOpen = [&](const std::wstring& f) {
+    DWORD left = until - GetTickCount();
+    return WindowFileOpen(f, (int)left > 0 ? left : 0);
+  };
   std::vector<std::wstring> files;
   WIN32_FIND_DATAW fd;
   HANDLE h = FindFirstFileW((g_windowDir + L"\\window-*.txt").c_str(), &fd);
   if (h != INVALID_HANDLE_VALUE) {
-    do files.push_back(g_windowDir + L"\\" + fd.cFileName);
+    do
+      if (_wcsicmp(fd.cFileName, kMainFile + 1)) files.push_back(g_windowDir + L"\\" + fd.cFileName);
     while (FindNextFileW(h, &fd));
     FindClose(h);
   }
   std::sort(files.begin(), files.end());
+  // No main window yet (first start of this version, or its file is gone): the first saved window
+  // that comes back becomes it (window-1.txt if there is one); with none, this new one.
+  if (GetFileAttributesW(mainFile.c_str()) == INVALID_FILE_ATTRIBUTES && !isOpen(mainFile))
+    for (auto it = files.begin(); it != files.end(); ++it)
+      if (!isOpen(*it) && ReopensFile(*it) && MoveFileExW(it->c_str(), mainFile.c_str(), 0)) {
+        files.erase(it);
+        break;
+      }
   std::wstring mine;
+  if (!isOpen(mainFile) && ClaimWindowFile(mainFile)) mine = mainFile, g_isMain = true;
   for (auto& file : files) {
-    if (mine.empty()) {
-      if (ClaimWindowFile(file)) mine = file;
+    if (isOpen(file)) continue;  // ya abierta
+    if (!ReopensFile(file)) {
+      DeleteFileW(file.c_str());  // still open when Warp quit (or Windows shut down): discarded
       continue;
     }
-    std::wstring name = L"Local\\warp-lite-" + file.substr(file.find_last_of(L'\\') + 1);
-    HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE, name.c_str());
-    if (m) CloseHandle(m);  // ya abierta
+    if (mine.empty() && ClaimWindowFile(file)) mine = file;
     else LaunchWindow(file);
   }
   if (mine.empty()) {
     mine = NewWindowFile();
     ClaimWindowFile(mine);
   }
+  if (lock) ReleaseMutex(lock), CloseHandle(lock);
   return mine;
 }
 
@@ -7576,9 +7721,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   int argc = 0;
   std::wstring windowArg;
   wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  bool relaunch = false;
   for (int i = 1; i < argc; i++)
-    if (!wcscmp(argv[i], L"--relaunch"))  // tras actualizar: esperar a que se cierren las ventanas viejas
-      for (int t = 0; t < 200 && FindWindowW(L"WarpLite", nullptr); t++) Sleep(100);
+    if (!wcscmp(argv[i], L"--relaunch")) {  // tras actualizar: esperar a que se cierren las ventanas viejas (of this Warp)
+      relaunch = true;
+      for (int t = 0; t < 200 && !SiblingWindows().empty(); t++) Sleep(100);
+    }
   for (int i = 1; i + 1 < argc; i++) {
     if (!wcscmp(argv[i], L"--window")) windowArg = argv[++i];
     else if (!wcscmp(argv[i], L"--cd")) g_openDir = argv[++i];
@@ -7624,7 +7772,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g_upd.testUrl = GetEnvironmentVariableW(L"WARPLITE_UPDATE_URL", nullptr, 0) > 0;
   }
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);  // WIC (pegar imágenes)
-  g_sessionPath = SessionPath(windowArg);
+  g_sessionPath = SessionPath(windowArg, relaunch);
+  if (g_sessionPath.empty()) return 0;  // that window is open already
   LoadUpdateSettings();
   if (g_script.empty() && !windowArg.empty()) {  // pruebas: guion para las ventanas que se abren
     wchar_t sc[2048];
