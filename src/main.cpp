@@ -103,7 +103,7 @@ static const int kGap = 1;           // separación entre paneles (px)
 static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
-enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT };
+enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS };
 enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6 };
 
 // ---------------------------------------------------------------------------
@@ -291,6 +291,8 @@ struct LinkHit {
   Pane* p = nullptr;
   int row = -1, c0 = 0, c1 = 0;  // trozo bajo el ratón
   std::wstring url;
+  std::wstring path;  // or a file/folder that exists (full path)
+  bool dir = false;   // path is a folder
   std::vector<std::array<int, 3>> segs;  // todos los trozos (fila, c0, c1) de una URL partida
 };
 static LinkHit g_link;
@@ -3107,7 +3109,511 @@ static std::vector<UrlSpan> UrlsFrom(Pane* p, int r0, const std::function<const 
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Paths as links, like URLs (Ctrl+hover underlines, Ctrl+click opens): C:\…, C:/…, \\server\share\…
+// and paths relative to the pane's folder, quoted or not, with :line[:col] or (line) behind, also
+// wrapped over several rows. Claude Code wraps at spaces and drops them, indenting the next row, so a
+// row break may have been a space or nothing: both are tried. Only paths that exist count, which
+// settles that (the longest one that exists wins) and keeps ordinary words from being links. Answers
+// are cached for a few seconds; local disks are asked right away (a bounded number of calls per
+// hover), shares and network, removable or optical drives on a worker thread, and the link shows up
+// when it answers.
+
+static const DWORD kPathCacheMs = 3000;
+static const wchar_t kBreak = 1;               // row break in the joined text: a space or nothing
+static const DWORD kAttrPending = 0xFFFFFFFE;  // not known yet (slow drive, or out of budget)
+
+struct PathRow {  // a row's text for paths: every character once (wide ones too) and its cells
+  std::wstring s;
+  std::vector<int> c0, c1;
+};
+struct TimedAttrs {
+  DWORD attrs, tick;
+};
+struct DirList {
+  DWORD tick;
+  bool ok;                                        // false: too big or unreadable
+  std::unordered_map<std::wstring, DWORD> names;  // lower case → attributes
+};
+struct PathCache {
+  std::unordered_map<std::wstring, TimedAttrs> attrs;  // lower-case full path → attributes
+  std::unordered_map<std::wstring, DirList> dirs;      // folder listings (for relative paths)
+  std::map<wchar_t, TimedAttrs> drives;                // drive letter → GetDriveTypeW
+  std::set<std::wstring> pending;                      // handed to the worker
+  bool busy = false;                                   // the worker is checking slow paths
+  DWORD memoTick = 0;                                  // last answer (same rows, folder and cell: reused)
+  std::wstring memoKey;
+  LinkHit memo;
+};
+static PathCache g_paths;
+
+struct PathChecks {  // a batch of slow checks for the worker
+  std::vector<std::wstring> paths;
+  std::vector<DWORD> attrs;
+};
+
+static DWORD WINAPI PathCheckThread(LPVOID arg) {
+  auto* job = (PathChecks*)arg;
+  SetThreadErrorMode(SEM_FAILCRITICALERRORS, nullptr);  // no "insert a disk" box
+  for (auto& f : job->paths) job->attrs.push_back(GetFileAttributesW(f.c_str()));
+  if (!PostMessage(g_hwnd, WM_APP_PATHS, 0, (LPARAM)job)) delete job;
+  return 0;
+}
+
+static bool IsPathSep(wchar_t c) { return c == L'\\' || c == L'/'; }
+
+// 1: local fixed disk (answers at once); 2: share, network, removable or optical drive (may take
+// seconds or wake a disc: asked on the worker); 0: no such drive.
+static int DriveSpeed(const std::wstring& full) {
+  if (IsPathSep(full[0])) return 2;
+  wchar_t d = towupper(full[0]);
+  DWORD now = GetTickCount();
+  auto it = g_paths.drives.find(d);
+  if (it == g_paths.drives.end() || now - it->second.tick >= kPathCacheMs) {
+    wchar_t root[] = {d, L':', L'\\', 0};
+    it = g_paths.drives.insert_or_assign(d, TimedAttrs{GetDriveTypeW(root), now}).first;
+  }
+  UINT t = it->second.attrs;
+  return t == DRIVE_FIXED || t == DRIVE_RAMDISK ? 1 : t == DRIVE_NO_ROOT_DIR || t == DRIVE_UNKNOWN ? 0 : 2;
+}
+
+// Attributes of a full path, cached or from the disk: INVALID_FILE_ATTRIBUTES if it doesn't exist,
+// kAttrPending if not known yet (slow ones go into `slow` for the worker; `budget` caps the calls to
+// the disk in one hover). Its folder is checked first, so candidates that only differ after a
+// missing folder cost nothing more.
+static DWORD PathAttrs(const std::wstring& full, int& budget, std::vector<std::wstring>& slow) {
+  std::wstring key = Lower(full);
+  DWORD now = GetTickCount();
+  auto it = g_paths.attrs.find(key);
+  if (it != g_paths.attrs.end() && now - it->second.tick < kPathCacheMs) return it->second.attrs;
+  int speed = DriveSpeed(full);
+  if (!speed) return INVALID_FILE_ATTRIBUTES;
+  if (speed == 2) {
+    if (!g_paths.pending.count(key) && slow.size() < 16 && std::find(slow.begin(), slow.end(), full) == slow.end())
+      slow.push_back(full);
+    return kAttrPending;
+  }
+  size_t cut = full.find_last_of(L'\\');
+  if (cut != std::wstring::npos && cut > 2 && cut + 1 < full.size()) {
+    DWORD up = PathAttrs(full.substr(0, cut), budget, slow);
+    if (up == kAttrPending) return kAttrPending;
+    if (up == INVALID_FILE_ATTRIBUTES || !(up & FILE_ATTRIBUTE_DIRECTORY)) {
+      g_paths.attrs[key] = TimedAttrs{INVALID_FILE_ATTRIBUTES, now};
+      return INVALID_FILE_ATTRIBUTES;
+    }
+  }
+  if (budget <= 0) return kAttrPending;
+  budget--;
+  DWORD a = GetFileAttributesW(full.c_str());
+  g_paths.attrs[key] = TimedAttrs{a, now};
+  return a;
+}
+
+// Names in a local folder, so relative candidates whose first part isn't there (most words of a
+// sentence) are ruled out without asking the disk for each. nullptr if it can't be used.
+static const DirList* DirNames(const std::wstring& dir, int& budget) {
+  std::wstring key = Lower(dir);
+  DWORD now = GetTickCount();
+  auto it = g_paths.dirs.find(key);
+  if (it != g_paths.dirs.end() && now - it->second.tick < kPathCacheMs) return it->second.ok ? &it->second : nullptr;
+  if (dir.empty() || DriveSpeed(dir) != 1 || budget <= 0) return nullptr;
+  budget--;
+  DirList& l = g_paths.dirs[key];
+  l = DirList{now, true, {}};
+  WIN32_FIND_DATAW fd;
+  HANDLE f = FindFirstFileExW((dir + (IsPathSep(dir.back()) ? L"*" : L"\\*")).c_str(), FindExInfoBasic, &fd,
+                              FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+  if (f == INVALID_HANDLE_VALUE) {
+    l.ok = false;
+  } else {
+    do {
+      if (l.names.size() >= 20000) {
+        l.ok = false;
+        break;
+      }
+      l.names[Lower(fd.cFileName)] = fd.dwFileAttributes;
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+  }
+  return l.ok ? &l : nullptr;
+}
+
+// Length of a :line[:col] or (line[,col]) starting at s[i] (0 if there's none).
+static int LineSuffixAt(const std::wstring& s, int i) {
+  auto digits = [&](int k) {
+    int n = 0;
+    while (k + n < (int)s.size() && s[k + n] >= L'0' && s[k + n] <= L'9') n++;
+    return n;
+  };
+  if (i >= (int)s.size() || (s[i] != L':' && s[i] != L'(')) return 0;
+  int n = digits(i + 1);
+  if (!n) return 0;
+  int len = 1 + n;
+  wchar_t sep = s[i] == L':' ? L':' : L',';
+  if (i + len < (int)s.size() && s[i + len] == sep)
+    if (int m = digits(i + len + 1)) len += 1 + m;
+  if (s[i] == L':') return len;
+  return i + len < (int)s.size() && s[i + len] == L')' ? len + 1 : 0;
+}
+
+// Start of a :line or (line[,col]) that ends at e (e if there's none), leaving something before it.
+static int LineSuffixStart(const std::wstring& s, int a, int e) {
+  int k = e;
+  while (k > a && s[k - 1] >= L'0' && s[k - 1] <= L'9') k--;
+  if (k < e && k > a + 1 && s[k - 1] == L':') return k - 1;
+  if (e > a + 3 && s[e - 1] == L')') {
+    size_t o = s.rfind(L'(', e - 1);
+    if (o != std::wstring::npos && (int)o > a && LineSuffixAt(s, (int)o) == e - (int)o) return (int)o;
+  }
+  return e;
+}
+
+// Could this be a path at all? Nothing Windows forbids in a name, a colon only after the drive letter
+// (C:\ or C:/), \\server\share but no \\?\ or \\.\ device paths, no \foo (rooted on whatever drive:
+// usually a Unix path over ssh), not ending in . or a space (Windows would drop them) and not a
+// device name (nul, con, com1…).
+static bool PathShaped(const std::wstring& s) {
+  if (s.empty() || s.size() > 1024) return false;
+  for (size_t i = 0; i < s.size(); i++)
+    if (s[i] < 32 || wcschr(L"\"<>|?*\u2502", s[i]) || (s[i] == L':' && i != 1)) return false;
+  if (s.size() >= 2 && s[1] == L':') {
+    wchar_t d = s[0] | 0x20;
+    if (s.size() < 3 || !IsPathSep(s[2]) || d < L'a' || d > L'z') return false;
+  } else if (IsPathSep(s[0])) {
+    if (s.size() < 3 || !IsPathSep(s[1]) || IsPathSep(s[2])) return false;
+    size_t a = s.find_first_of(L"\\/", 2);
+    if (a == std::wstring::npos || a + 1 >= s.size() || IsPathSep(s[a + 1])) return false;
+  }
+  if (s.back() == L'.' || s.back() == L' ') return false;
+  size_t end = s.size();
+  while (end > 0 && IsPathSep(s[end - 1])) end--;
+  size_t k = end ? s.find_last_of(L"\\/", end - 1) : std::wstring::npos;
+  size_t from = k == std::wstring::npos ? 0 : k + 1;
+  std::wstring base = Lower(s.substr(from, end - from));
+  base = base.substr(0, base.find(L'.'));
+  while (!base.empty() && base.back() == L' ') base.pop_back();
+  static const wchar_t* const kDevices[] = {L"con", L"prn", L"aux", L"nul", L"conin$", L"conout$", L"clock$"};
+  for (auto d : kDevices)
+    if (base == d) return false;
+  if (base.size() == 4 && (!base.compare(0, 3, L"com") || !base.compare(0, 3, L"lpt")) && iswdigit(base[3])) return false;
+  return true;
+}
+
+// Full form of a path seen in the pane (relative ones against its folder); empty if there's none.
+static std::wstring FullPath(const std::wstring& s, const std::wstring& cwd) {
+  std::wstring f = s;
+  if (!(s.size() >= 2 && (s[1] == L':' || IsPathSep(s[0])))) {
+    if (cwd.empty()) return {};
+    f = cwd + (IsPathSep(cwd.back()) ? L"" : L"\\") + s;
+  }
+  wchar_t buf[2048];
+  DWORD n = GetFullPathNameW(f.c_str(), 2048, buf, nullptr);
+  return n && n < 2048 ? std::wstring(buf, n) : std::wstring();
+}
+
+// file:///C:/a%20b → C:/a b
+static std::wstring PercentDecode(const std::wstring& s) {
+  std::string u = ToUtf8(s), o;
+  for (size_t i = 0; i < u.size(); i++) {
+    if (u[i] == '%' && i + 2 < u.size() && isxdigit((unsigned char)u[i + 1]) && isxdigit((unsigned char)u[i + 2])) {
+      o += (char)strtol(u.substr(i + 1, 2).c_str(), nullptr, 16);
+      i += 2;
+    } else {
+      o += u[i];
+    }
+  }
+  return ToWide(o);
+}
+
+// A row for paths, with the lock held.
+static PathRow PathRowAt(Pane* p, int row) {
+  PathRow r;
+  for (int c = 0; c < p->cols; c++) {
+    VTermScreenCell cell;
+    CellAt(p, row, c, &cell);
+    if (cell.chars[0] == (uint32_t)-1) continue;  // second half of a wide character
+    if (!cell.chars[0]) r.s += L' ';
+    for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i]; i++) AppendUtf16(r.s, cell.chars[i]);
+    r.c0.resize(r.s.size(), c);
+    r.c1.resize(r.s.size(), c + std::max(1, (int)cell.width));
+  }
+  return r;
+}
+
+struct PathCand {
+  int a, link, b;  // path start, underline start (file:/// included), end (a whole token's)
+  int cls;         // 0: absolute or quoted, 1: relative
+  bool fileUrl;
+};
+
+// Path that exists under the cell pos; rows[i] is screen row first + i (a few above and below).
+static bool PathAt(const std::vector<PathRow>& rows, int first, VTermPos pos, int ncols, const std::wstring& cwd,
+                   LinkHit& h) {
+  int hr = pos.row - first;
+  if (hr < 0 || hr >= (int)rows.size()) return false;
+  if (g_paths.attrs.size() > 4096) g_paths.attrs.clear();
+  if (g_paths.dirs.size() > 64) g_paths.dirs.clear();
+  std::wstring key = cwd + L"\n" + std::to_wstring(first) + L"," + std::to_wstring(pos.row) + L"," +
+                     std::to_wstring(pos.col) + L"\n";
+  for (auto& r : rows) key += r.s + L"\n";
+  DWORD now = GetTickCount();
+  if (g_paths.memoTick && now - g_paths.memoTick < kPathCacheMs && key == g_paths.memoKey) {
+    h = g_paths.memo;
+    return !h.path.empty();
+  }
+  auto done = [&](bool hit) {
+    g_paths.memoKey = key, g_paths.memo = h, g_paths.memoTick = now ? now : 1;
+    return hit;
+  };
+  // The column of the mouse (tmux panes: between │ borders) and the character under it.
+  const PathRow& cur = rows[hr];
+  int L = 0, R = ncols, hu = -1;
+  for (int u = 0; u < (int)cur.s.size(); u++) {
+    if (cur.c0[u] <= pos.col) hu = u;
+    if (IsColumnBorder(cur.s[u])) {
+      if (cur.c1[u] <= pos.col) L = cur.c1[u];
+      else if (cur.c0[u] > pos.col) R = std::min(R, cur.c0[u]);
+      else return done(false);
+    }
+  }
+  // Each row's text in that column without the spaces around it: [u0, u1), last column + 1, indent.
+  struct Piece {
+    int u0 = 0, u1 = 0, end = 0, indent = 0;
+  };
+  std::vector<Piece> pc(rows.size());
+  for (size_t i = 0; i < rows.size(); i++) {
+    const PathRow& r = rows[i];
+    int u0 = -1, u1 = -1;
+    for (int u = 0; u < (int)r.s.size(); u++)
+      if (r.c0[u] >= L && r.c1[u] <= R && r.s[u] != L' ') {
+        if (u0 < 0) u0 = u;
+        u1 = u + 1;
+      }
+    if (u0 >= 0) pc[i] = Piece{u0, u1, r.c1[u1 - 1], r.c0[u0] - L};
+  }
+  // Rows that go on in the next one: it fills the column (wrapped by the terminal, the next one goes
+  // on from the left), or the next one is indented (wrapped by Claude Code and the like).
+  auto empty = [&](int i) { return pc[i].u1 <= pc[i].u0; };
+  auto full = [&](int i) { return pc[i].end + 3 >= R; };
+  auto joins = [&](int i) { return !empty(i) && !empty(i + 1) && (full(i) || pc[i + 1].indent > 0); };
+  if (hu < 0 || empty(hr)) return done(false);
+  int ra = hr, rb = hr;
+  while (ra > 0 && hr - ra < 4 && joins(ra - 1)) ra--;
+  while (rb + 1 < (int)rows.size() && rb - hr < 4 && joins(rb)) rb++;
+  // Those rows joined, with a kBreak between them (tried first as nothing after a full row, as a space otherwise).
+  std::wstring s;
+  std::vector<int> srow, sc0, sc1;
+  std::vector<char> space;  // at each kBreak: a space is tried first
+  int hpos = -1;
+  for (int i = ra; i <= rb; i++) {
+    if (i > ra) s += kBreak, srow.push_back(-1), sc0.push_back(0), sc1.push_back(0), space.push_back(!full(i - 1));
+    for (int u = pc[i].u0; u < pc[i].u1; u++) {
+      if (i == hr && u == hu) hpos = (int)s.size();
+      s += rows[i].s[u];
+      srow.push_back(first + i), sc0.push_back(rows[i].c0[u]), sc1.push_back(rows[i].c1[u]), space.push_back(0);
+    }
+  }
+  if (hpos < 0) return done(false);
+  // Runs without spaces or breaks; kL..kR are the ones at the mouse (two if it's on a space).
+  std::vector<std::pair<int, int>> tk;
+  for (int i = 0; i < (int)s.size();) {
+    if (s[i] == L' ' || s[i] == kBreak) {
+      i++;
+      continue;
+    }
+    int j = i;
+    while (j < (int)s.size() && s[j] != L' ' && s[j] != kBreak) j++;
+    tk.push_back({i, j});
+    i = j;
+  }
+  int kL = -1, kR = -1;
+  for (int k = 0; k < (int)tk.size(); k++) {
+    if (tk[k].first <= hpos) kL = k;
+    if (kR < 0 && tk[k].second > hpos) kR = k;
+  }
+  if (kL < 0 || kR < 0) return done(false);
+  // Candidates: from a token at or before the mouse to one at or after it, starting after the quotes and
+  // brackets in front, after file:///, or inside the token after ( " ' = or at a drive letter
+  // (Read(src\x.cpp), --out=C:\x). Absolute and quoted ones first, then the longest.
+  std::vector<PathCand> cands;
+  for (int i = kL; i >= 0 && i > kR - 10; i--) {
+    int ts = tk[i].first, te = tk[i].second, a = ts;
+    while (a < te && wcschr(L"\"'`([{<", s[a])) a++;
+    std::vector<std::pair<int, bool>> starts;
+    if (a < te) starts.push_back({a, false});
+    if (te - a > 8 && !_wcsnicmp(s.c_str() + a, L"file:///", 8)) starts.push_back({a + 8, true});
+    for (int k = a + 1; k < te && starts.size() < 4; k++) {
+      bool drive = k + 2 < te && iswalpha(s[k]) && s[k + 1] == L':' && IsPathSep(s[k + 2]) && !iswalnum(s[k - 1]);
+      bool dup = false;
+      for (auto& st : starts) dup = dup || st.first == k;
+      if (!dup && (drive || wcschr(L"(\"'=`", s[k - 1]))) starts.push_back({k, false});
+    }
+    for (auto [st, fu] : starts) {
+      int link = fu ? a : st;
+      if (link > hpos) continue;
+      int n = (int)s.size();
+      bool abs = fu || (st + 2 < n && iswalpha(s[st]) && s[st + 1] == L':' && IsPathSep(s[st + 2])) ||
+                 (st + 1 < n && IsPathSep(s[st]) && IsPathSep(s[st + 1]));
+      bool quoted = st > ts && wcschr(L"\"'`", s[st - 1]);
+      int cls = abs || quoted ? 0 : 1;
+      for (int j = std::max(i, kR); j < (int)tk.size() && j - i < (cls ? 6 : 10); j++)
+        cands.push_back({st, link, tk[j].second, cls, fu});
+    }
+  }
+  std::stable_sort(cands.begin(), cands.end(), [](const PathCand& x, const PathCand& y) {
+    return x.cls != y.cls ? x.cls < y.cls : x.b - x.a > y.b - y.a;
+  });
+  int budget = 64;
+  std::vector<std::wstring> slow;
+  const DirList* names = nullptr;
+  bool listed = false;
+  // Attributes of a candidate (relative ones whose first part isn't in the pane's folder: missing).
+  auto attrsOf = [&](const std::wstring& t, std::wstring& full) -> DWORD {
+    full = FullPath(t, cwd);
+    if (full.empty()) return INVALID_FILE_ATTRIBUTES;
+    if (!(t.size() >= 2 && (t[1] == L':' || IsPathSep(t[0])))) {
+      size_t sep = t.find_first_of(L"\\/");
+      std::wstring head = t.substr(0, sep);
+      if (head != L"." && head != L"..") {
+        if (!listed) names = DirNames(cwd, budget), listed = true;
+        if (names) {
+          auto it = names->names.find(Lower(head));
+          if (it == names->names.end()) return INVALID_FILE_ATTRIBUTES;
+          if (sep == std::wstring::npos) return it->second;
+        }
+      }
+    }
+    return PathAttrs(full, budget, slow);
+  };
+  for (auto& c : cands) {
+    std::vector<int> breaks;
+    for (int k = c.a; k < c.b; k++)
+      if (s[k] == kBreak) breaks.push_back(k);
+    int masks = 1 << std::min((int)breaks.size(), 4);
+    for (int m = 0; m < masks; m++) {
+      // Shorter and shorter: without a :line or (line) or a punctuation mark at the end each time.
+      for (int e = c.b, step = 0; e > c.a && step < 6; step++) {
+        wchar_t last = s[e - 1];
+        if (last == kBreak) break;
+        int le = e + LineSuffixAt(s, e);  // the underline takes a :line behind too
+        if (last != L'.' && hpos < le) {
+          std::wstring t;
+          for (int k = c.a, bi = 0; k < e; k++) {
+            if (s[k] != kBreak) {
+              t += s[k];
+              continue;
+            }
+            if ((space[k] != 0) != (bi < 4 && (m >> bi & 1))) t += L' ';
+            bi++;
+          }
+          if (c.fileUrl) t = PercentDecode(t);
+          std::wstring full;
+          DWORD at = PathShaped(t) ? attrsOf(t, full) : INVALID_FILE_ATTRIBUTES;
+          if (at != INVALID_FILE_ATTRIBUTES && at != kAttrPending) {
+            h.path = full, h.dir = at & FILE_ATTRIBUTE_DIRECTORY, h.row = pos.row;
+            for (int k = c.link; k < le; k++) {
+              if (s[k] == kBreak) continue;
+              if (h.segs.empty() || h.segs.back()[0] != srow[k]) h.segs.push_back({srow[k], sc0[k], sc1[k]});
+              else h.segs.back()[2] = sc1[k];
+            }
+            for (auto& [row, c0, c1] : h.segs)
+              if (row == pos.row) h.c0 = c0, h.c1 = c1;
+            return done(true);
+          }
+        }
+        int k = LineSuffixStart(s, c.a, e);
+        if (k < e) e = k;
+        else if (wcschr(L".,;:!?)]}>'\"`", last)) e--;
+        else break;
+      }
+    }
+  }
+  // Nothing (yet): ask the worker about the slow ones; when it answers, the hover is looked up again.
+  if (!slow.empty() && !g_paths.busy) {
+    auto* job = new PathChecks{slow, {}};
+    for (auto& f : slow) g_paths.pending.insert(Lower(f));
+    g_paths.busy = true;
+    HANDLE t = CreateThread(nullptr, 0, PathCheckThread, job, 0, nullptr);
+    if (t) {
+      CloseHandle(t);
+    } else {
+      for (auto& f : slow) g_paths.pending.erase(Lower(f));
+      g_paths.busy = false;
+      delete job;
+    }
+  }
+  if (!slow.empty()) return false;  // not final: no memo
+  return done(false);
+}
+
+// Programs and scripts: Ctrl+click never runs them (Explorer opens with them selected instead).
+static bool IsRunnable(const std::wstring& path) {
+  size_t slash = path.find_last_of(L"\\/"), dot = path.rfind(L'.');
+  if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash)) return false;
+  std::wstring ext = Lower(path.substr(dot));
+  static const wchar_t* const kRun[] = {
+      L".exe", L".com", L".bat", L".cmd", L".ps1", L".psm1", L".psd1", L".ps1xml", L".psc1", L".vbs", L".vbe",
+      L".vb", L".js", L".jse", L".wsf", L".wsh", L".ws", L".msi", L".msp", L".mst", L".scr", L".pif", L".lnk",
+      L".url", L".website", L".hta", L".cpl", L".msc", L".jar", L".reg", L".inf", L".scf", L".chm",
+      L".application", L".appref-ms", L".gadget", L".settingcontent-ms", L".appx", L".appxbundle", L".msix",
+      L".msixbundle", L".diagcab", L".py", L".pyw", L".pyz", L".sh", L".bash", L".pl", L".rb", L".ahk", L".au3"};
+  for (auto e : kRun)
+    if (ext == e) return true;
+  wchar_t buf[1024];
+  DWORD n = GetEnvironmentVariableW(L"PATHEXT", buf, 1024);
+  if (n && n < 1024) {
+    std::wstringstream ss(Lower(buf));
+    std::wstring x;
+    while (std::getline(ss, x, L';'))
+      if (x == ext) return true;
+  }
+  return false;
+}
+
+// What Ctrl+click does: URLs and files open with their app, folders in Explorer, and programs and
+// scripts are never run (Explorer opens with them selected).
+enum { LINK_OPEN, LINK_EXPLORER, LINK_SELECT };
+static const wchar_t* const kLinkActions[] = {L"open", L"explorer", L"select"};
+
+static int LinkAction(const LinkHit& h) {
+  if (!h.url.empty()) return LINK_OPEN;
+  return h.dir ? LINK_EXPLORER : IsRunnable(h.path) ? LINK_SELECT : LINK_OPEN;
+}
+
+struct PathOpen {
+  std::wstring path;
+  int action;
+};
+
+// On its own thread: the file's app, Explorer or the network may take a while to answer.
+static DWORD WINAPI PathOpenThread(LPVOID arg) {
+  std::unique_ptr<PathOpen> job((PathOpen*)arg);
+  CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+  if (job->action == LINK_SELECT) {
+    if (auto id = ILCreateFromPathW(job->path.c_str())) {
+      SHOpenFolderAndSelectItems(id, 0, nullptr, 0);
+      ILFree(id);
+    }
+  } else if (job->action == LINK_EXPLORER) {
+    if ((INT_PTR)ShellExecuteW(nullptr, L"explore", job->path.c_str(), nullptr, nullptr, SW_SHOWNORMAL) <= 32)
+      ShellExecuteW(nullptr, L"open", job->path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  } else {
+    ShellExecuteW(nullptr, L"open", job->path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  }
+  CoUninitialize();
+  return 0;
+}
+
+static void OpenPathLink(const LinkHit& h) {
+  auto* job = new PathOpen{h.path, LinkAction(h)};
+  HANDLE t = CreateThread(nullptr, 0, PathOpenThread, job, 0, nullptr);
+  if (t) CloseHandle(t);
+  else delete job;
+}
+
 // URL bajo el punto (también si se pulsa en el trozo de una URL partida).
+// If there's none, a path that exists (PathAt): the rows are copied with the lock held and the disk
+// is asked after letting it go.
 static LinkHit LinkAt(Pane* p, int x, int y) {
   LinkHit h;
   POINT pt{x, y};
@@ -3126,8 +3632,37 @@ static LinkHit LinkAt(Pane* p, int x, int y) {
           h.p = p, h.row = pos.row, h.c0 = sg.c0, h.c1 = sg.c1, h.url = u.url;
           for (auto& s2 : u.segs) h.segs.push_back({s2.row, s2.c0, s2.c1});
         }
+  std::vector<PathRow> rows;
+  int first = std::max(0, pos.row - 4), cols = p->cols;
+  std::wstring cwd;
+  if (h.url.empty()) {
+    for (int r = first; r < p->rows && r <= pos.row + 4; r++) rows.push_back(PathRowAt(p, r));
+    cwd = p->cwd;
+  }
   LeaveCriticalSection(&p->cs);
+  if (h.url.empty() && PathAt(rows, first, pos, cols, cwd, h)) h.p = p;
   return h;
+}
+
+// Answers from PathCheckThread: cached, and the link under the mouse is looked up again with them.
+static void OnPathChecks(PathChecks* job) {
+  g_paths.busy = false;
+  DWORD now = GetTickCount();
+  for (size_t i = 0; i < job->paths.size() && i < job->attrs.size(); i++) {
+    std::wstring key = Lower(job->paths[i]);
+    g_paths.pending.erase(key);
+    g_paths.attrs[key] = TimedAttrs{job->attrs[i], now};
+  }
+  g_paths.memoTick = 0;
+  POINT pt;
+  if (g_tabs.empty() || !(GetKeyState(VK_CONTROL) & 0x8000) || !GetCursorPos(&pt) || !ScreenToClient(g_hwnd, &pt))
+    return;
+  Pane* p = PaneAt(pt.x, pt.y);
+  LinkHit h = p ? LinkAt(p, pt.x, pt.y) : LinkHit{};
+  if (h.p != g_link.p || h.row != g_link.row || h.c0 != g_link.c0 || h.path != g_link.path)
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+  g_link = h;
+  if (g_link.p) SetCursor(LoadCursor(nullptr, IDC_HAND));
 }
 
 static int TabWidth() { return Px(200); }
@@ -4824,7 +5359,8 @@ static bool SaveScreenshot(const std::wstring& path) {
 //   auto-update:on|off update-check update-click update-state key:<tab|down|up|enter|esc> edit-text comp drag-tab:<de>,<a> tabs clipboard (estos y hover/hover-text dejan el resultado en <sesión>.bench)
 //   font:<family> font-wait font font-others toast (font, font-others and toast also write to <session>.bench)
 //   cells join:<hex>,<hex>... brightness font-size (these write to <session>.bench) select:<text> brightness:<RRGGBB>
-//   font-size:<px>
+//   font-size:<px> link-action:<col>,<row> hover-time:<col>,<row> (these write to <session>.bench; hover reports
+//   paths as "path <full path>")
 
 static void SetStartWithWindows(bool on);
 
@@ -5566,6 +6102,11 @@ static std::wstring FontReport() {
   return r;
 }
 
+// What the hover steps report: the URL, "path <full path>" or "(sin enlace)".
+static std::wstring LinkLabel(const LinkHit& h) {
+  return !h.url.empty() ? h.url : !h.path.empty() ? L"path " + h.path : L"(sin enlace)";
+}
+
 // Resultado de un paso, una línea en <sesión>.bench (lo leen los wintest-*.ps1).
 static void ScriptLog(const std::wstring& r) {
   std::string u = ToUtf8(r) + "\n";
@@ -5632,8 +6173,29 @@ static void RunScriptStep() {
     int c = 0, r = 0;
     swscanf(s.c_str() + 6, L"%d,%d", &c, &r);
     g_link = LinkAt(p, p->content.left + kPad + c * g_cellW + 1, p->content.top + kPad + r * g_cellH + 1);
-    Toast(g_link.url.empty() ? L"(sin enlace)" : g_link.url);
-    ScriptLog(L"hover " + std::to_wstring(c) + L"," + std::to_wstring(r) + L": " + (g_link.url.empty() ? L"(sin enlace)" : g_link.url));
+    Toast(LinkLabel(g_link));
+    ScriptLog(L"hover " + std::to_wstring(c) + L"," + std::to_wstring(r) + L": " + LinkLabel(g_link));
+  } else if (s.rfind(L"link-action:", 0) == 0 && p) {  // link-action:col,row — what Ctrl+click there would do (opens nothing)
+    int c = 0, r = 0;
+    swscanf(s.c_str() + 12, L"%d,%d", &c, &r);
+    LinkHit h = LinkAt(p, p->content.left + kPad + c * g_cellW + 1, p->content.top + kPad + r * g_cellH + 1);
+    ScriptLog(L"link-action " + std::to_wstring(c) + L"," + std::to_wstring(r) + L": " +
+              (h.p ? kLinkActions[LinkAction(h)] + std::wstring(L" ") + (h.url.empty() ? h.path : h.url) : L"(sin enlace)"));
+  } else if (s.rfind(L"hover-time:", 0) == 0 && p) {  // hover-time:col,row — µs of that hover with the path cache empty, then full
+    int c = 0, r = 0;
+    swscanf(s.c_str() + 11, L"%d,%d", &c, &r);
+    int x = p->content.left + kPad + c * g_cellW + 1, y = p->content.top + kPad + r * g_cellH + 1;
+    g_paths.attrs.clear(), g_paths.dirs.clear(), g_paths.drives.clear(), g_paths.memoTick = 0;
+    LARGE_INTEGER f, t0, t1, t2;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    LinkAt(p, x, y);
+    QueryPerformanceCounter(&t1);
+    for (int i = 0; i < 100; i++) g_paths.memoTick = 0, LinkAt(p, x, y);  // every time worked out again (moving the mouse)
+    QueryPerformanceCounter(&t2);
+    ScriptLog(L"hover-time " + std::to_wstring(c) + L"," + std::to_wstring(r) + L": cold " +
+              std::to_wstring((t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart) + L"us warm " +
+              std::to_wstring((t2.QuadPart - t1.QuadPart) * 10000 / f.QuadPart) + L"us");
   } else if (s.rfind(L"find:", 0) == 0 && p) {
     OpenFind(p);
     for (wchar_t c : s.substr(5)) FindChar(c);
@@ -5826,8 +6388,8 @@ static void RunScriptStep() {
       size_t a = t.find_first_not_of(L' '), b = t.find_last_not_of(L' ');
       if (a != std::wstring::npos && t.substr(a, b - a + 1) == want) {
         g_link = LinkAt(p, p->content.left + kPad + (int)a * g_cellW + 1, p->content.top + kPad + r * g_cellH + 1);
-        Toast(g_link.url.empty() ? L"(sin enlace)" : g_link.url);
-        ScriptLog(L"hover-text " + want + L": " + (g_link.url.empty() ? L"(sin enlace)" : g_link.url));
+        Toast(LinkLabel(g_link));
+        ScriptLog(L"hover-text " + want + L": " + LinkLabel(g_link));
         break;
       }
     }
@@ -6063,6 +6625,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_UPDATE: OnUpdateReply(std::unique_ptr<UpdateReply>((UpdateReply*)lp).get()); return 0;
     case WM_APP_UPDATED: OnUpdateInstalled(std::unique_ptr<InstallJob>((InstallJob*)lp).get()); return 0;
     case WM_APP_FONT: OnFontDownloaded(std::unique_ptr<FontJob>((FontJob*)lp).get()); return 0;
+    case WM_APP_PATHS: OnPathChecks(std::unique_ptr<PathChecks>((PathChecks*)lp).get()); return 0;
     case WM_APP_PARAMS: {  // parámetros de una orden, de ParamsThread
       std::unique_ptr<ParamsReply> r((ParamsReply*)lp);
       std::wstring low = Lower(r->cmd);
@@ -6353,6 +6916,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           ShellExecuteW(nullptr, L"open", h.url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
           return 0;
         }
+        if (!h.path.empty()) {  // file: its app; folder: Explorer; program or script: selected, never run
+          OpenPathLink(h);
+          return 0;
+        }
       }
       if (p->mouseMode && !shift) {
         MouseToApp(p, x, y, msg == WM_LBUTTONDOWN ? 1 : msg == WM_MBUTTONDOWN ? 2 : 3, true);
@@ -6436,7 +7003,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         LinkHit h;
         if (wp & MK_CONTROL)
           if (Pane* p = PaneAt(x, y)) h = LinkAt(p, x, y);
-        if (h.p != g_link.p || h.row != g_link.row || h.c0 != g_link.c0) InvalidateRect(hwnd, nullptr, FALSE);
+        if (h.p != g_link.p || h.row != g_link.row || h.c0 != g_link.c0 || h.path != g_link.path)
+          InvalidateRect(hwnd, nullptr, FALSE);
         g_link = h;
       }
       Node* d = y >= TabBarH() ? DividerAt(CurTab().root, x, y) : nullptr;
