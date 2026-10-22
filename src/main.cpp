@@ -96,6 +96,7 @@ static const COLORREF kFindCur = RGB(0xff, 0x8c, 0x1a);  // coincidencia actual
 static const COLORREF kUrl = RGB(0xc2, 0xd9, 0xf5);     // URLs: blanco azulado
 static const COLORREF kCmdOk = RGB(0x4e, 0xd1, 0x8f);   // orden que existe
 static const COLORREF kCmdBad = RGB(0xf0, 0x55, 0x55);  // orden desconocida
+static const COLORREF kPathFg = kCmdOk;                 // files and folders that exist, in the output: the same green
 static const COLORREF kChipBorder = RGB(0x3a, 0x3a, 0x3a);
 static const uint32_t kAnsi[16] = {0x616161, 0xFF8272, 0xB4FA72, 0xFEFDC2, 0xA5D5FE, 0xFF8FFD,
                                    0xD0D1FE, 0xF1F1F1, 0x8E8E8E, 0xFFC4BD, 0xD6FCB9, 0xFEFDD5,
@@ -105,7 +106,7 @@ static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
 enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS, WM_APP_PROMPT, WM_APP_NETCHANGE };
-enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6 };
+enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6, TIMER_PATHS = 7 };
 
 // ---------------------------------------------------------------------------
 // Modelo: pestañas -> árbol de paneles
@@ -201,6 +202,14 @@ struct Pane {
   int agent = 0;           // AGENT_* que corre aquí, también si se lanzó con un atajo (ver UpdateRunning)
   std::atomic<DWORD> firstOut{0}, lastOut{0};
   Reconnect recon;
+  // Paths in their own color (see «Path highlighting»): for each view row, the hash of the text they were found in and
+  // their cells [c0, c1). outSeq counts the shell's output, so new text is looked at again.
+  std::vector<size_t> pathHash;
+  std::vector<std::vector<std::pair<int, int>>> pathSpans;
+  std::atomic<unsigned> outSeq{0};
+  unsigned pathSeq = 0;
+  bool pathDue = false;  // look again: text drawn that no pass has seen, or new answers from the disk
+  int pathRounds = 0;    // passes redone for answers since the text last changed (capped)
 };
 
 static HWND g_hwnd;
@@ -683,6 +692,7 @@ static DWORD WINAPI ReaderThread(LPVOID arg) {
     DWORD now = GetTickCount();
     if (!p->firstOut) p->firstOut = now;
     p->lastOut = now;
+    p->outSeq++;
     RequestRepaint();
   }
   return 0;
@@ -3494,17 +3504,25 @@ struct PathCache {
   std::unordered_map<std::wstring, TimedAttrs> attrs;  // lower-case full path → attributes
   std::unordered_map<std::wstring, DirList> dirs;      // folder listings (for relative paths)
   std::map<wchar_t, TimedAttrs> drives;                // drive letter → GetDriveTypeW
-  std::set<std::wstring> pending;                      // handed to the worker
-  bool busy = false;                                   // the worker is checking slow paths
+  std::set<std::wstring> pending, dirsPending;         // handed to the worker (paths, folders to list)
+  std::vector<std::wstring> queue, dirQueue;           // waiting for it: it takes one batch at a time
+  bool busy = false;                                   // the worker is checking a batch
   DWORD memoTick = 0;                                  // last answer (same rows, folder and cell: reused)
   std::wstring memoKey;
   LinkHit memo;
 };
 static PathCache g_paths;
 
-struct PathChecks {  // a batch of slow checks for the worker
-  std::vector<std::wstring> paths;
-  std::vector<DWORD> attrs;
+struct PathChecks {  // a batch for the worker: paths to look up and folders to list
+  std::vector<std::wstring> paths, dirs;
+  std::vector<std::pair<std::wstring, DWORD>> attrs;  // answers: those paths and the folders above them it asked about
+  std::vector<DirList> lists;                         // one per folder in dirs
+};
+
+// A pass of path highlighting (see «Path highlighting»): PathAt never waits for the disk then.
+struct PathScan {
+  bool pending = false;     // some answers aren't known yet (asked on the worker)
+  bool revalidate = false;  // the text changed: old answers are used and asked again
 };
 
 static bool IsPathSep(wchar_t c) { return c == L'\\' || c == L'/'; }
@@ -3519,12 +3537,80 @@ static void CountProbe(const std::wstring& full) {
   if (full.size() < 2 || full[1] != L':' || GetDriveTypeW(root) == DRIVE_REMOTE) g_remoteProbes++;
 }
 
+// A folder's names, lower case (ok false if it has more than 20000 or can't be read).
+static void ListDir(const std::wstring& dir, DirList& l) {
+  WIN32_FIND_DATAW fd;
+  HANDLE f = FindFirstFileExW((dir + (IsPathSep(dir.back()) ? L"*" : L"\\*")).c_str(), FindExInfoBasic, &fd,
+                              FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+  if (f == INVALID_HANDLE_VALUE) {
+    l.ok = false;
+    return;
+  }
+  do {
+    if (l.names.size() >= 20000) {
+      l.ok = false;
+      break;
+    }
+    l.names[Lower(fd.cFileName)] = fd.dwFileAttributes;
+  } while (FindNextFileW(f, &fd));
+  FindClose(f);
+}
+
+// On the worker: a path's attributes, its folders first (every one it asks about goes back in the answer, so the
+// other candidates under a missing folder cost nothing).
+static DWORD WorkerAttrs(const std::wstring& full, std::map<std::wstring, DWORD>& seen) {
+  auto it = seen.find(full);
+  if (it != seen.end()) return it->second;
+  size_t cut = full.find_last_of(L'\\');
+  DWORD up = cut != std::wstring::npos && cut > 2 && cut + 1 < full.size() ? WorkerAttrs(full.substr(0, cut), seen)
+                                                                           : FILE_ATTRIBUTE_DIRECTORY;
+  DWORD a = INVALID_FILE_ATTRIBUTES;
+  if (up != INVALID_FILE_ATTRIBUTES && (up & FILE_ATTRIBUTE_DIRECTORY)) CountProbe(full), a = GetFileAttributesW(full.c_str());
+  return seen[full] = a;
+}
+
 static DWORD WINAPI PathCheckThread(LPVOID arg) {
   auto* job = (PathChecks*)arg;
   SetThreadErrorMode(SEM_FAILCRITICALERRORS, nullptr);  // no "insert a disk" box
-  for (auto& f : job->paths) CountProbe(f), job->attrs.push_back(GetFileAttributesW(f.c_str()));
+  std::map<std::wstring, DWORD> seen;
+  for (auto& f : job->paths) WorkerAttrs(f, seen);
+  job->attrs.assign(seen.begin(), seen.end());
+  for (auto& d : job->dirs) {
+    job->lists.push_back(DirList{0, true, {}});
+    CountProbe(d);
+    ListDir(d, job->lists.back());
+  }
   if (!PostMessage(g_hwnd, WM_APP_PATHS, 0, (LPARAM)job)) delete job;
   return 0;
+}
+
+// Hands a path, or a folder to list, to the worker (only local drives get here, see DriveSpeed). They go in batches,
+// one at a time: PathSend sends the next one when it's free, and OnPathChecks when it answers.
+static void PathAsk(const std::wstring& full) {
+  if (g_paths.pending.insert(Lower(full)).second) g_paths.queue.push_back(full);
+}
+
+static void PathAskDir(const std::wstring& dir) {
+  if (g_paths.dirsPending.insert(Lower(dir)).second) g_paths.dirQueue.push_back(dir);
+}
+
+static void PathSend() {
+  if (g_paths.busy || (g_paths.queue.empty() && g_paths.dirQueue.empty())) return;
+  auto* job = new PathChecks{};
+  size_t n = std::min<size_t>(g_paths.queue.size(), 256), m = std::min<size_t>(g_paths.dirQueue.size(), 4);
+  job->paths.assign(g_paths.queue.begin(), g_paths.queue.begin() + n);
+  job->dirs.assign(g_paths.dirQueue.begin(), g_paths.dirQueue.begin() + m);
+  g_paths.queue.erase(g_paths.queue.begin(), g_paths.queue.begin() + n);
+  g_paths.dirQueue.erase(g_paths.dirQueue.begin(), g_paths.dirQueue.begin() + m);
+  HANDLE t = CreateThread(nullptr, 0, PathCheckThread, job, 0, nullptr);
+  if (!t) {  // asked again next time
+    for (auto& f : job->paths) g_paths.pending.erase(Lower(f));
+    for (auto& d : job->dirs) g_paths.dirsPending.erase(Lower(d));
+    delete job;
+    return;
+  }
+  CloseHandle(t);
+  g_paths.busy = true;
 }
 
 // 1: local fixed disk (answers at once); 2: removable or optical drive (may take seconds or wake a
@@ -3576,6 +3662,41 @@ static DWORD PathAttrs(const std::wstring& full, int& budget, std::vector<std::w
   return a;
 }
 
+// The same for highlighting, which never asks the disk on this thread: an answer in the cache is used even if old (and
+// asked again when the text changed, so nothing flickers while it's checked), and the rest is asked on the worker
+// (kAttrPending, scan.pending).
+static DWORD CachedPathAttrs(const std::wstring& full, PathScan& scan) {
+  std::wstring key = Lower(full);
+  DWORD now = GetTickCount();
+  auto it = g_paths.attrs.find(key);
+  if (it != g_paths.attrs.end()) {
+    if (scan.revalidate && now - it->second.tick >= kPathCacheMs && DriveSpeed(full)) PathAsk(full);
+    return it->second.attrs;
+  }
+  if (!DriveSpeed(full)) return INVALID_FILE_ATTRIBUTES;
+  size_t cut = full.find_last_of(L'\\');
+  if (cut != std::wstring::npos && cut > 2 && cut + 1 < full.size()) {  // in a folder known to be missing: missing
+    auto up = g_paths.attrs.find(key.substr(0, cut));
+    if (up != g_paths.attrs.end() && now - up->second.tick < kPathCacheMs &&
+        (up->second.attrs == INVALID_FILE_ATTRIBUTES || !(up->second.attrs & FILE_ATTRIBUTE_DIRECTORY)))
+      return INVALID_FILE_ATTRIBUTES;
+  }
+  PathAsk(full);
+  scan.pending = true;
+  return kAttrPending;
+}
+
+// Keeps the cache small: old answers go first, and everything if that isn't enough (highlighting asks again).
+static void TrimPathCache() {
+  if (g_paths.attrs.size() > 4096) {
+    DWORD now = GetTickCount();
+    for (auto it = g_paths.attrs.begin(); it != g_paths.attrs.end();)
+      it = now - it->second.tick >= kPathCacheMs ? g_paths.attrs.erase(it) : std::next(it);
+    if (g_paths.attrs.size() > 4096) g_paths.attrs.clear();
+  }
+  if (g_paths.dirs.size() > 64) g_paths.dirs.clear();
+}
+
 // Names in a local folder, so relative candidates whose first part isn't there (most words of a
 // sentence) are ruled out without asking the disk for each. nullptr if it can't be used.
 static const DirList* DirNames(const std::wstring& dir, int& budget) {
@@ -3588,22 +3709,22 @@ static const DirList* DirNames(const std::wstring& dir, int& budget) {
   DirList& l = g_paths.dirs[key];
   l = DirList{now, true, {}};
   CountProbe(dir);
-  WIN32_FIND_DATAW fd;
-  HANDLE f = FindFirstFileExW((dir + (IsPathSep(dir.back()) ? L"*" : L"\\*")).c_str(), FindExInfoBasic, &fd,
-                              FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
-  if (f == INVALID_HANDLE_VALUE) {
-    l.ok = false;
-  } else {
-    do {
-      if (l.names.size() >= 20000) {
-        l.ok = false;
-        break;
-      }
-      l.names[Lower(fd.cFileName)] = fd.dwFileAttributes;
-    } while (FindNextFileW(f, &fd));
-    FindClose(f);
-  }
+  ListDir(dir, l);
   return l.ok ? &l : nullptr;
+}
+
+// The same for highlighting: the listing in the cache (an old one too, asked again with scan.revalidate), or nullptr:
+// it can't be used, or it isn't known yet (asked on the worker: *asked).
+static const DirList* CachedDirNames(const std::wstring& dir, PathScan& scan, bool& asked) {
+  auto it = g_paths.dirs.find(Lower(dir));
+  if (it != g_paths.dirs.end()) {
+    if (scan.revalidate && GetTickCount() - it->second.tick >= kPathCacheMs && DriveSpeed(dir) == 1) PathAskDir(dir);
+    return it->second.ok ? &it->second : nullptr;
+  }
+  if (dir.empty() || DriveSpeed(dir) != 1) return nullptr;
+  PathAskDir(dir);
+  asked = scan.pending = true;
+  return nullptr;
 }
 
 // Length of a :line[:col] or (line[,col]) starting at s[i] (0 if there's none).
@@ -3712,23 +3833,26 @@ struct PathCand {
   bool fileUrl;
 };
 
-// Path that exists under the cell pos; rows[i] is screen row first + i (a few above and below).
+// Path that exists under the cell pos; rows[i] is screen row first + i (a few above and below, or the whole view).
+// With scan (highlighting) the hover's memo isn't used and the disk is never asked here: answers come from the cache
+// and the rest is asked on the worker (scan->pending).
 static bool PathAt(const std::vector<PathRow>& rows, int first, VTermPos pos, int ncols, const std::wstring& cwd,
-                   LinkHit& h) {
+                   LinkHit& h, PathScan* scan = nullptr) {
   int hr = pos.row - first;
   if (hr < 0 || hr >= (int)rows.size()) return false;
-  if (g_paths.attrs.size() > 4096) g_paths.attrs.clear();
-  if (g_paths.dirs.size() > 64) g_paths.dirs.clear();
-  std::wstring key = cwd + L"\n" + std::to_wstring(first) + L"," + std::to_wstring(pos.row) + L"," +
-                     std::to_wstring(pos.col) + L"\n";
-  for (auto& r : rows) key += r.s + L"\n";
+  TrimPathCache();
+  std::wstring key;
   DWORD now = GetTickCount();
-  if (g_paths.memoTick && now - g_paths.memoTick < kPathCacheMs && key == g_paths.memoKey) {
-    h = g_paths.memo;
-    return !h.path.empty();
+  if (!scan) {
+    key = cwd + L"\n" + std::to_wstring(first) + L"," + std::to_wstring(pos.row) + L"," + std::to_wstring(pos.col) + L"\n";
+    for (auto& r : rows) key += r.s + L"\n";
+    if (g_paths.memoTick && now - g_paths.memoTick < kPathCacheMs && key == g_paths.memoKey) {
+      h = g_paths.memo;
+      return !h.path.empty();
+    }
   }
   auto done = [&](bool hit) {
-    g_paths.memoKey = key, g_paths.memo = h, g_paths.memoTick = now ? now : 1;
+    if (!scan) g_paths.memoKey = key, g_paths.memo = h, g_paths.memoTick = now ? now : 1;
     return hit;
   };
   // The column of the mouse (tmux panes: between │ borders) and the character under it.
@@ -3742,12 +3866,13 @@ static bool PathAt(const std::vector<PathRow>& rows, int first, VTermPos pos, in
       else return done(false);
     }
   }
-  // Each row's text in that column without the spaces around it: [u0, u1), last column + 1, indent.
+  // Each row's text in that column without the spaces around it: [u0, u1), last column + 1, indent (only the rows
+  // a path through the mouse's row can reach).
   struct Piece {
     int u0 = 0, u1 = 0, end = 0, indent = 0;
   };
   std::vector<Piece> pc(rows.size());
-  for (size_t i = 0; i < rows.size(); i++) {
+  for (int i = std::max(0, hr - 4); i < (int)rows.size() && i <= hr + 4; i++) {
     const PathRow& r = rows[i];
     int u0 = -1, u1 = -1;
     for (int u = 0; u < (int)r.s.size(); u++)
@@ -3832,7 +3957,7 @@ static bool PathAt(const std::vector<PathRow>& rows, int first, VTermPos pos, in
   int budget = 64;
   std::vector<std::wstring> slow;
   const DirList* names = nullptr;
-  bool listed = false;
+  bool listed = false, listing = false;  // listing: the folder's names were asked on the worker (scan)
   // Attributes of a candidate (relative ones whose first part isn't in the pane's folder: missing).
   auto attrsOf = [&](const std::wstring& t, std::wstring& full) -> DWORD {
     full = FullPath(t, cwd);
@@ -3841,15 +3966,17 @@ static bool PathAt(const std::vector<PathRow>& rows, int first, VTermPos pos, in
       size_t sep = t.find_first_of(L"\\/");
       std::wstring head = t.substr(0, sep);
       if (head != L"." && head != L"..") {
-        if (!listed) names = DirNames(cwd, budget), listed = true;
+        if (!listed) names = scan ? CachedDirNames(cwd, *scan, listing) : DirNames(cwd, budget), listed = true;
         if (names) {
           auto it = names->names.find(Lower(head));
           if (it == names->names.end()) return INVALID_FILE_ATTRIBUTES;
           if (sep == std::wstring::npos) return it->second;
+        } else if (listing) {
+          return kAttrPending;  // not one by one: the listing is on its way
         }
       }
     }
-    return PathAttrs(full, budget, slow);
+    return scan ? CachedPathAttrs(full, *scan) : PathAttrs(full, budget, slow);
   };
   for (auto& c : cands) {
     std::vector<int> breaks;
@@ -3895,20 +4022,11 @@ static bool PathAt(const std::vector<PathRow>& rows, int first, VTermPos pos, in
     }
   }
   // Nothing (yet): ask the worker about the slow ones; when it answers, the hover is looked up again.
-  if (!slow.empty() && !g_paths.busy) {
-    auto* job = new PathChecks{slow, {}};
-    for (auto& f : slow) g_paths.pending.insert(Lower(f));
-    g_paths.busy = true;
-    HANDLE t = CreateThread(nullptr, 0, PathCheckThread, job, 0, nullptr);
-    if (t) {
-      CloseHandle(t);
-    } else {
-      for (auto& f : slow) g_paths.pending.erase(Lower(f));
-      g_paths.busy = false;
-      delete job;
-    }
+  if (!slow.empty()) {
+    for (auto& f : slow) PathAsk(f);
+    PathSend();
+    return false;  // not final: no memo
   }
-  if (!slow.empty()) return false;  // not final: no memo
   return done(false);
 }
 
@@ -4034,14 +4152,206 @@ static LinkHit LinkAt(Pane* p, int x, int y) {
   return h;
 }
 
-// Answers from PathCheckThread: cached, and the link under the mouse is looked up again with them.
+// ---------------------------------------------------------------------------
+// Path highlighting: files and folders that exist are drawn in their own color (kPathFg), always, not only under
+// Ctrl. A pass over the view of each pane on screen finds them with PathAt at every seed (a \ or /, or the dot of a
+// name.ext, so plain words and bare folder names are never colored), in its scan mode: only the cache, the rest asked
+// on the worker and the pass redone when it answers. Passes run on a one-shot timer, at most every kPathScanMs while
+// the text changes (output, or DrawPane drawing text no pass has seen: scrolling, resizing), and never when idle.
+// DrawPane colors a row only with the paths found in that same text, so they never land on other cells.
+
+static const UINT kPathScanMs = 150;
+static const int kPathRounds = 6;  // passes redone for answers without the text changing
+static bool g_pathTimer = false;
+
+static void ArmPathScan() {
+  if (!g_pathTimer && g_hwnd) SetTimer(g_hwnd, TIMER_PATHS, kPathScanMs, nullptr), g_pathTimer = true;
+}
+
+// Does more of a path come right after cell c1 of a row: after one space (or at the start of the next row, when that
+// ends its row and the next one goes on from it, as PathAt joins them) a run with the separator sep in it that doesn't
+// start a path of its own (drive, quote, bracket, file:///) nor a switch or another path (/s, \\host)? run: its row
+// and cells.
+static bool PathGoesOn(const std::vector<PathRow>& rows, int cols, int row, int c1, wchar_t sep, std::array<int, 3>& run) {
+  const PathRow* r = &rows[row];
+  int u = 0, spaces = 0;
+  while (u < (int)r->s.size() && r->c0[u] < c1) u++;
+  while (u < (int)r->s.size() && r->s[u] == L' ') u++, spaces++;
+  if (u == (int)r->s.size()) {
+    if (row + 1 >= (int)rows.size()) return false;
+    r = &rows[++row], u = 0;
+    while (u < (int)r->s.size() && r->s[u] == L' ') u++;
+    if (u == 0 && c1 + 3 < cols) return false;  // neither full nor an indented row below
+  } else if (spaces != 1) {
+    return false;
+  }
+  int e = u;
+  while (e < (int)r->s.size() && r->s[e] != L' ') e++;
+  if (u == e || IsPathSep(r->s[u]) || wcschr(L"\"'`([{<", r->s[u]) || (e - u > 2 && r->s[u + 1] == L':') ||
+      (e - u > 8 && !_wcsnicmp(r->s.c_str() + u, L"file:///", 8)))
+    return false;
+  run = {row, r->c0[u], r->c1[e - 1]};
+  for (int k = u; k < e; k++)
+    if (r->s[k] == sep) return true;
+  return false;
+}
+
+// Paths that exist in the rows of a pane's view: for each row, its cells [c0, c1).
+static std::vector<std::vector<std::pair<int, int>>> FindPaths(const std::vector<PathRow>& rows, int cols,
+                                                               const std::wstring& cwd, PathScan& scan) {
+  std::vector<std::vector<std::pair<int, int>>> out(rows.size());
+  std::vector<std::vector<std::array<int, 3>>> folders;  // segments of the folders found
+  auto covered = [&](int r, int c) {
+    for (auto& [c0, c1] : out[r])
+      if (c >= c0 && c < c1) return true;
+    return false;
+  };
+  for (int r = 0; r < (int)rows.size(); r++) {
+    const std::wstring& s = rows[r].s;
+    for (int u = 0; u < (int)s.size();) {
+      if (s[u] == L' ') {
+        u++;
+        continue;
+      }
+      int e = u, seed = -1;
+      while (e < (int)s.size() && s[e] != L' ') e++;
+      for (int k = u; k < e && seed < 0; k++)
+        if (IsPathSep(s[k])) seed = k;
+      for (int k = e - 2; k >= u && seed < 0; k--)
+        if (s[k] == L'.' && iswalnum(s[k + 1])) seed = k;
+      u = e;
+      if (seed < 0 || covered(r, rows[r].c0[seed])) continue;
+      LinkHit h;
+      if (!PathAt(rows, 0, VTermPos{r, rows[r].c0[seed]}, cols, cwd, h, &scan) || h.segs.empty()) continue;
+      for (auto& [sr, c0, c1] : h.segs)
+        if (sr >= 0 && sr < (int)out.size()) out[sr].push_back({c0, c1});
+      if (h.dir) folders.push_back(h.segs);
+    }
+  }
+  // A folder followed by more of a path that isn't one is the start of a longer path that doesn't exist (C:\Users\Ana in
+  // «C:\Users\Ana Lopez\new.txt» when there's a C:\Users\Ana): not colored.
+  for (auto& segs : folders) {
+    std::array<int, 3> run;
+    int lr = segs.back()[0];
+    if (lr < 0 || lr >= (int)rows.size()) continue;
+    wchar_t sep = 0;  // the separator the folder is written with (its last one)
+    for (auto& [sr, c0, c1] : segs)
+      for (int u = 0; sr >= 0 && sr < (int)rows.size() && u < (int)rows[sr].s.size(); u++)
+        if (rows[sr].c0[u] >= c0 && rows[sr].c1[u] <= c1 && IsPathSep(rows[sr].s[u])) sep = rows[sr].s[u];
+    if (!sep || !PathGoesOn(rows, cols, lr, segs.back()[2], sep, run)) continue;
+    bool own = false;  // a path was found in it after all
+    for (int c = run[1]; c < run[2] && !own; c++) own = covered(run[0], c);
+    if (own) continue;
+    for (auto& [sr, c0, c1] : segs) {
+      auto& v = out[sr];
+      auto it = std::find(v.begin(), v.end(), std::pair<int, int>{c0, c1});
+      if (it != v.end()) v.erase(it);
+    }
+  }
+  for (auto& v : out) std::sort(v.begin(), v.end());
+  return out;
+}
+
+// The paths found for a row with this text: the row's own, or those of a row that had the same text (the view has
+// scrolled since); nullptr if no pass has seen it.
+static const std::vector<std::pair<int, int>>* PathSpansFor(Pane* p, int row, size_t hash) {
+  if (row >= 0 && row < (int)p->pathHash.size() && p->pathHash[row] == hash) return &p->pathSpans[row];
+  for (size_t r = 0; r < p->pathHash.size(); r++)
+    if (p->pathHash[r] == hash) return &p->pathSpans[r];
+  return nullptr;
+}
+
+// A pass over a pane's view (rows copied with the lock held, looked up without it); rows whose paths changed are
+// drawn again.
+static void PathScanPane(Pane* p, bool revalidate) {
+  EnterCriticalSection(&p->cs);
+  int n = p->rows, cols = p->cols;
+  std::vector<PathRow> rows;
+  std::vector<size_t> hash;
+  for (int r = 0; r < n; r++) rows.push_back(PathRowAt(p, r)), hash.push_back(std::hash<std::wstring>{}(RowText(p, r)));
+  std::wstring cwd = p->cwd;
+  LeaveCriticalSection(&p->cs);
+  PathScan scan;
+  scan.revalidate = revalidate;
+  auto spans = FindPaths(rows, cols, cwd, scan);
+  static const std::vector<std::pair<int, int>> kNone;
+  bool redraw = false;
+  EnterCriticalSection(&p->cs);  // dirtyRows is the reader's too
+  for (int r = 0; r < n; r++) {
+    // While answers are on their way, a row with the same text keeps its paths (redone when they arrive).
+    if (scan.pending && r < (int)p->pathHash.size() && p->pathHash[r] == hash[r]) spans[r] = p->pathSpans[r];
+    const auto* was = PathSpansFor(p, r, hash[r]);  // what DrawPane would draw now
+    if ((was ? *was : kNone) != spans[r]) MarkRow(p, r), redraw = true;
+  }
+  p->pathHash = std::move(hash);
+  p->pathSpans = std::move(spans);
+  LeaveCriticalSection(&p->cs);
+  if (redraw) RequestRepaint();
+}
+
+// TIMER_PATHS: a pass over the panes on screen whose text changed or that got answers.
+static void ScanPaths() {
+  if (g_tabs.empty() || IsIconic(g_hwnd)) return;  // looked at again when drawn
+  std::vector<Pane*> ls;
+  Leaves(CurTab().root, ls);
+  for (Pane* p : ls) {
+    unsigned seq = p->outSeq;
+    if (seq != p->pathSeq) p->pathSeq = seq, p->pathDue = true, p->pathRounds = 0;
+    if (!p->pathDue) continue;
+    p->pathDue = false;
+    PathScanPane(p, p->pathRounds == 0);
+  }
+  PathSend();
+}
+
+// New output in a pane on screen: a pass soon.
+static void PathsMaybeChanged() {
+  if (g_tabs.empty()) return;
+  std::vector<Pane*> ls;
+  Leaves(CurTab().root, ls);
+  for (Pane* p : ls)
+    if (p->outSeq != p->pathSeq) return ArmPathScan();
+}
+
+// Cells of a row to draw in kPathFg. Text no pass has seen gets none for now, and a pass soon.
+static std::vector<char> PathMask(Pane* p, int row, const std::wstring& text) {
+  std::vector<char> m(p->cols, 0);
+  const auto* spans = PathSpansFor(p, row, std::hash<std::wstring>{}(text));
+  if (!spans) p->pathDue = true, p->pathRounds = 0;
+  if (p->pathDue) ArmPathScan();
+  if (spans)
+    for (auto [c0, c1] : *spans)
+      for (int c = std::max(0, c0); c < c1 && c < p->cols; c++) m[c] = 1;
+  return m;
+}
+
+// Answers from PathCheckThread: cached, and the link under the mouse is looked up again with them; if any of them is
+// new or different, the panes' paths too (a few rounds at most until their text changes).
 static void OnPathChecks(PathChecks* job) {
   g_paths.busy = false;
   DWORD now = GetTickCount();
-  for (size_t i = 0; i < job->paths.size() && i < job->attrs.size(); i++) {
-    std::wstring key = Lower(job->paths[i]);
-    g_paths.pending.erase(key);
-    g_paths.attrs[key] = TimedAttrs{job->attrs[i], now};
+  bool changed = false;
+  for (auto& f : job->paths) g_paths.pending.erase(Lower(f));
+  for (auto& [f, a] : job->attrs) {
+    std::wstring key = Lower(f);
+    auto it = g_paths.attrs.find(key);
+    changed = changed || it == g_paths.attrs.end() || it->second.attrs != a;
+    g_paths.attrs[key] = TimedAttrs{a, now};
+  }
+  for (size_t i = 0; i < job->dirs.size() && i < job->lists.size(); i++) {
+    std::wstring key = Lower(job->dirs[i]);
+    g_paths.dirsPending.erase(key);
+    auto it = g_paths.dirs.find(key);
+    changed = changed || it == g_paths.dirs.end() || it->second.ok != job->lists[i].ok ||
+              it->second.names != job->lists[i].names;
+    job->lists[i].tick = now;
+    g_paths.dirs[key] = std::move(job->lists[i]);
+  }
+  PathSend();
+  if (changed) {
+    for (Pane* p : g_live)
+      if (p->pathRounds < kPathRounds) p->pathRounds++, p->pathDue = true;
+    ArmPathScan();
   }
   g_paths.memoTick = 0;
   POINT pt;
@@ -5022,6 +5332,7 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
     // DirectWrite: the whole row (padding included) is composed off-screen and copied at the end.
     bool comp = DwBegin(RECT{p->content.left, y, p->content.right, y + g_cellH}, kBg);
     std::vector<char> url = UrlMask(p, row, rowText);
+    std::vector<char> path = PathMask(p, row, rowText(row));
     int col = 0;
     while (col < p->cols) {
       int start = col;
@@ -5040,6 +5351,9 @@ static RECT DrawPane(HDC dc, Pane* p, bool active, bool showFocus, bool onlyDirt
         Style s;
         s.fg = url[col] && VTERM_COLOR_IS_DEFAULT_FG(&c.fg) ? kUrl : ResolveColor(p, c.fg, true);
         s.bg = ResolveColor(p, c.bg, false);
+        // Paths that exist: their color over the program's (Claude Code colors inline code), but URLs keep theirs and
+        // nothing on a background of its own (diffs, bars) or in reverse video changes.
+        if (path[col] && !url[col] && VTERM_COLOR_IS_DEFAULT_BG(&c.bg) && !c.attrs.reverse) s.fg = kPathFg;
         if (c.attrs.dim)  // atenuado (SGR 2): a medio camino entre texto y fondo
           s.fg = RGB((GetRValue(s.fg) + GetRValue(s.bg)) / 2, (GetGValue(s.fg) + GetGValue(s.bg)) / 2,
                      (GetBValue(s.fg) + GetBValue(s.bg)) / 2);
@@ -5767,8 +6081,8 @@ static bool SaveScreenshot(const std::wstring& path) {
 //   auto-update:on|off update-check update-click update-state key:<tab|down|up|enter|esc> edit-text comp drag-tab:<de>,<a> tabs clipboard (estos y hover/hover-text dejan el resultado en <sesión>.bench)
 //   font:<family> font-wait font font-others toast (font, font-others and toast also write to <session>.bench)
 //   cells join:<hex>,<hex>... brightness font-size (these write to <session>.bench) select:<text> select-to:<text> copy brightness:<RRGGBB>
-//   font-size:<px> link-action:<col>,<row> hover-time:<col>,<row> path-probes (these write to <session>.bench;
-//   hover reports paths as "path <full path>")
+//   font-size:<px> link-action:<col>,<row> hover-time:<col>,<row> path-probes path-spans:<row> path-scan-time (these
+//   write to <session>.bench; hover reports paths as "path <full path>")
 
 static void SetStartWithWindows(bool on);
 
@@ -6608,6 +6922,25 @@ static void RunScriptStep() {
               (h.p ? kLinkActions[LinkAction(h)] + std::wstring(L" ") + (h.url.empty() ? h.path : h.url) : L"(sin enlace)"));
   } else if (s == L"path-probes") {  // disk lookups made for path links so far, and how many reached the network (0)
     ScriptLog(L"path-probes: " + std::to_wstring(g_pathProbes.load()) + L" remote " + std::to_wstring(g_remoteProbes.load()));
+  } else if (s.rfind(L"path-spans:", 0) == 0 && p) {  // path-spans:row — text drawn there in the path color, as DrawPane would
+    int r = _wtoi(s.c_str() + 11);
+    EnterCriticalSection(&p->cs);
+    std::wstring t = r >= 0 && r < p->rows ? RowText(p, r) : std::wstring();
+    const auto* spans = PathSpansFor(p, r, std::hash<std::wstring>{}(t));
+    std::wstring out;
+    for (size_t i = 0; spans && i < spans->size(); i++) {
+      auto [c0, c1] = (*spans)[i];
+      if (c0 >= 0 && c0 < c1 && c0 < (int)t.size()) out += (out.empty() ? L"" : L" | ") + t.substr(c0, c1 - c0);
+    }
+    LeaveCriticalSection(&p->cs);
+    ScriptLog(L"path-spans " + std::to_wstring(r) + L": " + (!spans ? L"(not looked at)" : out.empty() ? L"(none)" : out));
+  } else if (s == L"path-scan-time" && p) {  // µs of a highlighting pass over the active pane (with what's cached)
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    for (int i = 0; i < 20; i++) PathScanPane(p, false);
+    QueryPerformanceCounter(&t1);
+    ScriptLog(L"path-scan-time: " + std::to_wstring((t1.QuadPart - t0.QuadPart) * 50000 / f.QuadPart) + L"us");
   } else if (s.rfind(L"hover-time:", 0) == 0 && p) {  // hover-time:col,row — µs of that hover with the path cache empty, then full
     int c = 0, r = 0;
     swscanf(s.c_str() + 11, L"%d,%d", &c, &r);
@@ -7155,6 +7488,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_APP_DIRTY:
       g_dirtyPosted = false;
+      PathsMaybeChanged();
       if (GetTickCount() - g_lastFrame < 16) {  // como mucho 60 fotogramas por segundo
         if (!g_frameTimer) SetTimer(hwnd, TIMER_FRAME, 16, nullptr), g_frameTimer = true;
       } else {
@@ -7177,6 +7511,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, TIMER_FRAME);
         g_frameTimer = false;
         PaintDirty();
+      } else if (wp == TIMER_PATHS) {
+        KillTimer(hwnd, TIMER_PATHS);
+        g_pathTimer = false;
+        ScanPaths();
       } else if (wp == TIMER_UPDANIM) {  // barra de «Instalando…» en movimiento
         if (g_upd.stage == UPD_INSTALLING && !g_upd.hidden) InvalidateRect(hwnd, &g_upd.rc, FALSE);
       } else if (wp == TIMER_UPDATE) {
