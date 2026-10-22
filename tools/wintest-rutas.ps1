@@ -6,7 +6,8 @@
 # (\\host\share, //host/share) and \\?\ \\.\ device paths are never links and are never even looked up
 # (that would connect to the host and leak the NTLM hash): an existing file through \\localhost\C$, a
 # \\evil\share path, and the path-probes counter of lookups that reached the network (must be 0). Also
-# how long a hover takes with the path cache empty and full. Results in session-rutas.txt.bench.
+# how long a hover takes with the path cache empty and full, and the right-click menu on a file, a folder and
+# a URL (and its copy item). Results in session-rutas.txt.bench.
 $ErrorActionPreference = 'Stop'
 $dir = $PSScriptRoot
 $env:WARPLITE_NO_UPDATE = '1'
@@ -79,7 +80,9 @@ $steps += @("hover:$cu,19", 'wait', "hover:$cu,19", "hover:$($ce[0]),20", "hover
   "hover:$($cd[1]),21")
 $steps += @(
   "link-action:$($c.tool),10", "link-action:$($c.run),10", "link-action:$($c.folder),6", 'link-action:10,5',
-  'link-action:6,12', "link-action:$($c.missing),7", "link-action:$cu,19", 'path-probes',
+  'link-action:6,12', "link-action:$($c.missing),7", "link-action:$cu,19",
+  "link-menu:$($c.final),3", "link-menu:$($c.folder),6", 'link-menu:6,12', "link-menu:$($c.missing),7",
+  "link-menu:$($c.final),3,2", 'clipboard', 'link-menu:6,12,2', 'clipboard', 'path-probes',
   'hover-time:4,1', 'hover-time:30,15', 'hover-time:2,18',
   'quit'
 )
@@ -103,7 +106,11 @@ $want += @("hover $cu,19: $none", "hover $cu,19: $none", "hover $($ce[0]),20: $n
 $want += @(
   "link-action $($c.tool),10: select $t\tool.exe", "link-action $($c.run),10: select $t\run.ps1",
   "link-action $($c.folder),6: explorer $t\src", "link-action 10,5: open $t\file.txt",
-  'link-action 6,12: open https://example.com/a/b', "link-action $($c.missing),7: $none", "link-action $cu,19: $none"
+  'link-action 6,12: open https://example.com/a/b', "link-action $($c.missing),7: $none", "link-action $cu,19: $none",
+  "link-menu $($c.final),3: Open | Copy path | Open file location", "link-menu $($c.folder),6: Open | Copy path | Open file location",
+  'link-menu 6,12: Open | Copy link', "link-menu $($c.missing),7: $none",
+  "link-menu $($c.final),3: Open | Copy path | Open file location", "clipboard: $t\Mis Notas\nota final.txt",
+  'link-menu 6,12: Open | Copy link', 'clipboard: https://example.com/a/b'
 )
 $fail = 0
 # Lookups so far: some (the local paths above), none of them to the network.

@@ -249,7 +249,8 @@ enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, 
            S_LOADING, S_KIND_CMD, S_KIND_DIR, S_KIND_FILE, S_KIND_PARAM, S_UPD_AVAIL, S_UPD_INSTALLING, S_UPD_READY,
            S_UPD_FAILED, S_UPD_INSTALL, S_UPD_RESTART, S_UPD_RETRY, S_UPD_CHECK, S_UPD_AUTO, S_UPD_LATEST, S_UPD_CHECKING,
            S_UPD_OFFLINE, S_UPD_DOWNLOADING, S_SWITCH, S_OTHER_WINDOW, S_FONT_MENU, S_OTHER_FONTS, S_FONT_FAILED,
-           S_FONT_SIZE, S_TEXT_BRIGHTNESS, S_DEFAULT, S_RECONNECTING, S_RECONNECT_WAIT, S_REOPEN, S_COUNT };
+           S_FONT_SIZE, S_TEXT_BRIGHTNESS, S_DEFAULT, S_RECONNECTING, S_RECONNECT_WAIT, S_REOPEN, S_OPEN, S_COPY_PATH, S_COPY_LINK,
+           S_OPEN_LOCATION, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
@@ -260,7 +261,7 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Couldn't check for updates", L"Downloading %s…", L"Search terminals…", L"other window", L"Font",
      L"Other installed", L"Couldn't download %s", L"Font size", L"Text brightness", L"default",
      L"Reconnecting… (attempt %d) — Esc to cancel", L"Reconnecting in %d s (attempt %d) — Esc to cancel",
-     L"Reopen on restart"},
+     L"Reopen on restart", L"Open", L"Copy path", L"Copy link", L"Open file location"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
@@ -271,7 +272,7 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Descargando %s…", L"Buscar terminales…", L"otra ventana", L"Fuente", L"Otras instaladas",
      L"No se pudo descargar %s", L"Tamaño de letra", L"Brillo del texto", L"predeterminado",
      L"Reconectando… (intento %d) — Esc para cancelar", L"Reconectando en %d s (intento %d) — Esc para cancelar",
-     L"Abrir al reiniciar"},
+     L"Abrir al reiniciar", L"Abrir", L"Copiar ruta", L"Copiar enlace", L"Abrir ubicación del archivo"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -1708,6 +1709,16 @@ static void SetClipboardText(const std::wstring& s) {
 }
 
 static void CopySelection() { SetClipboardText(SelectionText()); }
+// OSC 52 that arrives right after a mouse release in an app (tmux copies on drag end) waits here
+// until Ctrl+C; copies from the keyboard (tmux y/Enter, nvim) still go straight to the clipboard.
+static std::wstring g_clipPending;
+static DWORD g_appMouseUp = 0;  // GetTickCount() of the last button release sent to an app (0: none)
+static bool CopyPending() {
+  if (g_clipPending.empty()) return false;
+  SetClipboardText(g_clipPending);
+  g_clipPending.clear();
+  return true;
+}
 
 static bool EditorActive(Pane* p);
 static void EditorInsert(Pane* p, const std::wstring& t);
@@ -2063,7 +2074,10 @@ static bool HandleShortcut(WPARAM vk) {
       case 'E': SplitActive(false); return true;   // dividir hacia abajo
       case 'T': NewTab(g_activeTab + 1); return true;
       case 'W': ClosePane(act); return true;
-      case 'C': CopySelection(); return true;
+      case 'C':
+        if (g_hasSel) CopySelection();
+        else CopyPending();
+        return true;
       case 'V': Paste(act); return true;
       case 'F': OpenFind(act); return true;  // Ctrl+Shift+F: el de Warp
       case 'K': OpenSwitcher(); return true;  // Ctrl+Shift+K: saltar a cualquier terminal
@@ -2111,7 +2125,7 @@ static bool HandleShortcut(WPARAM vk) {
           InvalidateRect(g_hwnd, nullptr, FALSE);
           return true;
         }
-        return false;
+        return CopyPending();
       case 'V': Paste(act); return true;
       case 'F': OpenFind(act); return true;
     }
@@ -3245,6 +3259,9 @@ static bool EditorKey(Pane* p, WPARAM vk) {
 // Devuelve true si la tecla se ha consumido (no se traduce a WM_CHAR).
 static bool HandleKeyDown(WPARAM vk, LPARAM) {
   if (g_tabs.empty()) return false;
+  // Any other key drops a pending tmux copy, so a later Ctrl+C still interrupts instead of copying.
+  if (vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU && !(vk == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)))
+    g_clipPending.clear();
   if (HandleShortcut(vk)) return true;
   Pane* p = CurTab().active;
   // Any key in a pane that is reconnecting stops it (bare modifiers don't); Esc while waiting does
@@ -3953,12 +3970,35 @@ static DWORD WINAPI PathOpenThread(LPVOID arg) {
   return 0;
 }
 
-static void OpenPathLink(const LinkHit& h) {
+static void OpenPathLink(const LinkHit& h, int action = -1) {
   if (!DriveSpeed(h.path)) return;  // never a share or network drive (PathAt doesn't return those either)
-  auto* job = new PathOpen{h.path, LinkAction(h)};
+  auto* job = new PathOpen{h.path, action < 0 ? LinkAction(h) : action};
   HANDLE t = CreateThread(nullptr, 0, PathOpenThread, job, 0, nullptr);
   if (t) CloseHandle(t);
   else delete job;
+}
+
+// Right-click menu on a link: open it (like Ctrl+click), copy it, or show the file or folder selected
+// in Explorer.
+static std::vector<Str> LinkMenuItems(const LinkHit& h) {
+  if (!h.url.empty()) return {S_OPEN, S_COPY_LINK};
+  return {S_OPEN, S_COPY_PATH, S_OPEN_LOCATION};
+}
+
+static void LinkMenuRun(const LinkHit& h, Str item) {
+  if (item == S_OPEN && !h.url.empty()) ShellExecuteW(nullptr, L"open", h.url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  else if (item == S_OPEN) OpenPathLink(h);
+  else if (item == S_COPY_LINK || item == S_COPY_PATH) SetClipboardText(h.url.empty() ? h.path : h.url);
+  else if (item == S_OPEN_LOCATION) OpenPathLink(h, LINK_SELECT);  // file or folder selected in Explorer
+}
+
+static void LinkMenu(const LinkHit& h, POINT screen) {
+  HMENU m = CreatePopupMenu();
+  auto items = LinkMenuItems(h);
+  for (size_t i = 0; i < items.size(); i++) AppendMenuW(m, MF_STRING, i + 1, T(items[i]));
+  int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, g_hwnd, nullptr);
+  DestroyMenu(m);
+  if (cmd > 0) LinkMenuRun(h, items[cmd - 1]);
 }
 
 // URL bajo el punto (también si se pulsa en el trozo de una URL partida).
@@ -6756,6 +6796,21 @@ static void RunScriptStep() {
     std::wstring r = L"tabs:";
     for (int i = 0; i < (int)g_tabs.size(); i++) r += L" " + (i == g_activeTab ? L"*" + g_tabs[i].name : g_tabs[i].name);
     ScriptLog(r);
+  } else if (s.rfind(L"link-menu:", 0) == 0 && p) {  // link-menu:col,row[,n] — the right-click menu there; n runs item n (never «Open»)
+    int c = 0, r = 0, n = 0;
+    swscanf(s.c_str() + 10, L"%d,%d,%d", &c, &r, &n);
+    LinkHit h = LinkAt(p, p->content.left + kPad + c * g_cellW + 1, p->content.top + kPad + r * g_cellH + 1);
+    std::wstring out;
+    auto items = h.p ? LinkMenuItems(h) : std::vector<Str>{};
+    for (Str i : items) out += (out.empty() ? L"" : L" | ") + std::wstring(T(i));
+    ScriptLog(L"link-menu " + std::to_wstring(c) + L"," + std::to_wstring(r) + L": " + (out.empty() ? L"(sin enlace)" : out));
+    if (n > 1 && n <= (int)items.size()) LinkMenuRun(h, items[n - 1]);
+    delay = 1500;
+  } else if (s.rfind(L"osc52-drag:", 0) == 0) {  // OSC 52 as tmux sends it when a mouse drag ends
+    g_appMouseUp = GetTickCount() | 1;
+    SendMessageW(g_hwnd, WM_APP_CLIP, 0, (LPARAM) new std::wstring(s.substr(11)));
+  } else if (s == L"ctrl-c") {  // what Ctrl+C does with no selection: copies a pending tmux copy, if any
+    ScriptLog(std::wstring(L"ctrl-c: ") + (CopyPending() ? L"copia" : L"al programa"));
   } else if (s == L"clipboard") {
     std::wstring w = L"(vacío)";
     if (OpenClipboard(g_hwnd)) {
@@ -7076,7 +7131,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (c == L'\n' && (w.empty() || w.back() != L'\r')) w += L'\r';
         w += c;
       }
-      SetClipboardText(w);
+      if (g_appMouseUp && GetTickCount() - g_appMouseUp < 2000) g_clipPending = w;  // drag in tmux: until Ctrl+C
+      else SetClipboardText(w);
       return 0;
     }
     case WM_APP_LAYOUT: {
@@ -7269,6 +7325,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
       if (g_tabs.empty()) return 0;
       SetFocus(hwnd);
+      g_clipPending.clear();
       if (g_renameTab >= 0) EndRename(true);  // clic fuera: guarda el nombre
       if (POINT pt{x, y}; PtInRect(&g_upd.rc, pt)) {  // aviso de actualización
         if (msg == WM_LBUTTONDOWN && PtInRect(&g_upd.close, pt)) g_upd.hidden = true;
@@ -7362,6 +7419,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (!h.path.empty()) {  // file: its app; folder: Explorer; program or script: selected, never run
           OpenPathLink(h);
+          return 0;
+        }
+      }
+      if (msg == WM_RBUTTONDOWN && !g_hasSel) {  // right-click on a link: its menu (also over tmux or a TUI)
+        LinkHit h = LinkAt(p, x, y);
+        if (!h.url.empty() || !h.path.empty()) {
+          POINT sp{x, y};
+          ClientToScreen(hwnd, &sp);
+          LinkMenu(h, sp);
           return 0;
         }
       }
@@ -7512,8 +7578,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
       }
       if (g_tabs.empty() || y < TabBarH()) return 0;
-      if (Pane* p = PaneAt(x, y); p && p->mouseMode && !(GetKeyState(VK_SHIFT) & 0x8000))
+      if (Pane* p = PaneAt(x, y); p && p->mouseMode && !(GetKeyState(VK_SHIFT) & 0x8000)) {
         MouseToApp(p, x, y, msg == WM_LBUTTONUP ? 1 : msg == WM_MBUTTONUP ? 2 : 3, false);
+        g_appMouseUp = GetTickCount() | 1;
+      }
       return 0;
     }
     case WM_SETCURSOR:
