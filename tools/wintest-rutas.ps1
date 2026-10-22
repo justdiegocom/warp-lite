@@ -7,7 +7,11 @@
 # (that would connect to the host and leak the NTLM hash): an existing file through \\localhost\C$, a
 # \\evil\share path, and the path-probes counter of lookups that reached the network (must be 0). Also
 # how long a hover takes with the path cache empty and full, and the right-click menu on a file, a folder and
-# a URL (and its copy item). Results in session-rutas.txt.bench.
+# a URL (and its copy item). Highlighting, before any hover: what each row draws in the path color (the paths
+# above, also wrapped and with spaces; nothing for the missing path, the URL, the sentence and the network and
+# device paths) and how long a pass takes. -Capture <file.bmp> also saves a screenshot of it. Results in
+# session-rutas.txt.bench.
+param([string]$Capture = '')
 $ErrorActionPreference = 'Stop'
 $dir = $PSScriptRoot
 $env:WARPLITE_NO_UPDATE = '1'
@@ -16,7 +20,7 @@ $t = "$dir\rutas"
 $sample = "$dir\rutas-sample.txt"
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$env:WARPLITE_SESSION*", $t, $sample
 $shotDir = "$t\Diego Rodriguez\Pictures\Zas"
-New-Item -ItemType Directory -Force $shotDir, "$t\Mis Notas", "$t\src" | Out-Null
+New-Item -ItemType Directory -Force $shotDir, "$t\Mis Notas", "$t\Mis", "$t\src" | Out-Null
 $shot = "$shotDir\Screenshot 2026-10-21 14.24.19.png"
 foreach ($f in $shot, "$t\Mis Notas\nota final.txt", "$t\src\main.cpp", "$t\file.txt", "$t\tool.exe", "$t\run.ps1") {
   Set-Content -Encoding ASCII $f 'x'
@@ -31,14 +35,14 @@ $lines = @(
   "Abre $t\Mis Notas\nota final.txt ahora",           # 3
   'Mira src\main.cpp:120 luego',                      # 4
   'error en file.txt:12:3 aqui',                      # 5
-  "Carpeta $t\src",                                   # 6
+  "Carpeta $t\src /s",                                # 6
   "Falta $t\no-existe.txt",                           # 7
   "Guardado en $t\file.txt.",                         # 8
   '(ver src\main.cpp)',                               # 9
   "Lanza $t\tool.exe o run.ps1 ya",                   # 10
   "Abre $fileUrl",                                    # 11
   'Web https://example.com/a/b',                      # 12
-  '',                                                 # 13
+  "Nueva $t\Mis Notas\nueva.txt",                      # 13
   '- The quick brown fox jumps over the lazy dog while the build keeps running and the',  # 14
   '  tests wait for the next machine to be free so nothing else starts on it right now',  # 15
   '  and then the report is written with every result and the time each step took ok'    # 16
@@ -68,8 +72,10 @@ $c = @{
   tool = ("Lanza $t\").Length + 1; run = ("Lanza $t\tool.exe o ").Length + 1
   url = ("Abre $fileUrl").Length - 6
 }
-$steps = @(
-  'wait', 'wait', 'wait', 'edit:Set-Location $env:WLT_DIR', 'submit', 'wait', $show, 'submit', 'wait', 'wait',
+$steps = @('wait', 'wait', 'wait', 'edit:Set-Location $env:WLT_DIR', 'submit', 'wait', $show, 'submit', 'wait', 'wait')
+$steps += 0..21 | ForEach-Object { "path-spans:$_" }
+if ($Capture) { $steps += "shot:$Capture" }
+$steps += @(
   'hover:5,0', "hover:$rod,0", 'hover:4,1', 'hover:4,2', 'hover:15,2',
   "hover:$($c.final),3", "hover:$($c.ahora),3",
   'hover:6,4', "hover:$($c.line),4", "hover:$($c.luego),4",
@@ -82,7 +88,7 @@ $steps += @(
   "link-action:$($c.tool),10", "link-action:$($c.run),10", "link-action:$($c.folder),6", 'link-action:10,5',
   'link-action:6,12', "link-action:$($c.missing),7", "link-action:$cu,19",
   "link-menu:$($c.final),3", "link-menu:$($c.folder),6", 'link-menu:6,12', "link-menu:$($c.missing),7",
-  "link-menu:$($c.final),3,2", 'clipboard', 'link-menu:6,12,2', 'clipboard', 'path-probes',
+  "link-menu:$($c.final),3,2", 'clipboard', 'link-menu:6,12,2', 'clipboard', 'path-probes', 'path-scan-time',
   'hover-time:4,1', 'hover-time:30,15', 'hover-time:2,18',
   'quit'
 )
@@ -112,7 +118,29 @@ $want += @(
   "link-menu $($c.final),3: Open | Copy path | Open file location", "clipboard: $t\Mis Notas\nota final.txt",
   'link-menu 6,12: Open | Copy link', 'clipboard: https://example.com/a/b'
 )
+# Highlighting: the text of each path drawn in its color, row by row (17-18: the path the terminal wrapped).
+# Missing files draw nothing, not even a folder that exists before a space in them ($t\Mis in row 13).
+$file = $env:WLT_FILE
+$wantSpans = @(
+  "$t\Diego", 'Rodriguez\Pictures\Zas\Screenshot', '2026-10-21 14.24.19.png', "$t\Mis Notas\nota final.txt",
+  'src\main.cpp:120', 'file.txt:12:3', "$t\src", '(none)',
+  "$t\file.txt", 'src\main.cpp', "$t\tool.exe | run.ps1", $fileUrl, '(none)', '(none)', '(none)', '(none)', '(none)',
+  $file.Substring(0, 19), $file.Substring(19), '(none)', '(none)', '(none)'
+)
+$spans = @($got | Where-Object { $_ -like 'path-spans *' })
+$scan = @($got | Where-Object { $_ -like 'path-scan-time*' })
+$got = @($got | Where-Object { $_ -notlike 'path-spans *' -and $_ -notlike 'path-scan-time*' })
 $fail = 0
+for ($i = 0; $i -lt $wantSpans.Count; $i++) {
+  $w = "path-spans ${i}: $($wantSpans[$i])"
+  $ok = $i -lt $spans.Count -and $spans[$i] -eq $w
+  if (-not $ok) { $fail++ }
+  '{0} {1}' -f $(if ($ok) { 'OK  ' } else { 'FALLO' }), $(if ($i -lt $spans.Count) { if ($ok) { $spans[$i] } else { "$($spans[$i]) (esperado $w)" } } else { "(falta) $w" })
+}
+# A pass over the whole view with the cache full: generous limit, it's about not freezing the UI.
+$ok = $scan.Count -eq 1 -and $scan[0] -match '^path-scan-time: (\d+)us$' -and [int]$Matches[1] -lt 5000
+if (-not $ok) { $fail++ }
+'{0} {1}' -f $(if ($ok) { 'OK  ' } else { 'FALLO' }), $(if ($scan.Count) { $scan[0] } else { '(falta) path-scan-time' })
 # Lookups so far: some (the local paths above), none of them to the network.
 $probes = @($got | Where-Object { $_ -like 'path-probes:*' })
 $ok = $probes.Count -eq 1 -and $probes[0] -match '^path-probes: (\d+) remote 0$' -and [int]$Matches[1] -gt 0
