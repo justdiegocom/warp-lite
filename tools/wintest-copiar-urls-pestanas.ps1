@@ -1,4 +1,5 @@
-# URLs partidas de Claude Code (listas, «(sirve…» debajo), OSC 52 → portapapeles y arrastrar
+# URLs partidas de Claude Code (listas, «(sirve…» debajo), OSC 52 → portapapeles (tras soltar el ratón en tmux,
+# solo con Ctrl+C) y arrastrar
 # pestañas para reordenarlas. Todo deja su resultado en session-cup.txt.bench; se compara aquí.
 $ErrorActionPreference = 'Stop'
 $dir = $PSScriptRoot
@@ -21,7 +22,8 @@ $steps = @(
   'hover-text:as/releases/tag/v1.21.24', 'hover-text:(sirve la libreria reexportada).', 'hover-text:Prueba a volver a un traje', 'hover-text:te',
   "shot:$dir\cup.bmp",
   'clear', "edit:$tmux", 'submit', 'wait', 'hover:2,1', 'hover:6,2', 'hover:2,3', 'hover:2,4',
-  "edit:$osc", 'submit', 'wait', 'clipboard', 'edit:pwd', 'submit', 'wait',
+  "edit:$osc", 'submit', 'wait', 'clipboard',
+  'osc52-drag:arrastre', 'clipboard', 'ctrl-c', 'clipboard', 'ctrl-c', 'edit:pwd', 'submit', 'wait',
   'rename:A', 'tab', 'rename:B', 'tab', 'rename:C', 'tabs', 'drag-tab:0,2', 'tabs', 'drag-tab:2,0', 'tabs', 'drag-tab:1,2', 'tabs',
   'quit'
 )
@@ -39,6 +41,7 @@ $want = @(
   'hover 2,3: https://github.com/justdiegocom/aaa*aaawarp-lite',
   'hover 2,4: (sin enlace)',
   'clipboard: hola\nmundo ñ',
+  'clipboard: hola\nmundo ñ', 'ctrl-c: copia', 'clipboard: arrastre', 'ctrl-c: al programa',
   'tabs: A B *C', 'tabs: B C *A', 'tabs: *A B C', 'tabs: A C *B'
 )
 $fail = 0
