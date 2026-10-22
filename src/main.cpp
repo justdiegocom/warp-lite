@@ -7140,7 +7140,7 @@ static void RunScriptStep() {
     if (n > 1 && n <= (int)items.size()) LinkMenuRun(h, items[n - 1]);
     delay = 1500;
   } else if (s.rfind(L"osc52-drag:", 0) == 0) {  // OSC 52 as tmux sends it when a mouse drag ends
-    g_appMouseUp = GetTickCount() | 1;
+    g_appMouseUp = std::max<DWORD>(GetTickCount(), 1);
     SendMessageW(g_hwnd, WM_APP_CLIP, 0, (LPARAM) new std::wstring(s.substr(11)));
   } else if (s == L"ctrl-c") {  // what Ctrl+C does with no selection: copies a pending tmux copy, if any
     ScriptLog(std::wstring(L"ctrl-c: ") + (CopyPending() ? L"copia" : L"al programa"));
@@ -7918,7 +7918,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_tabs.empty() || y < TabBarH()) return 0;
       if (Pane* p = PaneAt(x, y); p && p->mouseMode && !(GetKeyState(VK_SHIFT) & 0x8000)) {
         MouseToApp(p, x, y, msg == WM_LBUTTONUP ? 1 : msg == WM_MBUTTONUP ? 2 : 3, false);
-        g_appMouseUp = GetTickCount() | 1;
+        g_appMouseUp = std::max<DWORD>(GetTickCount(), 1);  // not ahead of the clock: WM_APP_CLIP's 2 s check would wrap
       }
       return 0;
     }
