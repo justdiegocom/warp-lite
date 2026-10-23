@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "vterm.h"
+#include "qrcodegen.hpp"
 
 // Hack, la fuente por defecto de Warp, va dentro del .exe (third_party/hack, MIT/Bitstream Vera).
 __asm__(".section .rdata,\"dr\"\n.balign 4\n"
@@ -108,7 +109,8 @@ static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
 enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS, WM_APP_PROMPT, WM_APP_NETCHANGE, WM_APP_NOTE };
-enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6, TIMER_PATHS = 7 };
+enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6, TIMER_PATHS = 7,
+       TIMER_REMOTE = 8, TIMER_PAIR = 9 };
 
 // ---------------------------------------------------------------------------
 // Modelo: pestañas -> árbol de paneles
@@ -269,7 +271,9 @@ enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, 
            S_UPD_FAILED, S_UPD_INSTALL, S_UPD_RESTART, S_UPD_RETRY, S_UPD_CHECK, S_UPD_AUTO, S_UPD_LATEST, S_UPD_CHECKING,
            S_UPD_OFFLINE, S_UPD_DOWNLOADING, S_SWITCH, S_OTHER_WINDOW, S_FONT_MENU, S_OTHER_FONTS, S_FONT_FAILED,
            S_FONT_SIZE, S_TEXT_BRIGHTNESS, S_DEFAULT, S_RECONNECTING, S_RECONNECT_WAIT, S_REOPEN, S_OPEN, S_COPY_PATH, S_COPY_LINK,
-           S_OPEN_LOCATION, S_UNREAD, S_COUNT };
+           S_OPEN_LOCATION, S_UNREAD, S_PAIR_PHONE, S_PAIRED_DEVICES, S_NO_DEVICES, S_REMOVE_DEVICE, S_PAIR_TITLE, S_PAIR_HINT,
+           S_PAIR_STARTING, S_PAIR_EXPIRES, S_PAIR_EXPIRED, S_PAIR_NEW, S_COPY, S_COPIED, S_PAIR_FAILED, S_PHONE_PAIRED,
+           S_PHONE_CONNECTED, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
@@ -280,7 +284,11 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Couldn't check for updates", L"Downloading %s…", L"Search terminals…", L"other window", L"Font",
      L"Other installed", L"Couldn't download %s", L"Font size", L"Text brightness", L"default",
      L"Reconnecting… (attempt %d) — Esc to cancel", L"Reconnecting in %d s (attempt %d) — Esc to cancel",
-     L"Reopen on restart", L"Open", L"Copy path", L"Copy link", L"Open file location", L"%d unread"},
+     L"Reopen on restart", L"Open", L"Copy path", L"Copy link", L"Open file location", L"%d unread", L"Pair phone…",
+     L"Paired devices", L"No paired devices", L"Remove \u201c%ls\u201d", L"Pair phone",
+     L"Scan it with the Warp app on your phone, or paste the text there.", L"Getting a pairing code…",
+     L"Expires in %d:%02d", L"This code has expired.", L"New code", L"Copy", L"Copied",
+     L"Couldn't start pairing: %ls", L"Phone paired", L"Phone connected"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
@@ -291,7 +299,11 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Descargando %s…", L"Buscar terminales…", L"otra ventana", L"Fuente", L"Otras instaladas",
      L"No se pudo descargar %s", L"Tamaño de letra", L"Brillo del texto", L"predeterminado",
      L"Reconectando… (intento %d) — Esc para cancelar", L"Reconectando en %d s (intento %d) — Esc para cancelar",
-     L"Abrir al reiniciar", L"Abrir", L"Copiar ruta", L"Copiar enlace", L"Abrir ubicación del archivo", L"%d sin leer"},
+     L"Abrir al reiniciar", L"Abrir", L"Copiar ruta", L"Copiar enlace", L"Abrir ubicación del archivo", L"%d sin leer",
+     L"Vincular móvil…", L"Dispositivos vinculados", L"Ningún dispositivo vinculado", L"Quitar \u00ab%ls\u00bb",
+     L"Vincular móvil", L"Escanéalo con la app Warp del móvil, o pega allí el texto.", L"Preparando el código…",
+     L"Caduca en %d:%02d", L"Este código ha caducado.", L"Código nuevo", L"Copiar", L"Copiado",
+     L"No se pudo empezar a vincular: %ls", L"Móvil vinculado", L"Móvil conectado"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -317,6 +329,8 @@ static bool g_isMain = false, g_reopen = false, g_restartAll = false;
 static bool g_keepSession = false;  // closing for quit-all / Windows shutdown: its last pane closing doesn't discard it
 static UINT g_msgQuitAll;           // mensaje registrado: «cerrar todas» (wParam 1: update restart, all come back)
 static UINT g_msgListPanes, g_msgFocusPane;  // selector de terminales entre ventanas (Ctrl+Shift+K)
+static UINT g_msgRemote, g_msgRemoteState;   // warp-remote → windows: phones / events; windows → it: how many phones
+static int g_remotePhones = 0;               // phones connected now (title-bar indicator, see «Phone»)
 static std::wstring g_openDir;      // --cd <carpeta> («Abrir Warp aquí»): pestaña nueva ya en ella
 // Las ventanas de un mismo Warp (mismo %APPDATA%\warp-lite, o la misma carpeta en las pruebas) se
 // reconocen por esta marca: así las pruebas nunca tocan las ventanas de verdad.
@@ -2179,12 +2193,15 @@ static int OtherWindows() {
 }
 
 static std::vector<HWND> SiblingWindows();
+static bool RemoteCommand(const std::wstring& cmd);
 
 // Closes every window of this Warp (Ctrl+Shift+Q, the update restart), never those of another one
-// (a test's, or the real one from a test). update: they all come back at the next start.
+// (a test's, or the real one from a test). update: they all come back at the next start. Its warp-remote
+// goes too (after an update the new one starts with the windows).
 static void QuitAll(bool update) {
   for (HWND h : SiblingWindows()) PostMessageW(h, g_msgQuitAll, update ? 1 : 0, 0);
   PostMessageW(g_hwnd, g_msgQuitAll, update ? 1 : 0, 0);
+  RemoteCommand(L"quit");
 }
 
 // Lleva una pestaña (o un solo panel) a una ventana nueva en el punto de la pantalla donde
@@ -2641,8 +2658,11 @@ static std::wstring PaneListText() {
       Pane* p = ls[j];
       std::wstring title = !p->agentName.empty() ? p->agentName
                            : ls.size() == 1 && !g_tabs[i].name.empty() ? g_tabs[i].name : ShortTitle(p);
+      // Then the tab's name and the agent (Claude Code / Codex), for warp-remote (older windows read the first 5).
+      std::wstring tab = g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name;
+      const wchar_t* agent = p->agent == AGENT_CLAUDE ? L"claude" : p->agent == AGENT_CODEX ? L"codex" : L"";
       out += std::to_wstring(i) + L"\t" + std::to_wstring(j) + L"\t" + clean(title) + L"\t" + clean(p->cwd) + L"\t" +
-             clean(p->runningCmd) + L"\n";
+             clean(p->runningCmd) + L"\t" + clean(tab) + L"\t" + agent + L"\n";
     }
   }
   return out;
@@ -5825,8 +5845,16 @@ static void DrawTitleBar(HDC dc, int w, int h) {
     if (pct >= 0 && g_fontFiles) swprintf(b + wcslen(b), 160 - wcslen(b), L" %d %%", (g_fontFile * 100 + pct) / g_fontFiles);
     toast = b;
   }
+  int right = w - 3 * WinBtnW() - Px(12);
+  if (g_remotePhones > 0) {  // a phone is connected (warp-remote)
+    RECT pr{right - Px(22), 0, right, th};
+    SelectObject(dc, g_iconFont);
+    Text(dc, L"\uE8EA", pr, kAccent, DT_CENTER);  // CellPhone
+    SelectObject(dc, g_uiFont);
+    right = pr.left - Px(6);
+  }
   if (!toast.empty()) {
-    RECT tr{L.end + Px(10), 0, w - 3 * WinBtnW() - Px(12), th};
+    RECT tr{L.end + Px(10), 0, right, th};
     Text(dc, toast, tr, kFg, DT_RIGHT);
   }
   // Minimizar, maximizar/restaurar, cerrar
@@ -6114,6 +6142,276 @@ static void DrawCompletion(HDC dc) {
   SetBkMode(dc, OPAQUE);
 }
 
+// ---------------------------------------------------------------------------
+// Phone: a paired phone sees this Warp's terminals from anywhere (iroh: direct UDP when hole punching
+// works, n0's relays otherwise). warp-remote.exe, next to Warp.exe, does the networking in its own process:
+// one per Warp, started by the main window when a phone is paired or by any window when pairing is asked
+// for, and it ends with the last window of this Warp. It lists the panes the same way the terminal switcher
+// does (g_msgListPanes), so the windows need nothing new for that. Messages: warp-remote/src/win.rs.
+
+static const ULONG_PTR kCopyRemote = 0x57524d00, kCopyRemoteTicket = 0x57525400;
+struct PairCard {
+  bool open = false;
+  std::wstring ticket, error;
+  DWORD shown = 0, expires = 0;          // GetTickCount: card opened (or code asked for), code stops working
+  std::vector<std::vector<bool>> qr;     // modules of the QR code, [y][x]
+  bool copied = false;
+  RECT rc{}, action{}, close{};
+};
+static PairCard g_pair;
+
+// Key, allow-list and log of this Warp's warp-remote (a test's next to its session, never the real one).
+static std::wstring RemoteDir() { return g_windowDir.empty() ? g_sessionPath + L".remote" : g_windowDir + L"\\remote"; }
+
+struct PairedDevice {
+  std::wstring id, name;
+  long long when = 0;
+};
+
+// devices.txt: one paired device per line, «<id hex>\t<unix seconds>\t<name>» (written by warp-remote).
+static std::vector<PairedDevice> PairedDevices() {
+  std::vector<PairedDevice> out;
+  HANDLE f = CreateFileW((RemoteDir() + L"\\devices.txt").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return out;
+  std::string data(std::min<DWORD>(GetFileSize(f, nullptr), 1 << 20), 0);
+  DWORD r = 0;
+  ReadFile(f, data.data(), (DWORD)data.size(), &r, nullptr);
+  CloseHandle(f);
+  data.resize(r);
+  std::istringstream in(data);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    size_t a = line.find('\t'), b = a == std::string::npos ? a : line.find('\t', a + 1);
+    if (a == std::string::npos || a != 64) continue;
+    PairedDevice d;
+    d.id = ToWide(line.substr(0, a));
+    d.when = atoll(line.substr(a + 1, b == std::string::npos ? std::string::npos : b - a - 1).c_str());
+    d.name = b == std::string::npos ? L"" : ToWide(line.substr(b + 1));
+    if (d.name.empty()) d.name = d.id.substr(0, 10);
+    out.push_back(d);
+  }
+  return out;
+}
+
+// This Warp's warp-remote: its hidden message window carries our instance key.
+static HWND RemoteWindow() {
+  for (HWND h = nullptr; (h = FindWindowExW(HWND_MESSAGE, h, L"WarpRemote", nullptr));)
+    if (GetPropW(h, kInstanceProp) == InstanceKey()) return h;
+  return nullptr;
+}
+
+static bool RemoteCommand(const std::wstring& cmd) {
+  HWND h = RemoteWindow();
+  if (!h) return false;
+  COPYDATASTRUCT cd{kCopyRemote, (DWORD)(cmd.size() * sizeof(wchar_t)), (void*)cmd.data()};
+  DWORD_PTR r = 0;
+  return SendMessageTimeoutW(h, WM_COPYDATA, (WPARAM)g_hwnd, (LPARAM)&cd, SMTO_ABORTIFHUNG, 2000, &r) && r;
+}
+
+// Starts this Warp's warp-remote if it isn't running. pair: and asks it for a pairing code for this window
+// (the answer comes as WM_COPYDATA kCopyRemoteTicket).
+static bool StartRemote(bool pair) {
+  wchar_t hwnd[40];
+  swprintf(hwnd, 40, L"%llx", (unsigned long long)(ULONG_PTR)g_hwnd);
+  if (RemoteWindow()) return !pair || RemoteCommand(L"pair " + std::wstring(hwnd));
+  wchar_t self[MAX_PATH];
+  GetModuleFileNameW(nullptr, self, MAX_PATH);
+  std::wstring dir = self;
+  dir = dir.substr(0, dir.find_last_of(L'\\'));
+  std::wstring exe = dir + L"\\warp-remote.exe";
+  if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+  wchar_t args[96];
+  swprintf(args, 96, L" --instance %08x --pid %lu", (unsigned)(ULONG_PTR)InstanceKey(), GetCurrentProcessId());
+  std::wstring cmd = L"\"" + exe + L"\" --dir \"" + RemoteDir() + L"\"" + args + (pair ? L" --pair " + std::wstring(hwnd) : L"");
+  STARTUPINFOW si{sizeof si};
+  PROCESS_INFORMATION pi{};
+  // Its own folder as working directory: it outlives windows and must not keep their folders in use.
+  if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi))
+    return false;
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return true;
+}
+
+static void ClosePairCard() {
+  if (!g_pair.open) return;
+  g_pair.open = false;
+  KillTimer(g_hwnd, TIMER_PAIR);
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void RequestPairCode() {
+  g_pair.ticket.clear(), g_pair.error.clear(), g_pair.qr.clear(), g_pair.copied = false;
+  g_pair.shown = GetTickCount();
+  if (!StartRemote(true)) g_pair.error = L"warp-remote.exe";
+  SetTimer(g_hwnd, TIMER_PAIR, 1000, nullptr);  // countdown, and giving up on an answer that never comes
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Title-bar menu → Pair phone…: a card with the pairing code as a QR code and as text.
+static void OpenPairCard() {
+  g_pair = PairCard{};
+  g_pair.open = true;
+  RequestPairCode();
+}
+
+static bool PairCodeValid() { return !g_pair.ticket.empty() && (int)(g_pair.expires - GetTickCount()) > 0; }
+
+// The card's button: copy the code, or ask for a new one when it expired (or failed).
+static void PairAction() {
+  if (PairCodeValid()) {
+    SetClipboardText(g_pair.ticket);
+    g_pair.copied = true;
+  } else {
+    RequestPairCode();
+  }
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// warp-remote's answer: «ticket\t<code>\t<seconds>» or «error\t<why>».
+static void OnPairTicket(const std::wstring& t) {
+  if (!g_pair.open) return;
+  size_t a = t.find(L'\t'), b = a == std::wstring::npos ? a : t.find(L'\t', a + 1);
+  if (t.rfind(L"ticket\t", 0) != 0 || b == std::wstring::npos) {
+    g_pair.error = a == std::wstring::npos ? t : t.substr(a + 1);
+  } else {
+    g_pair.ticket = t.substr(a + 1, b - a - 1);
+    g_pair.expires = GetTickCount() + (DWORD)_wtoi(t.c_str() + b + 1) * 1000;
+    try {
+      qrcodegen::QrCode q = qrcodegen::QrCode::encodeText(ToUtf8(g_pair.ticket).c_str(), qrcodegen::QrCode::Ecc::MEDIUM);
+      int n = q.getSize();
+      g_pair.qr.assign(n, std::vector<bool>(n));
+      for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++) g_pair.qr[y][x] = q.getModule(x, y);
+    } catch (const std::exception&) {
+      g_pair.error = L"QR";
+    }
+  }
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Removes a paired device: it is disconnected now and turned away from then on.
+static void RemoveDevice(const std::wstring& id) {
+  std::wstring path = RemoteDir() + L"\\devices.txt", tmp = path + L".warp";
+  std::string out;
+  for (auto& d : PairedDevices())
+    if (d.id != id) out += ToUtf8(d.id) + "\t" + std::to_string(d.when) + "\t" + ToUtf8(d.name) + "\n";
+  HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return;
+  DWORD w = 0;
+  bool ok = WriteFile(f, out.data(), (DWORD)out.size(), &w, nullptr) && w == out.size();
+  CloseHandle(f);
+  if (!ok || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    DeleteFileW(tmp.c_str());
+    return;
+  }
+  RemoteCommand(L"reload");
+}
+
+// At start (once, a moment after the window shows): the main window starts warp-remote when a phone is
+// paired; every window asks it how many phones are connected. Nothing at all when none is paired.
+static void RemoteAtStart() {
+  if (g_isMain && !PairedDevices().empty()) StartRemote(false);
+  if (HWND r = RemoteWindow()) {
+    DWORD_PTR n = 0;
+    if (SendMessageTimeoutW(r, g_msgRemoteState, 0, 0, SMTO_ABORTIFHUNG, 1000, &n)) g_remotePhones = (int)n;
+  }
+}
+
+// What warp-remote tells every window: phones connected (lp 0), a phone was paired (1), the code ended (2).
+static void OnRemoteEvent(WPARAM wp, LPARAM lp) {
+  if (lp == 0) {
+    if ((int)wp > g_remotePhones && !g_pair.open) Toast(T(S_PHONE_CONNECTED));
+    g_remotePhones = (int)wp;
+  } else if (lp == 1 && g_pair.open) {
+    ClosePairCard();
+    Toast(T(S_PHONE_PAIRED), 3000);
+  }
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void DrawPairCard(HDC dc, int w, int h) {
+  g_pair.rc = g_pair.action = g_pair.close = RECT{};
+  if (!g_pair.open) return;
+  int n = g_pair.qr.empty() ? 57 : (int)g_pair.qr.size();  // version 10 until the code arrives (~200 characters)
+  int mod = std::max(3, Px(4)), quiet = 4 * mod, side = n * mod + 2 * quiet;
+  int cw = std::max(side + Px(48), Px(470));
+  int perLine = std::max(16, (cw - Px(48)) / std::max(1, g_cellW));
+  int lines = g_pair.ticket.empty() ? 1 : ((int)g_pair.ticket.size() + perLine - 1) / perLine;
+  int ch = Px(52) + Px(26) + side + Px(14) + lines * g_cellH + Px(10) + Px(46);
+  int top = TabBarH() + std::max(Px(12), (h - TabBarH() - ch) / 2);
+  RECT r{(w - cw) / 2, top, (w - cw) / 2 + cw, top + ch};
+  g_pair.rc = r;
+  Panel(dc, r);
+  SetBkMode(dc, TRANSPARENT);
+  SelectObject(dc, g_uiFont);
+  int x0 = r.left + Px(24), x1 = r.right - Px(24), y = r.top + Px(10);
+  Text(dc, T(S_PAIR_TITLE), RECT{x0, y, x1, y + Px(36)}, kFg, DT_LEFT);
+  g_pair.close = RECT{r.right - Px(40), r.top + Px(8), r.right - Px(8), r.top + Px(40)};
+  Text(dc, L"×", g_pair.close, kTabText, DT_CENTER);
+  y += Px(42);
+  Text(dc, T(S_PAIR_HINT), RECT{x0, y, x1, y + Px(22)}, RGB(0x9b, 0x9b, 0x9b), DT_LEFT | DT_END_ELLIPSIS);
+  y += Px(26);
+  // The QR code: dark modules on white with its quiet zone, as phones' cameras expect.
+  RECT q{(r.left + r.right - side) / 2, y, (r.left + r.right - side) / 2 + side, y + side};
+  bool expired = !g_pair.ticket.empty() && !PairCodeValid();
+  if (!g_pair.qr.empty() && !expired) {
+    Fill(dc, q, RGB(0xff, 0xff, 0xff));
+    for (int my = 0; my < n; my++)
+      for (int mx = 0; mx < n;) {
+        if (!g_pair.qr[my][mx]) {
+          mx++;
+          continue;
+        }
+        int run = mx;
+        while (run < n && g_pair.qr[my][run]) run++;
+        Fill(dc, RECT{q.left + quiet + mx * mod, q.top + quiet + my * mod, q.left + quiet + run * mod, q.top + quiet + (my + 1) * mod}, RGB(0, 0, 0));
+        mx = run;
+      }
+  } else {
+    Fill(dc, q, kBg);
+    std::wstring msg = expired ? T(S_PAIR_EXPIRED) : g_pair.error.empty() ? T(S_PAIR_STARTING) : L"";
+    if (!g_pair.error.empty()) {
+      wchar_t b[300];
+      swprintf(b, 300, T(S_PAIR_FAILED), g_pair.error.c_str());
+      msg = b;
+    }
+    Text(dc, msg, RECT{q.left + Px(8), q.top, q.right - Px(8), q.bottom}, kTabText, DT_CENTER | DT_END_ELLIPSIS);
+  }
+  y += side + Px(14);
+  // The same code as text, for pasting (also in the clipboard with the button).
+  SelectObject(dc, g_fonts[0]);
+  for (int i = 0; i < lines && !g_pair.ticket.empty(); i++) {
+    std::wstring part = g_pair.ticket.substr((size_t)i * perLine, perLine);
+    Text(dc, part, RECT{x0, y + i * g_cellH, x1, y + (i + 1) * g_cellH}, expired ? RGB(0x5a, 0x5a, 0x5a) : RGB(0xd0, 0xd0, 0xd0), DT_LEFT);
+  }
+  y += lines * g_cellH + Px(10);
+  SelectObject(dc, g_uiFont);
+  std::wstring left;
+  if (PairCodeValid()) {
+    int s = (int)(g_pair.expires - GetTickCount() + 999) / 1000;
+    wchar_t b[80];
+    swprintf(b, 80, T(S_PAIR_EXPIRES), s / 60, s % 60);
+    left = b;
+  } else if (expired) {
+    left = T(S_PAIR_EXPIRED);
+  }
+  const wchar_t* act = PairCodeValid() ? T(g_pair.copied ? S_COPIED : S_COPY)
+                       : expired || !g_pair.error.empty() ? T(S_PAIR_NEW)
+                                                          : nullptr;
+  if (act) {
+    SIZE as{};
+    GetTextExtentPoint32W(dc, act, (int)wcslen(act), &as);
+    g_pair.action = RECT{x1 - as.cx - Px(24), y + Px(4), x1, y + Px(36)};
+    Fill(dc, g_pair.action, kAccent);
+    Text(dc, act, g_pair.action, kFg, DT_CENTER);
+  }
+  Text(dc, left, RECT{x0, y + Px(4), (act ? g_pair.action.left : x1) - Px(8), y + Px(36)}, kTabText, DT_LEFT);
+  SetBkMode(dc, OPAQUE);
+}
+
 static void Render(HDC dc, int w, int h) {
   RECT all{0, 0, w, h};
   Fill(dc, all, kBg);
@@ -6133,6 +6431,7 @@ static void Render(HDC dc, int w, int h) {
   DrawCompletion(dc);
   DrawSwitcher(dc, w);
   DrawUpdateNotice(dc, w, h);
+  DrawPairCard(dc, w, h);
   if (g_dropTarget) {  // destino al arrastrar un panel por su cabecera
     HBRUSH b = CreateSolidBrush(kAccent);
     RECT r = g_dropTarget->rc;
@@ -6167,7 +6466,7 @@ static void PaintDirty() {
   if (!g_backDC || g_tabs.empty() || IsIconic(g_hwnd)) return;
   std::vector<Pane*> ls;
   Leaves(CurTab().root, ls);
-  bool overlay = g_find.open || g_pick.open || g_sw.open || g_comp.open || (g_upd.stage != UPD_NONE && !g_upd.hidden) || g_dragPane || g_link.p || g_renameTab >= 0 ||
+  bool overlay = g_find.open || g_pick.open || g_sw.open || g_comp.open || (g_upd.stage != UPD_NONE && !g_upd.hidden) || g_dragPane || g_link.p || g_renameTab >= 0 || g_pair.open ||
                  std::any_of(ls.begin(), ls.end(), [](Pane* p) { return p->recon.state != RC_OFF; });
   if (overlay || (g_titleDirty && now - g_lastFull >= 250)) {  // títulos: como mucho 4 veces por segundo
     g_titleDirty = false;
@@ -6311,6 +6610,8 @@ static bool SaveScreenshot(const std::wstring& path) {
 //   font-size:<px> link-action:<col>,<row> hover-time:<col>,<row> path-probes path-spans:<row> path-scan-time (these
 //   write to <session>.bench; hover reports paths as "path <full path>")
 //   focus:on|off feed:<tab>:<hex> badge-icon:<n>,<px>,<file.bmp> badges notes taskbar (the last three write to <session>.bench)
+//   remote-pair remote-wait remote-close remote-remove:<n> wait-file:<path> remote-ticket remote-state (these two
+//   write to <session>.bench)
 
 static void SetStartWithWindows(bool on);
 
@@ -7342,6 +7643,27 @@ static void RunScriptStep() {
     }
     ScriptLog(r + L" sel=" + std::to_wstring(g_sw.sel));
     delay = 300;
+  } else if (s == L"remote-pair") {  // as if chosen in the title-bar menu (Pair phone…)
+    OpenPairCard();
+  } else if (s == L"remote-wait") {  // until the pairing code (or an error) arrives (30 s at most)
+    static int waited = 0;
+    if (g_pair.open && g_pair.ticket.empty() && g_pair.error.empty() && ++waited < 120) g_scriptPos--, delay = 250;
+    else waited = 0, delay = 300;
+  } else if (s == L"remote-ticket") {
+    ScriptLog(L"remote-ticket: " + (g_pair.ticket.empty() ? L"(none) " + g_pair.error : g_pair.ticket));
+  } else if (s == L"remote-close") {
+    ClosePairCard();
+  } else if (s == L"remote-state") {  // phones connected, paired devices, warp-remote running, pairing card open
+    ScriptLog(L"remote: phones=" + std::to_wstring(g_remotePhones) + L" devices=" + std::to_wstring(PairedDevices().size()) +
+              L" sidecar=" + (RemoteWindow() ? L"1" : L"0") + L" card=" + (g_pair.open ? L"1" : L"0"));
+  } else if (s.rfind(L"remote-remove:", 0) == 0) {  // remote-remove:<n> — as if chosen in Paired devices
+    std::vector<PairedDevice> devs = PairedDevices();
+    size_t i = (size_t)_wtoi(s.c_str() + 14);
+    if (i < devs.size()) RemoveDevice(devs[i].id);
+  } else if (s.rfind(L"wait-file:", 0) == 0) {  // until that file exists (the other side of a test is done; 5 min at most)
+    static int waited = 0;
+    if (GetFileAttributesW(s.c_str() + 10) == INVALID_FILE_ATTRIBUTES && ++waited < 1200) g_scriptPos--, delay = 250;
+    else waited = 0, delay = 300;
   } else if (s.rfind(L"sw-type:", 0) == 0) {
     for (wchar_t c : s.substr(8)) SwChar(c);
     delay = 200;
@@ -7741,6 +8063,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           AppendMenuW(menu, MF_STRING | (g_isMain || g_reopen ? MF_CHECKED : 0) | (g_isMain ? MF_GRAYED : 0), 5, T(S_REOPEN));
         AppendMenuW(menu, MF_STRING | (StartsWithWindows() ? MF_CHECKED : 0), 1, T(S_STARTUP));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        // Phone: pair one; the paired ones, each item removes that one.
+        std::vector<PairedDevice> devs = PairedDevices();
+        if (devs.size() > 50) devs.resize(50);
+        HMENU phones = CreatePopupMenu();
+        if (devs.empty()) AppendMenuW(phones, MF_STRING | MF_GRAYED, 0, T(S_NO_DEVICES));
+        for (size_t i = 0; i < devs.size(); i++) {
+          wchar_t b[200];
+          swprintf(b, 200, T(S_REMOVE_DEVICE), devs[i].name.c_str());
+          AppendMenuW(phones, MF_STRING, 2000 + i, b);
+        }
+        AppendMenuW(menu, MF_STRING, 6, T(S_PAIR_PHONE));
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)phones, T(S_PAIRED_DEVICES));
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         wchar_t upd[160] = L"";
         if (g_upd.stage == UPD_AVAILABLE || g_upd.stage == UPD_FAILED) swprintf(upd, 160, L"%ls: %ls", T(S_UPD_INSTALL), g_upd.latest.c_str());
         else if (g_upd.stage == UPD_READY) swprintf(upd, 160, L"%ls (%ls)", T(S_UPD_RESTART), g_upd.latest.c_str());
@@ -7758,6 +8093,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           if (g_upd.autoUpdate && g_upd.stage == UPD_AVAILABLE) InstallUpdate();
         }
         if (cmd == 4) UpdateAction();
+        if (cmd == 6) OpenPairCard();
+        if (cmd >= 2000 && cmd < 2000 + (int)devs.size()) RemoveDevice(devs[cmd - 2000].id);
         if (cmd == 5 && !g_isMain) {
           g_reopen = !g_reopen;
           SaveSession();
@@ -7788,6 +8125,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       SetTimer(hwnd, TIMER_RESTORE, 250, nullptr);
       if (!g_script.empty()) SetTimer(hwnd, TIMER_SCRIPT, 3000, nullptr);
       if (!GetEnvironmentVariableW(L"WARPLITE_NO_UPDATE", nullptr, 0)) SetTimer(hwnd, TIMER_UPDATE, 20000, nullptr);
+      SetTimer(hwnd, TIMER_REMOTE, 1500, nullptr);  // once: warp-remote, if a phone is paired
       return 0;
     }
     case WM_SIZE: Relayout(); return 0;
@@ -7881,6 +8219,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       } else if (wp == TIMER_UPDATE) {
         SetTimer(hwnd, TIMER_UPDATE, 6 * 3600 * 1000, nullptr);
         CheckForUpdates(false);
+      } else if (wp == TIMER_REMOTE) {
+        KillTimer(hwnd, TIMER_REMOTE);
+        RemoteAtStart();
+      } else if (wp == TIMER_PAIR) {  // pairing card: countdown; no answer from warp-remote in 20 s is an error
+        if (!g_pair.open) KillTimer(hwnd, TIMER_PAIR);
+        else if (g_pair.ticket.empty() && g_pair.error.empty() && GetTickCount() - g_pair.shown > 20000) g_pair.error = L"no answer";
+        InvalidateRect(hwnd, &g_pair.rc, FALSE);
       } else if (wp == TIMER_TOAST) {
         KillTimer(hwnd, TIMER_TOAST);
         g_toast.clear();
@@ -8030,6 +8375,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_LBUTTONDOWN && PtInRect(&g_upd.close, pt)) g_upd.hidden = true;
         else if (msg == WM_LBUTTONDOWN && PtInRect(&g_upd.action, pt)) UpdateAction();
         InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      if (g_pair.open) {  // pairing card: its button and ×; a click outside closes it
+        POINT pt{x, y};
+        if (msg == WM_LBUTTONDOWN && PtInRect(&g_pair.close, pt)) ClosePairCard();
+        else if (msg == WM_LBUTTONDOWN && PtInRect(&g_pair.action, pt)) PairAction();
+        else if (!PtInRect(&g_pair.rc, pt)) ClosePairCard();
         return 0;
       }
       if (POINT pt{x, y}; g_find.open && PtInRect(&g_find.rc, pt)) {  // find bar: previous, next, close
@@ -8341,6 +8693,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     SendMessageW(to, WM_COPYDATA, (WPARAM)hwnd, (LPARAM)&cd);
     return 0;
   }
+  if (msg == g_msgRemote && g_msgRemote) {  // warp-remote: phones connected, a phone paired
+    OnRemoteEvent(wp, lp);
+    return 0;
+  }
   if (msg == g_msgFocusPane && g_msgFocusPane) {  // elegida en el selector de otra ventana
     FocusPane((int)wp, (int)lp);
     return 0;
@@ -8367,6 +8723,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (cd->dwData == kCopyPaneList && g_sw.open) {
       AddPaneList((HWND)wp, t);
+      return TRUE;
+    }
+    if (cd->dwData == kCopyRemoteTicket && (HWND)wp == RemoteWindow()) {  // the pairing code asked for
+      OnPairTicket(t);
       return TRUE;
     }
     return FALSE;
@@ -8554,6 +8914,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   g_msgFont = RegisterWindowMessageW(L"warp-lite-font");
   g_msgText = RegisterWindowMessageW(L"warp-lite-brightness");
   g_msgTaskbar = RegisterWindowMessageW(L"TaskbarButtonCreated");
+  g_msgRemote = RegisterWindowMessageW(L"warp-lite-remote");
+  g_msgRemoteState = RegisterWindowMessageW(L"warp-lite-remote-state");
   if (!g_openDir.empty()) {
     // El Explorador pasa "C:\" y Windows lo lee como «C:"»: se arregla la barra del final.
     while (!g_openDir.empty() && (g_openDir.back() == L' ' || g_openDir.back() == L'\t')) g_openDir.pop_back();
@@ -8637,6 +8999,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   while (GetMessageW(&m, nullptr, 0, 0)) {
     SyncUnread();  // the previous message may have changed the pane or tab in view (there are many ways to)
     bool keyDown = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN;
+    if (g_pair.open && m.message == WM_KEYDOWN) {  // pairing card: Esc closes, Enter or Ctrl+C is its button; nothing reaches the terminal
+      bool ctrl = GetKeyState(VK_CONTROL) & 0x8000;
+      if (m.wParam == VK_ESCAPE) ClosePairCard();
+      else if (m.wParam == VK_RETURN || (ctrl && m.wParam == 'C')) PairAction();
+      continue;
+    }
     if (g_sw.open && keyDown) {
       if (!SwKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
       continue;

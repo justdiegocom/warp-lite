@@ -1,2 +1,4 @@
 build/
 dist/
+target/
+mobile/ios/WarpRemote.xcodeproj/

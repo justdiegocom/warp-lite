@@ -22,11 +22,13 @@
 
 #include <string>
 
-// warp-lite.exe va dentro del instalador.
+// warp-lite.exe va dentro del instalador, and warp-remote.exe (the phone sidecar) next to it.
 __asm__(".section .rdata,\"dr\"\n.balign 4\n"
         ".global warp_lite_exe\nwarp_lite_exe:\n.incbin \"dist/warp-lite.exe\"\n"
-        ".global warp_lite_exe_end\nwarp_lite_exe_end:\n.text\n");
-extern "C" const unsigned char warp_lite_exe[], warp_lite_exe_end[];
+        ".global warp_lite_exe_end\nwarp_lite_exe_end:\n"
+        ".balign 4\n.global warp_remote_exe\nwarp_remote_exe:\n.incbin \"dist/warp-remote.exe\"\n"
+        ".global warp_remote_exe_end\nwarp_remote_exe_end:\n.text\n");
+extern "C" const unsigned char warp_lite_exe[], warp_lite_exe_end[], warp_remote_exe[], warp_remote_exe_end[];
 
 static const wchar_t* kUninstallKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\warp-lite";
 static const wchar_t* kVersion = L"0.3.7";
@@ -135,6 +137,11 @@ static int Install() {
     Message(Tr(L"Could not copy Warp.exe.", L"No se ha podido copiar Warp.exe."), MB_ICONERROR);
     return 2;
   }
+  // Running (a phone paired) it is set aside like Warp.exe; the new one starts with the next Warp.
+  if (!ReplaceFile(dir + L"\\warp-remote.exe", warp_remote_exe, (DWORD)(warp_remote_exe_end - warp_remote_exe))) {
+    Message(Tr(L"Could not copy warp-remote.exe.", L"No se ha podido copiar warp-remote.exe."), MB_ICONERROR);
+    return 2;
+  }
   wchar_t self[MAX_PATH];
   GetModuleFileNameW(nullptr, self, MAX_PATH);
   if (_wcsicmp(self, uninst.c_str()) != 0 && !CopyFileW(self, uninst.c_str(), FALSE)) {
@@ -166,7 +173,8 @@ static int Install() {
     SetString(k, L"QuietUninstallString", L"\"" + uninst + L"\" --uninstall --silent");
     SetDword(k, L"NoModify", 1);
     SetDword(k, L"NoRepair", 1);
-    SetDword(k, L"EstimatedSize", (DWORD)((warp_lite_exe_end - warp_lite_exe) / 1024 + 600));
+    SetDword(k, L"EstimatedSize",
+             (DWORD)((warp_lite_exe_end - warp_lite_exe + (warp_remote_exe_end - warp_remote_exe)) / 1024 + 600));
     RegCloseKey(k);
   }
   RegisterContextMenu(exe);
@@ -212,6 +220,9 @@ static int Uninstall(bool fromTemp) {
   DeleteOldCopies(dir);
   DeleteFileW((dir + L"\\warp-lite.exe").c_str());  // nombre antiguo
   bool ok = DeleteFileW((dir + L"\\Warp.exe").c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
+  // warp-remote.exe ends with the last Warp window, a moment after it (with Warp still open both stay).
+  for (int i = 0; ok && i < 25 && !DeleteFileW((dir + L"\\warp-remote.exe").c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND; i++)
+    Sleep(200);
   // uninstall.exe sigue abierto unos instantes (es quien ha lanzado esta copia).
   for (int i = 0; i < 50 && !DeleteFileW((dir + L"\\uninstall.exe").c_str()) &&
                   GetLastError() != ERROR_FILE_NOT_FOUND;

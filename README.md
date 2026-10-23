@@ -45,6 +45,16 @@ A pane counts one when its program sends a desktop notification (OSC 9, OSC 777 
 
 - **tmux**: the bell gets through with the defaults (`bell-action any`, `visual-bell off`). For OSC 9 notifications from inside it (Claude Code's `iterm2`, Codex's `osc9`), tmux 3.3 or later needs `set -g allow-passthrough on` in `~/.tmux.conf`; older versions pass them already.
 
+## Phone (preview)
+
+See your terminals from your phone, at home or away, with nothing to set up and no account. Warp is always the host; the phone app (`mobile/ios`, SwiftUI) connects to it.
+
+- **Pair phone…** in the title-bar menu shows a QR code (and the same code as text) that the app scans or pastes. The code works once and expires after 2 minutes; devices that weren't paired are turned away.
+- **Paired devices** in the same menu lists them; choosing one removes it, and it is disconnected at once.
+- The app lists every tab and pane of every Warp window, with its folder, whether something is running and whether it's Claude Code or Codex, and shows whether the connection is direct or through a relay and its round-trip time. A phone icon in Warp's title bar shows when a phone is connected.
+- Works across NATs and mobile data: [iroh](https://iroh.computer) (QUIC, end-to-end encrypted) connects directly when hole punching works and through n0's public relays otherwise.
+- The networking lives in `warp-remote.exe` (Rust, `warp-remote/`), next to Warp.exe. It only runs while a phone is paired or pairing is in progress, and ends with the last Warp window. Only then does anything talk to n0's servers (the relay, and the address lookup that lets the phone find this computer again); with no phone paired, Warp makes no network connections beyond the update check. Protocol: `warp-remote/src/proto.rs`.
+
 ## Install
 
 Download `warp-lite-setup.exe` from [Releases](https://github.com/justdiegocom/warp-lite/releases/latest) and run it (per-user, no admin); `warp-lite.zip` is the portable exe, and each file has a `.sha256` next to it. It shows up as **Warp** in the Start menu and in *Installed apps*. Right-click the title bar for the language, *Start with Windows*, *Check for updates* and *Update automatically*.
@@ -57,8 +67,10 @@ Download `warp-lite-setup.exe` from [Releases](https://github.com/justdiegocom/w
 tools/build.sh          # cross-compiles with zig (x86_64-windows-gnu) → dist/
 ```
 
-On Windows: `tools/build.ps1`.
+On Windows: `tools/build.ps1` (it takes `dist/warp-remote.exe` from `tools/build.sh`, which cross-compiles it with `cargo zigbuild`).
+
+Phone app, with Xcode and xcodegen: `mobile/ios/build.sh sim` (Simulator), `mobile/ios/build.sh device <TEAM_ID>` or `mobile/ios/build.sh ipa` (unsigned). Tests of the protocol: `cargo nextest run` in `warp-remote/`; `warp-remote-cli` is a client like the app, for scripts.
 
 ## License
 
-Third-party: libvterm (MIT), Hack (MIT / Bitstream Vera), Symbols Nerd Font (MIT). No Warp code is used; only its shortcuts, colours and default font are replicated.
+Third-party: libvterm (MIT), Hack (MIT / Bitstream Vera), Symbols Nerd Font (MIT), QR Code generator by Project Nayuki (MIT), iroh (MIT / Apache-2.0). No Warp code is used; only its shortcuts, colours and default font are replicated.
