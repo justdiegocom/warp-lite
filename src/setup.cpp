@@ -19,7 +19,9 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <propsys.h>
 
+#include <cstring>
 #include <string>
 
 // warp-lite.exe va dentro del instalador, and warp-remote.exe (the phone sidecar) next to it.
@@ -59,6 +61,27 @@ static std::wstring InstallDir() { return KnownFolder(FOLDERID_LocalAppData) + L
 static std::wstring StartMenuLink() { return KnownFolder(FOLDERID_Programs) + L"\\Warp.lnk"; }
 static std::wstring DesktopLink() { return KnownFolder(FOLDERID_Desktop) + L"\\Warp.lnk"; }
 
+// AppUserModelID of Warp's windows (kAppId in main.cpp) on its shortcuts: Windows shows notifications of a desktop app
+// whose ID is on a Start menu shortcut, and the taskbar keeps its windows with the shortcut.
+static const wchar_t* kAppId = L"justdiego.Warp";
+static const PROPERTYKEY kKeyAppId = {{0x9F4C2855, 0x9F79, 0x4B39, {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3}}, 5};
+
+static void SetAppId(IShellLinkW* sl) {
+  IPropertyStore* ps = nullptr;
+  if (FAILED(sl->QueryInterface(__uuidof(IPropertyStore), (void**)&ps))) return;
+  PROPVARIANT v;
+  PropVariantInit(&v);
+  v.vt = VT_LPWSTR;
+  size_t n = (wcslen(kAppId) + 1) * sizeof(wchar_t);
+  v.pwszVal = (LPWSTR)CoTaskMemAlloc(n);
+  if (v.pwszVal) {
+    memcpy(v.pwszVal, kAppId, n);
+    if (SUCCEEDED(ps->SetValue(kKeyAppId, v))) ps->Commit();
+  }
+  PropVariantClear(&v);
+  ps->Release();
+}
+
 static bool MakeShortcut(const std::wstring& lnk, const std::wstring& target, const std::wstring& workDir) {
   IShellLinkW* sl = nullptr;
   if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&sl)))
@@ -67,11 +90,35 @@ static bool MakeShortcut(const std::wstring& lnk, const std::wstring& target, co
   sl->SetWorkingDirectory(workDir.c_str());
   sl->SetIconLocation(target.c_str(), 0);
   sl->SetDescription(kAppName);
+  SetAppId(sl);
   IPersistFile* pf = nullptr;
   bool ok = SUCCEEDED(sl->QueryInterface(IID_IPersistFile, (void**)&pf)) && SUCCEEDED(pf->Save(lnk.c_str(), TRUE));
   if (pf) pf->Release();
   sl->Release();
   return ok;
+}
+
+// Taskbar pins of Warp made before it had an ID get it too: otherwise its windows would show apart from the pin.
+static void SetAppIdOnPins(const std::wstring& exe) {
+  std::wstring dir = KnownFolder(FOLDERID_RoamingAppData) + L"\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar";
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((dir + L"\\*.lnk").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    std::wstring lnk = dir + L"\\" + fd.cFileName;
+    IShellLinkW* sl = nullptr;
+    IPersistFile* pf = nullptr;
+    wchar_t target[MAX_PATH] = L"";
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&sl)) &&
+        SUCCEEDED(sl->QueryInterface(IID_IPersistFile, (void**)&pf)) && SUCCEEDED(pf->Load(lnk.c_str(), STGM_READWRITE)) &&
+        SUCCEEDED(sl->GetPath(target, MAX_PATH, nullptr, 0)) && !_wcsicmp(target, exe.c_str())) {
+      SetAppId(sl);
+      pf->Save(lnk.c_str(), TRUE);
+    }
+    if (pf) pf->Release();
+    if (sl) sl->Release();
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
 }
 
 static bool WriteAll(const std::wstring& path, const void* data, DWORD size) {
@@ -128,6 +175,26 @@ static void RegisterContextMenu(const std::wstring& exe) {
   }
 }
 
+// warp-lite: — what a click on one of Warp's Windows notifications opens (kToastScheme in main.cpp): Warp.exe --toast
+// <it> passes it to the window that showed it.
+static const wchar_t* kToastKey = L"Software\\Classes\\warp-lite";
+
+static void RegisterToastProtocol(const std::wstring& exe) {
+  HKEY k, c;
+  if (RegCreateKeyExW(HKEY_CURRENT_USER, kToastKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+  SetString(k, nullptr, L"URL:Warp");
+  SetString(k, L"URL Protocol", L"");
+  if (RegCreateKeyExW(k, L"DefaultIcon", 0, nullptr, 0, KEY_WRITE, nullptr, &c, nullptr) == ERROR_SUCCESS) {
+    SetString(c, nullptr, L"\"" + exe + L"\",0");
+    RegCloseKey(c);
+  }
+  if (RegCreateKeyExW(k, L"shell\\open\\command", 0, nullptr, 0, KEY_WRITE, nullptr, &c, nullptr) == ERROR_SUCCESS) {
+    SetString(c, nullptr, L"\"" + exe + L"\" --toast \"%1\"");
+    RegCloseKey(c);
+  }
+  RegCloseKey(k);
+}
+
 static int Install() {
   std::wstring dir = InstallDir(), exe = dir + L"\\Warp.exe", uninst = dir + L"\\uninstall.exe";
   if (!Ask(Tr(L"Install Warp for this user?", L"¿Instalar Warp para este usuario?"))) return 1;
@@ -152,6 +219,7 @@ static int Install() {
   std::wstring home = KnownFolder(FOLDERID_Profile);
   MakeShortcut(StartMenuLink(), exe, home);
   MakeShortcut(DesktopLink(), exe, home);
+  SetAppIdOnPins(exe);
   // Antes se llamaba better-warp y warp-lite: fuera sus accesos y el .exe con el nombre viejo.
   for (const wchar_t* old : {L"better-warp.lnk", L"warp-lite.lnk"}) {
     DeleteFileW((KnownFolder(FOLDERID_Programs) + L"\\" + old).c_str());
@@ -178,6 +246,7 @@ static int Install() {
     RegCloseKey(k);
   }
   RegisterContextMenu(exe);
+  RegisterToastProtocol(exe);
   if (!g_silent &&
       MessageBoxW(nullptr, Tr(L"Warp is installed. Open it now?", L"Warp está instalado. ¿Abrirlo ahora?"),
                   kAppName, MB_YESNO | MB_ICONINFORMATION) == IDYES)
@@ -211,6 +280,7 @@ static int Uninstall(bool fromTemp) {
   DeleteFileW(DesktopLink().c_str());
   RegDeleteKeyW(HKEY_CURRENT_USER, kUninstallKey);
   for (const wchar_t* key : kContextKeys) RegDeleteTreeW(HKEY_CURRENT_USER, key);
+  RegDeleteTreeW(HKEY_CURRENT_USER, kToastKey);
   HKEY run;  // «Iniciar con Windows»
   if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_WRITE, &run) ==
       ERROR_SUCCESS) {
