@@ -19,6 +19,7 @@
 #include <tlhelp32.h>
 #include <objbase.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <wincodec.h>
 #include <winhttp.h>
 #include <bcrypt.h>
@@ -28,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -105,7 +107,7 @@ static const int kGap = 1;           // separación entre paneles (px)
 static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
-enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS, WM_APP_PROMPT, WM_APP_NETCHANGE };
+enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS, WM_APP_PROMPT, WM_APP_NETCHANGE, WM_APP_NOTE };
 enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6, TIMER_PATHS = 7 };
 
 // ---------------------------------------------------------------------------
@@ -210,6 +212,13 @@ struct Pane {
   unsigned pathSeq = 0;
   bool pathDue = false;  // look again: text drawn that no pass has seen, or new answers from the disk
   int pathRounds = 0;    // passes redone for answers since the text last changed (capped)
+  // Unread badge (see «Unread badges»). Reader thread, with the lock: what the title and OSC 7501 last said
+  // (NOTE_IDLE/NOTE_BUSY, 0 = no agent) and the last kitty notification id. UI thread: the count and its dedupe.
+  int titleState = 0, statusState = 0;
+  std::string kittyId;
+  int unread = 0;
+  DWORD noteTick = 0;      // last event (counted or not), to merge an OSC notification with its BEL
+  bool noteQuiet = false;  // a finish was seen through the title or OSC 7501: its own bell/notification is not new
 };
 
 static HWND g_hwnd;
@@ -223,6 +232,7 @@ static std::wstring g_fontLoading;          // font being downloaded (its progre
 static std::atomic<int> g_fontPct{-1}, g_fontFile{0};  // download progress: % of file number g_fontFile
 static int g_fontFiles = 0;                 // files in that download
 static HFONT g_uiFont;
+static HFONT g_badgeFont;  // bold, for the unread count pills
 static HFONT g_iconFont;  // Segoe MDL2 Assets: botones de ventana
 static const int kDefaultFontPx = 13;  // DEFAULT_MONOSPACE_FONT_SIZE de Warp
 static int g_fontPx = kDefaultFontPx;
@@ -259,7 +269,7 @@ enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, 
            S_UPD_FAILED, S_UPD_INSTALL, S_UPD_RESTART, S_UPD_RETRY, S_UPD_CHECK, S_UPD_AUTO, S_UPD_LATEST, S_UPD_CHECKING,
            S_UPD_OFFLINE, S_UPD_DOWNLOADING, S_SWITCH, S_OTHER_WINDOW, S_FONT_MENU, S_OTHER_FONTS, S_FONT_FAILED,
            S_FONT_SIZE, S_TEXT_BRIGHTNESS, S_DEFAULT, S_RECONNECTING, S_RECONNECT_WAIT, S_REOPEN, S_OPEN, S_COPY_PATH, S_COPY_LINK,
-           S_OPEN_LOCATION, S_COUNT };
+           S_OPEN_LOCATION, S_UNREAD, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
@@ -270,7 +280,7 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Couldn't check for updates", L"Downloading %s…", L"Search terminals…", L"other window", L"Font",
      L"Other installed", L"Couldn't download %s", L"Font size", L"Text brightness", L"default",
      L"Reconnecting… (attempt %d) — Esc to cancel", L"Reconnecting in %d s (attempt %d) — Esc to cancel",
-     L"Reopen on restart", L"Open", L"Copy path", L"Copy link", L"Open file location"},
+     L"Reopen on restart", L"Open", L"Copy path", L"Copy link", L"Open file location", L"%d unread"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
@@ -281,7 +291,7 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Descargando %s…", L"Buscar terminales…", L"otra ventana", L"Fuente", L"Otras instaladas",
      L"No se pudo descargar %s", L"Tamaño de letra", L"Brillo del texto", L"predeterminado",
      L"Reconectando… (intento %d) — Esc para cancelar", L"Reconectando en %d s (intento %d) — Esc para cancelar",
-     L"Abrir al reiniciar", L"Abrir", L"Copiar ruta", L"Copiar enlace", L"Abrir ubicación del archivo"},
+     L"Abrir al reiniciar", L"Abrir", L"Copiar ruta", L"Copiar enlace", L"Abrir ubicación del archivo", L"%d sin leer"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -496,6 +506,67 @@ static int CbDamage(VTermRect r, void* user) {
 
 static std::atomic<bool> g_titleDirty{false};  // cambió un título: hay que repintar cabeceras y pestañas
 
+// Unread badges, reader thread side: what a program says when it finishes or needs input. It is only posted to the
+// window (WM_APP_NOTE); counting and dedupe happen on the UI thread (OnNote).
+//   NOTE_ALERT  a desktop notification: OSC 9 (iTerm2), OSC 777;notify (Ghostty), OSC 99 (kitty)
+//   NOTE_BELL   BEL (Claude Code's terminal_bell, Codex's default, a bell tmux passes on)
+//   NOTE_BUSY / NOTE_IDLE  an agent starts / stops working: Claude Code's title (◐ ◑ while working, ✳ otherwise;
+//               always ✳ under tmux) or OSC 7501 (Codex: state=working, then done, idle, blocked...)
+enum { NOTE_ALERT, NOTE_BELL, NOTE_BUSY, NOTE_IDLE };
+
+static void PostNote(Pane* p, int kind) { PostMessage(g_hwnd, WM_APP_NOTE, kind, (LPARAM)p); }
+
+// Working → idle posts NOTE_IDLE (it has finished, or waits for an answer); anything else → working, NOTE_BUSY.
+static void AgentState(Pane* p, int& state, int now) {
+  if (now == NOTE_BUSY && state != NOTE_BUSY) PostNote(p, NOTE_BUSY);
+  if (now == NOTE_IDLE && state == NOTE_BUSY) PostNote(p, NOTE_IDLE);
+  state = now;
+}
+
+static int TitleState(const std::wstring& t) {
+  if (t.size() < 2 || t[1] != L' ') return 0;
+  if (t[0] == 0x25D0 || t[0] == 0x25D1 || (t[0] > 0x2800 && t[0] <= 0x28FF)) return NOTE_BUSY;  // or a braille spinner
+  return t[0] == 0x2733 ? NOTE_IDLE : 0;
+}
+
+static int CbBell(void* user) {
+  PostNote((Pane*)user, NOTE_BELL);
+  return 1;
+}
+
+// Value of <key>= in a list of key=value separated by sep ("" if it isn't there).
+static std::string KeyValue(const std::string& s, const std::string& key, char sep) {
+  for (size_t a = 0; a < s.size();) {
+    size_t b = s.find(sep, a);
+    if (b == std::string::npos) b = s.size();
+    if (b - a > key.size() && s.compare(a, key.size() + 1, key + "=") == 0) return s.substr(a + key.size() + 1, b - a - key.size() - 1);
+    a = b + 1;
+  }
+  return "";
+}
+
+// A whole OSC 9 / 99 / 777 / 7501 from a program (not the prompt's 9;9;<token>).
+static void OscNote(Pane* p, int command, const std::string& s) {
+  if (command == 9) {  // 9;<text>; ConEmu's 9;<number>;... (9;9 folder, 9;4 progress) are not notifications
+    size_t n = 0;
+    while (n < s.size() && s[n] >= '0' && s[n] <= '9') n++;
+    if (!n || (n < s.size() && s[n] != ';')) PostNote(p, NOTE_ALERT);
+  } else if (command == 777) {  // 777;notify;<title>;<body>
+    if (s == "notify" || s.rfind("notify;", 0) == 0) PostNote(p, NOTE_ALERT);
+  } else if (command == 99) {  // 99;<key=value:...>;<text>, in chunks: d=0 = more to come; one per id
+    std::string meta = s.substr(0, s.find(';')), id = KeyValue(meta, "i", ':'), kind = KeyValue(meta, "p", ':');
+    if (KeyValue(meta, "d", ':') == "0" || kind == "?" || kind == "close" || kind == "alive") return;
+    if (!id.empty() && id == p->kittyId) return;
+    p->kittyId = id;
+    PostNote(p, NOTE_ALERT);
+  } else if (command == 7501) {  // 7501;state=working|blocked|idle|done|error|clear:app=...
+    std::string st = KeyValue(s, "state", ':');
+    if (st == "working") AgentState(p, p->statusState, NOTE_BUSY);
+    else if (st == "idle" || st == "done" || st == "blocked" || st == "error") AgentState(p, p->statusState, NOTE_IDLE);
+    else if (st == "clear") p->statusState = 0;
+  }
+}
+
 static int CbSetTermProp(VTermProp prop, VTermValue* v, void* user) {
   Pane* p = (Pane*)user;
   switch (prop) {
@@ -516,6 +587,7 @@ static int CbSetTermProp(VTermProp prop, VTermValue* v, void* user) {
       if (v->string.final) {
         std::wstring t = ToWide(p->titleBuf);
         if (t != p->title) p->title = t, g_titleDirty = true;
+        AgentState(p, p->titleState, TitleState(t));
       }
       break;
     default: break;
@@ -529,14 +601,16 @@ static bool IsLocalDir(const std::wstring& d) {
 }
 
 // OSC 9;9;<token>;<código de salida>;<ruta> (lo emite el prompt de warp-lite): la shell espera una
-// orden en <ruta>. The exit code is $LASTEXITCODE as an int; empty or invalid means unknown.
+// orden en <ruta>. The exit code is $LASTEXITCODE as an int; empty or invalid means unknown. Other OSC 9, and
+// OSC 99 / 777 / 7501, may be a program saying it has finished (OscNote).
 static int CbOsc(int command, VTermStringFragment frag, void* user) {
   Pane* p = (Pane*)user;
-  if (command != 9) return 0;
+  if (command != 9 && command != 99 && command != 777 && command != 7501) return 0;
   if (frag.initial) p->oscBuf.clear();
-  p->oscBuf.append(frag.str, frag.len);
+  if (p->oscBuf.size() < 65536) p->oscBuf.append(frag.str ? frag.str : "", frag.len);
+  if (!frag.final) return 1;
   std::string head = "9;" + p->token + ";";
-  if (frag.final && !p->token.empty() && p->oscBuf.rfind(head, 0) == 0) {
+  if (command == 9 && !p->token.empty() && p->oscBuf.rfind(head, 0) == 0) {
     size_t semi = p->oscBuf.find(';', head.size());
     if (semi == std::string::npos) return 1;
     std::string code = p->oscBuf.substr(head.size(), semi - head.size());
@@ -549,7 +623,9 @@ static int CbOsc(int command, VTermStringFragment frag, void* user) {
     p->integrated = p->atPrompt = true;
     PostMessage(g_hwnd, WM_APP_LAYOUT, first, (LPARAM)p);
     if (ended) PostMessage(g_hwnd, WM_APP_PROMPT, (WPARAM)(INT_PTR)(code.empty() ? kNoExit : atoi(code.c_str())), (LPARAM)p);
+    return 1;
   }
+  OscNote(p, command, p->oscBuf);
   return 1;
 }
 
@@ -605,6 +681,7 @@ static Pane* NewPane() {
     c.movecursor = CbMoveCursor;
     c.damage = CbDamage;
     c.settermprop = CbSetTermProp;
+    c.bell = CbBell;
     c.sb_pushline = CbPushLine;
     c.sb_popline = CbPopLine;
     c.sb_clear = CbSbClear;
@@ -1669,6 +1746,7 @@ static void ToBottom(Pane* p) {
 }
 
 static void SendKey(Pane* p, VTermKey key, VTermModifier mod) {
+  p->noteQuiet = false;  // typed to: its next bell or notification is news again
   EnterCriticalSection(&p->cs);
   ToBottom(p);
   if (key == VTERM_KEY_ENTER && !p->integrated) {
@@ -1688,6 +1766,7 @@ static void SendKey(Pane* p, VTermKey key, VTermModifier mod) {
 }
 
 static void SendChar(Pane* p, uint32_t cp, VTermModifier mod) {
+  p->noteQuiet = false;
   EnterCriticalSection(&p->cs);
   ToBottom(p);
   if (cp == 3) p->lineRow = p->lineCol = -1;  // Ctrl+C descarta la línea
@@ -1836,6 +1915,7 @@ static void PasteText(Pane* p, std::wstring w) {
   }
   if (norm.empty()) return;
   std::string u = ToUtf8(norm);
+  p->noteQuiet = false;
   EnterCriticalSection(&p->cs);
   ToBottom(p);
   MarkLineStart(p);
@@ -1917,6 +1997,82 @@ static bool RenameKey(WPARAM vk) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Unread badges: a program in a pane the user isn't looking at has finished or wants an answer (NOTE_* above). That
+// pane counts one more, and its header, its tab (or the hidden-tabs button) and the taskbar button show how many,
+// like a chat app. Looking at it (the active pane of the active tab, with the window in front) clears it.
+
+static const DWORD kNoteMergeMs = 1500;  // events closer than this are one (OSC 9 + BEL, title + bell)
+static int g_unreadShown = -1;           // total on the taskbar button (-1: set it again)
+static std::wstring g_noteLog;           // tests: what each event did (step «notes»)
+static const wchar_t* const kNoteNames[] = {L"alert", L"bell", L"busy", L"idle"};
+
+static int TabUnread(const Tab& t) {
+  std::vector<Pane*> ls;
+  Leaves(t.root, ls);
+  int n = 0;
+  for (Pane* p : ls) n += p->unread;
+  return n;
+}
+
+static int HiddenUnread() {
+  int n = 0;
+  for (auto& t : g_tabs)
+    if (t.hidden) n += TabUnread(t);
+  return n;
+}
+
+static bool Foreground() { return g_focused && !IsIconic(g_hwnd); }
+static bool PaneSeen(Pane* p) { return Foreground() && !g_tabs.empty() && CurTab().active == p; }
+
+static UINT g_msgTaskbar;         // TaskbarButtonCreated
+static ITaskbarList3* g_taskbar;  // this window's taskbar button (SetOverlay, TaskbarReady)
+static HRESULT g_taskbarHr = S_FALSE, g_overlayHr = S_FALSE;  // tests (step «taskbar»)
+static void SetOverlay(int total);
+static void TaskbarReady();
+static std::vector<uint32_t> BadgePixels(int n, int size);
+
+// Clears what the user is looking at and keeps the taskbar button in step. Cheap: it runs before every message.
+static void SyncUnread() {
+  if (g_tabs.empty()) return;
+  bool changed = false;
+  Pane* a = CurTab().active;
+  if (a && a->unread && PaneSeen(a)) a->unread = 0, changed = true;
+  int total = 0;
+  for (Pane* p : g_live) total += p->unread;
+  if (total != g_unreadShown) g_unreadShown = total, SetOverlay(total), changed = true;
+  if (changed) InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void OnNote(Pane* p, int kind) {
+  if (kind == NOTE_BUSY) {
+    p->noteQuiet = false;
+    return;
+  }
+  // The finish was already seen through the title or OSC 7501: the program's own bell or notification for it
+  // (Claude Code rings about 60 s later) is the same news, until it works again or is typed to.
+  const wchar_t* what = L"quiet";
+  if (kind == NOTE_IDLE || !p->noteQuiet) {
+    if (kind == NOTE_IDLE) p->noteQuiet = true;
+    DWORD now = std::max<DWORD>(GetTickCount(), 1);
+    bool merged = p->noteTick && now - p->noteTick < kNoteMergeMs;
+    p->noteTick = now;
+    what = merged ? L"merged" : PaneSeen(p) ? L"seen" : L"counted";
+    if (!merged && !PaneSeen(p)) {
+      p->unread = std::min(p->unread + 1, 999);
+      // The taskbar button flashes and stays lit until the window is in front (focus isn't taken), but not over a
+      // full-screen game or a presentation, where it would bring the taskbar up.
+      QUERY_USER_NOTIFICATION_STATE qs;
+      if (!Foreground() && SUCCEEDED(SHQueryUserNotificationState(&qs)) && qs == QUNS_ACCEPTS_NOTIFICATIONS) {
+        FLASHWINFO fi{sizeof fi, g_hwnd, FLASHW_TRAY, 3, 0};
+        FlashWindowEx(&fi);
+      }
+      SyncUnread();
+    }
+  }
+  if (!g_script.empty()) g_noteLog += std::wstring(g_noteLog.empty() ? L"" : L" ") + kNoteNames[kind] + L":" + what;
+}
+
 static void ActivateTab(int i) {
   if (i < 0 || i >= (int)g_tabs.size()) return;
   g_tabs[i].hidden = false;  // ir a una pestaña oculta la vuelve a mostrar
@@ -1976,9 +2132,11 @@ static void TabMenu(int i, POINT screen) {
 static void HiddenMenu(POINT screen) {
   HMENU m = CreatePopupMenu();
   for (int i = 0; i < (int)g_tabs.size(); i++)
-    if (g_tabs[i].hidden)
-      AppendMenuW(m, MF_STRING, 100 + i,
-                  (g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name).c_str());
+    if (g_tabs[i].hidden) {
+      std::wstring t = g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name;
+      if (int n = TabUnread(g_tabs[i])) t += L"  (" + std::to_wstring(n) + L")";  // unread
+      AppendMenuW(m, MF_STRING, 100 + i, t.c_str());
+    }
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(m, MF_STRING, 1, T(S_SHOW_ALL));
   int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, g_hwnd, nullptr);
@@ -2621,6 +2779,7 @@ static void SubmitEditor(Pane* p) {
   }
   p->recon = Reconnect{};  // a new run (it also stops a reconnect loop: the user typed something)
   p->recon.cmd = u;
+  p->noteQuiet = false;
   p->edit.clear();
   p->caret = 0;
   p->histPos = -1;
@@ -5128,6 +5287,9 @@ static void MakeFonts() {
   }
   g_uiFont = CreateFontW(-Px(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                          OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+  if (g_badgeFont) DeleteObject(g_badgeFont);
+  g_badgeFont = CreateFontW(-Px(10), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                            OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe UI");
   if (g_iconFont) DeleteObject(g_iconFont);
   g_iconFont = CreateFontW(-Px(9), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                            OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe MDL2 Assets");
@@ -5537,6 +5699,53 @@ static void Text(HDC dc, const std::wstring& s, RECT r, COLORREF c, UINT flags) 
   DrawTextW(dc, s.c_str(), (int)s.size(), &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | flags);
 }
 
+// Unread count pill: accent, white bold number, «9+» above 9. BadgeRect centres it on (cx, cy).
+static std::wstring BadgeLabel(int n) { return n > 9 ? L"9+" : std::to_wstring(n); }
+
+static RECT BadgeRect(HDC dc, int n, int cx, int cy) {
+  std::wstring t = BadgeLabel(n);
+  HGDIOBJ of = SelectObject(dc, g_badgeFont);
+  SIZE sz{};
+  GetTextExtentPoint32W(dc, t.c_str(), (int)t.size(), &sz);
+  SelectObject(dc, of);
+  int h = Px(16), w = std::max(h, (int)sz.cx + Px(8));
+  return RECT{cx - w / 2, cy - h / 2, cx - w / 2 + w, cy - h / 2 + h};
+}
+
+// How much of pixel (x, y) a w x h capsule (a circle when w == h) covers, antialiased by distance to its spine.
+static float CapsuleCover(int x, int y, int w, int h) {
+  float rad = h / 2.0f, fx = x + 0.5f, fy = y + 0.5f;
+  float dx = std::max(0.0f, std::max(rad - fx, fx - (w - rad))), dy = fy - rad;
+  return std::min(1.0f, std::max(0.0f, rad - std::sqrt(dx * dx + dy * dy) + 0.5f));
+}
+
+static void DrawBadge(HDC dc, int n, RECT r) {
+  int w = r.right - r.left, h = r.bottom - r.top;
+  BITMAPINFO bi{};
+  bi.bmiHeader = {sizeof bi.bmiHeader, w, -h, 1, 32, BI_RGB};
+  void* bits = nullptr;
+  HDC mdc = CreateCompatibleDC(dc);
+  HBITMAP bmp = CreateDIBSection(mdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+  if (bits) {  // premultiplied accent, blended over what is there
+    uint32_t* px = (uint32_t*)bits;
+    for (int y = 0; y < h; y++)
+      for (int x = 0; x < w; x++) {
+        float a = CapsuleCover(x, y, w, h);
+        px[(size_t)y * w + x] = (uint32_t)(a * 255 + 0.5f) << 24 | (uint32_t)(GetRValue(kAccent) * a + 0.5f) << 16 |
+                                (uint32_t)(GetGValue(kAccent) * a + 0.5f) << 8 | (uint32_t)(GetBValue(kAccent) * a + 0.5f);
+      }
+    HGDIOBJ ob = SelectObject(mdc, bmp);
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    GdiAlphaBlend(dc, r.left, r.top, w, h, mdc, 0, 0, w, h, bf);
+    SelectObject(mdc, ob);
+  }
+  DeleteObject(bmp);
+  DeleteDC(mdc);
+  HGDIOBJ of = SelectObject(dc, g_badgeFont);
+  Text(dc, BadgeLabel(n), r, kFg, DT_CENTER);
+  SelectObject(dc, of);
+}
+
 static void DrawTabItem(HDC dc, int i, RECT r, bool vertical) {
   bool act = i == g_activeTab, hover = g_hoverTab == i;
   if (act || hover) Fill(dc, r, act ? kTabActiveBg : RGB(0x1a, 0x1a, 0x1a));
@@ -5556,6 +5765,11 @@ static void DrawTabItem(HDC dc, int i, RECT r, bool vertical) {
     return;
   }
   const std::wstring& label = g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name;
+  if (int n = TabUnread(g_tabs[i])) {  // across the top: in the empty left padding; at the side: where the × goes
+    RECT xr = TabCloseRect(r), b = BadgeRect(dc, n, vertical ? (xr.left + xr.right) / 2 : r.left + Px(15), (r.top + r.bottom) / 2);
+    if (vertical && (act || hover)) OffsetRect(&b, xr.left - Px(2) - b.right, 0), tr.right = std::min(tr.right, b.left - Px(4));
+    DrawBadge(dc, n, b);
+  }
   Text(dc, label, tr, act ? kFg : kTabText, align | DT_END_ELLIPSIS);
   if (act || hover) {
     RECT xr = TabCloseRect(r);
@@ -5594,7 +5808,14 @@ static void DrawTitleBar(HDC dc, int w, int h) {
   Text(dc, L"+", L.plus, g_hoverHit == HIT_PLUS ? kFg : kTabText, DT_CENTER);
   if (L.hiddenBtn.right > L.hiddenBtn.left) {
     if (g_hoverHit == HIT_HIDDEN) Fill(dc, L.hiddenBtn, RGB(0x1a, 0x1a, 0x1a));
-    Text(dc, Tf(S_HIDDEN_N, HiddenCount()), L.hiddenBtn, g_hoverHit == HIT_HIDDEN ? kFg : kTabText, DT_CENTER);
+    RECT tr = L.hiddenBtn;
+    if (int n = HiddenUnread()) {  // unread in the hidden tabs, at its right end
+      RECT b = BadgeRect(dc, n, 0, (tr.top + tr.bottom) / 2);
+      OffsetRect(&b, tr.right - Px(6) - b.right, 0);
+      DrawBadge(dc, n, b);
+      tr.right = b.left;
+    }
+    Text(dc, Tf(S_HIDDEN_N, HiddenCount()), tr, g_hoverHit == HIT_HIDDEN ? kFg : kTabText, DT_CENTER);
   }
   std::wstring toast = g_toast;
   if (!g_fontLoading.empty()) {  // font download in progress
@@ -5628,6 +5849,7 @@ static void DrawPaneHeader(HDC dc, Pane* p, bool active) {
   SetBkMode(dc, TRANSPARENT);
   SelectObject(dc, g_uiFont);
   RECT tr{h.left + Px(34), h.top, h.right - Px(34), h.bottom};
+  if (p->unread) DrawBadge(dc, p->unread, BadgeRect(dc, p->unread, h.left + Px(17), (h.top + h.bottom) / 2));
   Text(dc, ShortTitle(p), tr, active ? kFg : kTabText, DT_CENTER | DT_END_ELLIPSIS);
   RECT xr{h.right - Px(30), h.top, h.right - Px(6), h.bottom};
   SelectObject(dc, g_iconFont);
@@ -6038,6 +6260,24 @@ static std::wstring Bench() {
   return out;
 }
 
+// 32-bit top-down BMP of w x h pixels.
+static bool WriteBmp(const std::wstring& path, const void* bits, int w, int h) {
+  BITMAPINFOHEADER bh{sizeof bh, w, -h, 1, 32, BI_RGB};
+  BITMAPFILEHEADER fh{};
+  DWORD size = (DWORD)w * h * 4;
+  fh.bfType = 0x4D42;
+  fh.bfOffBits = sizeof fh + sizeof bh;
+  fh.bfSize = fh.bfOffBits + size;
+  HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return false;
+  DWORD wr;
+  WriteFile(f, &fh, sizeof fh, &wr, nullptr);
+  WriteFile(f, &bh, sizeof bh, &wr, nullptr);
+  WriteFile(f, bits, size, &wr, nullptr);
+  CloseHandle(f);
+  return true;
+}
+
 static bool SaveScreenshot(const std::wstring& path) {
   RECT rc;
   GetClientRect(g_hwnd, &rc);
@@ -6054,20 +6294,7 @@ static bool SaveScreenshot(const std::wstring& path) {
   HGDIOBJ old = SelectObject(dc, bmp);
   Render(dc, w, h);
   GdiFlush();
-  BITMAPFILEHEADER fh{};
-  DWORD size = (DWORD)w * h * 4;
-  fh.bfType = 0x4D42;
-  fh.bfOffBits = sizeof fh + sizeof bi.bmiHeader;
-  fh.bfSize = fh.bfOffBits + size;
-  HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
-  bool ok = f != INVALID_HANDLE_VALUE;
-  if (ok) {
-    DWORD wr;
-    WriteFile(f, &fh, sizeof fh, &wr, nullptr);
-    WriteFile(f, &bi.bmiHeader, sizeof bi.bmiHeader, &wr, nullptr);
-    WriteFile(f, bits, size, &wr, nullptr);
-    CloseHandle(f);
-  }
+  bool ok = WriteBmp(path, bits, w, h);
   SelectObject(dc, old);
   DeleteObject(bmp);
   DeleteDC(dc);
@@ -6083,6 +6310,7 @@ static bool SaveScreenshot(const std::wstring& path) {
 //   cells join:<hex>,<hex>... brightness font-size (these write to <session>.bench) select:<text> select-to:<text> copy brightness:<RRGGBB>
 //   font-size:<px> link-action:<col>,<row> hover-time:<col>,<row> path-probes path-spans:<row> path-scan-time (these
 //   write to <session>.bench; hover reports paths as "path <full path>")
+//   focus:on|off feed:<tab>:<hex> badge-icon:<n>,<px>,<file.bmp> badges notes taskbar (the last three write to <session>.bench)
 
 static void SetStartWithWindows(bool on);
 
@@ -7129,6 +7357,60 @@ static void RunScriptStep() {
     std::wstring r = L"tabs:";
     for (int i = 0; i < (int)g_tabs.size(); i++) r += L" " + (i == g_activeTab ? L"*" + g_tabs[i].name : g_tabs[i].name);
     ScriptLog(r);
+  } else if (s.rfind(L"focus:", 0) == 0) {  // focus:on|off — as if the window got or lost the keyboard focus
+    SendMessageW(g_hwnd, s.substr(6) == L"on" ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);
+  } else if (s.rfind(L"feed:", 0) == 0) {  // feed:<tab>:<hex> — bytes to that tab's active pane as if its program wrote them
+    int ti = _wtoi(s.c_str() + 5);
+    size_t c = s.find(L':', 5);
+    if (ti >= 0 && ti < (int)g_tabs.size() && c != std::wstring::npos) {
+      Pane* q = g_tabs[ti].active;
+      std::string bytes = HexDecode(ToUtf8(s.substr(c + 1)));
+      EnterCriticalSection(&q->cs);
+      vterm_input_write(q->vt, bytes.data(), bytes.size());
+      vterm_screen_flush_damage(q->scr);
+      LeaveCriticalSection(&q->cs);
+      FlushOut(q);
+      RequestRepaint();
+    }
+    delay = 600;
+  } else if (s == L"badges") {  // unread per tab ([per pane] when split), window total, in hidden tabs, window in front
+    SyncUnread();
+    std::wstring r = L"badges:";
+    int total = 0;
+    for (int i = 0; i < (int)g_tabs.size(); i++) {
+      std::vector<Pane*> ls;
+      Leaves(g_tabs[i].root, ls);
+      int n = TabUnread(g_tabs[i]);
+      total += n;
+      r += L" tab" + std::to_wstring(i) + L"=" + std::to_wstring(n);
+      for (size_t k = 0; ls.size() > 1 && k < ls.size(); k++)
+        r += (k ? L"," : L"[") + std::to_wstring(ls[k]->unread) + (k + 1 == ls.size() ? L"]" : L"");
+    }
+    ScriptLog(r + L" window=" + std::to_wstring(total) + L" hidden=" + std::to_wstring(HiddenUnread()) + L" fg=" +
+              (Foreground() ? L"1" : L"0"));
+  } else if (s == L"notes") {  // what each event since the last «notes» did (<kind>:counted|seen|merged|quiet)
+    ScriptLog(L"notes: " + (g_noteLog.empty() ? std::wstring(L"(none)") : g_noteLog));
+    g_noteLog.clear();
+  } else if (s == L"taskbar") {  // the taskbar button: CoCreateInstance+HrInit and the last SetOverlayIcon (tried now
+    bool told = g_taskbar != nullptr;  // if Explorer never said the button exists)
+    if (!g_taskbar) TaskbarReady();
+    wchar_t b[160];
+    swprintf(b, 160, L"taskbar: %ls init=0x%08lX overlay=0x%08lX total=%d", told ? L"button" : L"no-button",
+             (unsigned long)g_taskbarHr, (unsigned long)g_overlayHr, g_unreadShown);
+    ScriptLog(b);
+  } else if (s.rfind(L"badge-icon:", 0) == 0) {  // badge-icon:<n>,<px>,<file.bmp> — the taskbar overlay, over a dark taskbar
+    int n = 0, px = 0;
+    swscanf(s.c_str() + 11, L"%d,%d", &n, &px);
+    size_t c = s.find(L',', s.find(L',', 11) + 1);
+    if (n > 0 && px > 0 && px <= 256 && c != std::wstring::npos) {
+      std::vector<uint32_t> v = BadgePixels(n, px);
+      for (auto& q : v) {
+        uint32_t a = q >> 24, bg = 0x20;
+        auto ch = [&](int sh) { return (((q >> sh & 255) * a + bg * (255 - a)) / 255) << sh; };
+        q = ch(16) | ch(8) | ch(0);
+      }
+      WriteBmp(s.substr(c + 1), v.data(), px, px);
+    }
   } else if (s.rfind(L"link-menu:", 0) == 0 && p) {  // link-menu:col,row[,n] — the right-click menu there; n runs item n (never «Open»)
     int c = 0, r = 0, n = 0;
     swscanf(s.c_str() + 10, L"%d,%d,%d", &c, &r, &n);
@@ -7305,6 +7587,79 @@ static int SysMetric(int idx, UINT dpi) {
   return fn ? fn(idx, dpi) : GetSystemMetrics(idx);
 }
 
+// Taskbar button: the unread total of this window as an overlay icon (see «Unread badges»). Explorer says when the
+// button exists (TaskbarButtonCreated, again if Explorer restarts); without it there is nothing to set.
+
+// The badge as straight-alpha BGRA, size x size: an accent circle with the count in white. GDI leaves alpha at 0,
+// so the text is drawn white on black and used as coverage over the accent; the circle is CapsuleCover's.
+static std::vector<uint32_t> BadgePixels(int n, int size) {
+  std::vector<uint32_t> px((size_t)size * size);
+  BITMAPINFO bi{};
+  bi.bmiHeader = {sizeof bi.bmiHeader, size, -size, 1, 32, BI_RGB};
+  void* bits = nullptr;
+  HDC dc = CreateCompatibleDC(nullptr);
+  HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+  HGDIOBJ ob = SelectObject(dc, bmp);
+  HFONT f = CreateFontW(-(n > 9 ? size * 9 / 16 : size * 11 / 16), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                        OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+  HGDIOBJ of = SelectObject(dc, f);
+  SetBkMode(dc, TRANSPARENT);
+  SetTextColor(dc, RGB(255, 255, 255));
+  RECT r{0, 0, size, size};
+  std::wstring t = BadgeLabel(n);
+  DrawTextW(dc, t.c_str(), (int)t.size(), &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+  GdiFlush();
+  const uint32_t* text = (const uint32_t*)bits;
+  for (int y = 0; y < size; y++)
+    for (int x = 0; x < size; x++) {
+      size_t i = (size_t)y * size + x;
+      int k = text ? text[i] & 0xff : 0;
+      auto mix = [k](int v) { return (uint32_t)((v * (255 - k) + 255 * k) / 255); };
+      float a = CapsuleCover(x, y, size, size);
+      px[i] = (uint32_t)(a * 255 + 0.5f) << 24 | mix(GetRValue(kAccent)) << 16 | mix(GetGValue(kAccent)) << 8 | mix(GetBValue(kAccent));
+    }
+  SelectObject(dc, of);
+  DeleteObject(f);
+  SelectObject(dc, ob);
+  DeleteObject(bmp);
+  DeleteDC(dc);
+  return px;
+}
+
+static void SetOverlay(int total) {
+  if (!g_taskbar) return;
+  HICON icon = nullptr;
+  if (total) {
+    int size = SysMetric(SM_CXSMICON, WindowDpi(g_hwnd));
+    std::vector<uint32_t> px = BadgePixels(total, size);
+    BITMAPINFO bi{};
+    bi.bmiHeader = {sizeof bi.bmiHeader, size, -size, 1, 32, BI_RGB};
+    void* bits = nullptr;
+    HBITMAP color = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bits) memcpy(bits, px.data(), px.size() * 4);
+    std::vector<BYTE> zeros((size_t)((size + 15) / 16 * 2) * size);  // the alpha decides; the mask is all opaque
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, zeros.data());
+    ICONINFO ii{TRUE, 0, 0, mask, color};
+    icon = CreateIconIndirect(&ii);
+    DeleteObject(mask);
+    DeleteObject(color);
+  }
+  wchar_t d[64];
+  swprintf(d, 64, T(S_UNREAD), total);
+  g_overlayHr = g_taskbar->SetOverlayIcon(g_hwnd, icon, total ? d : L"");  // the taskbar keeps its own copy
+  if (icon) DestroyIcon(icon);
+}
+
+static void TaskbarReady() {
+  if (!g_taskbar) {
+    g_taskbarHr = CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, __uuidof(ITaskbarList3), (void**)&g_taskbar);
+    if (SUCCEEDED(g_taskbarHr)) g_taskbarHr = g_taskbar->HrInit();
+    if (FAILED(g_taskbarHr) && g_taskbar) g_taskbar->Release(), g_taskbar = nullptr;
+  }
+  g_unreadShown = -1;  // a new button: set it again
+  SyncUnread();
+}
+
 static void SetHover(int hit, int tab) {
   if (hit == g_hoverHit && tab == g_hoverTab) return;
   g_hoverHit = hit;
@@ -7438,6 +7793,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE: Relayout(); return 0;
     case WM_DPICHANGED: {
       ApplyDpi(HIWORD(wp));
+      g_unreadShown = -1;  // the taskbar badge at the new size
       RECT* r = (RECT*)lp;
       SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                    SWP_NOZORDER | SWP_NOACTIVATE);
@@ -7505,6 +7861,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_live.count(p)) CommandEnded(p, (int)(INT_PTR)wp);
       return 0;
     }
+    case WM_APP_NOTE: {  // a program has finished or wants an answer (wp: NOTE_*), from the reader thread
+      Pane* p = (Pane*)lp;
+      if (g_live.count(p)) OnNote(p, (int)wp);
+      return 0;
+    }
     case WM_APP_NETCHANGE: OnNetworkChange(); return 0;
     case WM_TIMER:
       if (wp == TIMER_FRAME) {
@@ -7564,7 +7925,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     }
     case WM_ERASEBKGND: return 1;
-    case WM_SETFOCUS: g_focused = true; InvalidateRect(hwnd, nullptr, FALSE); return 0;
+    case WM_SETFOCUS: g_focused = true; SyncUnread(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
     case WM_KILLFOCUS: g_focused = false; InvalidateRect(hwnd, nullptr, FALSE); return 0;
     case WM_CHAR:
     case WM_SYSCHAR: {
@@ -7962,6 +8323,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return 0;
   }
+  if (msg == g_msgTaskbar && g_msgTaskbar) {  // Explorer made (or remade) this window's taskbar button
+    TaskbarReady();
+    return 0;
+  }
   if (msg == g_msgQuitAll && g_msgQuitAll) {
     g_keepSession = true;
     if (wp) g_restartAll = true;  // update restart: this window comes back too, once
@@ -8188,6 +8553,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   g_msgFocusPane = RegisterWindowMessageW(L"warp-lite-focus-pane");
   g_msgFont = RegisterWindowMessageW(L"warp-lite-font");
   g_msgText = RegisterWindowMessageW(L"warp-lite-brightness");
+  g_msgTaskbar = RegisterWindowMessageW(L"TaskbarButtonCreated");
   if (!g_openDir.empty()) {
     // El Explorador pasa "C:\" y Windows lo lee como «C:"»: se arregla la barra del final.
     while (!g_openDir.empty() && (g_openDir.back() == L' ' || g_openDir.back() == L'\t')) g_openDir.pop_back();
@@ -8269,6 +8635,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
   MSG m;
   while (GetMessageW(&m, nullptr, 0, 0)) {
+    SyncUnread();  // the previous message may have changed the pane or tab in view (there are many ways to)
     bool keyDown = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN;
     if (g_sw.open && keyDown) {
       if (!SwKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);

@@ -12,6 +12,7 @@ A small, fast terminal for Windows with the look and shortcuts of [Warp](https:/
 - **Input box** at the bottom with the current folder (click it to switch folders), history, and the command coloured green if it exists or underlined in red if not.
 - **Tab completion** like Warp's menu: commands, `-parameters` and paths (`↑/↓` or `Tab` to move, `Enter` to pick).
 - **Picks up where you left off**: the main window (the first one Warp opens) always comes back after a restart with its tabs, splits and folders, however it was closed. Other windows (a tab dragged out, a second Warp) come back too only if *Reopen on restart* is ticked in their title-bar menu; an update restart brings back every window. Your last command is waiting in the input box, and anything that was still running (e.g. `ssh … tmux`) is relaunched. Claude Code and Codex resume the exact conversation each pane had (`claude --resume <id>`, `codex resume <id>`), even with several of them open in the same folder, instead of starting a new one.
+- **Unread badges**: when Claude Code, Codex or any other program finishes or waits for you in a pane you aren't looking at, that pane, its tab (or the hidden-tabs button) and the Windows taskbar button show a count, like a chat app, and the taskbar button flashes if Warp isn't in front (not over a full-screen game). Looking at the pane clears it. No sound, no Windows notification. See [Unread badges](#unread-badges) for what to set up.
 - **Reconnects dropped ssh sessions**: when the connection drops (`client_loop: send disconnect: Connection reset`, `closed by remote host`…), `ssh host` or `ssh -t host "tmux new -A -s x"` (also `tmux attach`, `screen -R`) is launched again by itself after 2, 4, 8, 16 and then every 30 s, sooner when the network comes back, until it connects. A small card shows the attempt; `Esc` or typing cancels. A normal exit, a tmux detach or an authentication error never retries, and neither do other remote commands.
 - **Vertical tabs**, renamable and hideable tabs, drag tabs to reorder them, several windows (drag a tab out to open it in a new one).
 - `Ctrl+F` search, file and folder paths that exist shown in their own color, `Ctrl+click` links and file paths (also when wrapped over several lines, quoted or not, with `:line` behind): files open with their app, folders in Explorer, and programs and scripts are only shown selected in Explorer, never run. Drop files to paste their path, `Ctrl +/-` zoom.
@@ -21,6 +22,28 @@ A small, fast terminal for Windows with the look and shortcuts of [Warp](https:/
 - Light on CPU: only the rows that change are redrawn.
 
 ![Vertical tabs](docs/screenshot-vertical.png)
+
+## Unread badges
+
+A pane counts one when its program sends a desktop notification (OSC 9, OSC 777 `notify`, OSC 99), rings the bell, or stops working: Claude Code's title spinner (◐ ◑) turning into ✳, or Codex's status (OSC 7501) leaving `working`. A notification and its bell arriving together count once, and `OSC 9;9` (folder) and `OSC 9;4` (progress) never count.
+
+- **Claude Code**, run in Warp or over plain `ssh`: nothing to set up (its title shows when it stops, to finish or to ask for a permission). Inside tmux its title stays still, so it has to ring the bell. Either set `"preferredNotifChannel": "terminal_bell"` in `~/.claude/settings.json` where it runs (it rings when it waits for a permission, and about a minute after finishing if you haven't typed), or, for a badge as soon as each reply ends, add these hooks instead:
+
+  ```json
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && printf '\\a' > \"$(tmux display -p -t \"$TMUX_PANE\" '#{pane_tty}')\"" }] }],
+    "Notification": [{ "matcher": "permission_prompt", "hooks": [{ "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && printf '\\a' > \"$(tmux display -p -t \"$TMUX_PANE\" '#{pane_tty}')\"" }] }]
+  }
+  ```
+
+- **Codex**: outside tmux, nothing (its status is enough). Inside tmux, let it notify even though it can't tell which pane you look at (Warp can), in `~/.codex/config.toml`:
+
+  ```toml
+  [tui]
+  notification_condition = "always"
+  ```
+
+- **tmux**: the bell gets through with the defaults (`bell-action any`, `visual-bell off`). For OSC 9 notifications from inside it (Claude Code's `iterm2`, Codex's `osc9`), tmux 3.3 or later needs `set -g allow-passthrough on` in `~/.tmux.conf`; older versions pass them already.
 
 ## Install
 
