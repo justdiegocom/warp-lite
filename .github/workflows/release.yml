@@ -28,9 +28,10 @@ jobs:
         id: ver
         run: |
           prev=$(git tag -l 'v*' --sort=-v:refname | head -n1)
-          # Nothing in the app changed since the last release (README, docs, tests...): no release.
+          # Nothing that ships changed since the last release (README, docs, tests...): no release.
+          # release.yml counts: it decides which assets the release carries.
           if [[ -n "$prev" && "${{ github.event_name }}" == push ]] &&
-             git diff --quiet "$prev" HEAD -- src third_party assets tools/build.sh; then
+             git diff --quiet "$prev" HEAD -- src third_party assets tools/build.sh .github/workflows/release.yml; then
             echo "No app changes since $prev, skipping."
             echo "skip=1" >> "$GITHUB_OUTPUT"
             exit 0
@@ -66,6 +67,19 @@ jobs:
         if: steps.ver.outputs.skip != '1'
         run: bash tools/build.sh --local
 
+      # Assets: the installer, the bare exe, a portable zip of the exe, and a .sha256 next to each
+      # (sha256sum format, so `sha256sum -c` verifies a download). dcbot's health check compares
+      # every .sha256 with the digest GitHub computed for the file it names.
+      - name: Package
+        if: steps.ver.outputs.skip != '1'
+        run: |
+          cd dist
+          rm -f warp-lite.zip
+          zip -9 -X warp-lite.zip warp-lite.exe
+          for f in warp-lite-setup.exe warp-lite.exe warp-lite.zip; do sha256sum "$f" > "$f.sha256"; done
+          sha256sum -c ./*.sha256
+          ls -l
+
       - name: Publish release
         if: steps.ver.outputs.skip != '1'
         env:
@@ -77,6 +91,9 @@ jobs:
             if [[ -n "$PREV" ]]; then git log --no-merges --format='- %s' "$PREV..HEAD"; fi
             echo
             echo "Install: download **warp-lite-setup.exe** and run it. Existing installs update themselves."
+            echo "Portable: **warp-lite.zip** holds the bare \`warp-lite.exe\`. Each file has a \`.sha256\` next to it (\`sha256sum -c\`)."
           } > notes.md
           gh release create "v$V" --target "$GITHUB_SHA" --title "v$V" --notes-file notes.md \
-            dist/warp-lite-setup.exe dist/warp-lite.exe
+            dist/warp-lite-setup.exe dist/warp-lite-setup.exe.sha256 \
+            dist/warp-lite.exe dist/warp-lite.exe.sha256 \
+            dist/warp-lite.zip dist/warp-lite.zip.sha256
