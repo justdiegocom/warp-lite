@@ -82,20 +82,25 @@ struct HostView: View {
     var body: some View {
         List {
             Section {
-                ConnectionRow(path: model.path, rtt: model.rtt)
-                if let e = model.error {
-                    Text(e).foregroundStyle(.red).font(.footnote)
+                if model.unreachable {
+                    UnreachableCard()
+                } else {
+                    ConnectionRow(path: model.path, rtt: model.rtt, connecting: model.connecting)
+                    if let e = model.error {
+                        Text(e).foregroundStyle(.red).font(.footnote)
+                    }
+                    if model.needsPairing {
+                        Button("Pair again") { Task { await model.forget() } }
+                            .accessibilityIdentifier("pair-again")
+                    }
                 }
             }
             ForEach(Array(windows.enumerated()), id: \.element.0) { index, group in
                 Section(windows.count > 1 ? "Window \(index + 1)" : "Terminals") {
                     ForEach(group.1) { s in
-                        if (s.pane_id ?? 0) != 0 {
-                            NavigationLink(value: s) { SessionRow(session: s) }
-                                .accessibilityIdentifier("session-\(s.id)")
-                        } else {
-                            SessionRow(session: s)  // an older Warp: the list only
-                        }
+                        // Also a pane of an older Warp (no pane id): it says to update Warp instead of doing nothing.
+                        NavigationLink(value: s) { SessionRow(session: s) }
+                            .accessibilityIdentifier("session-\(s.id)")
                     }
                 }
             }
@@ -112,6 +117,7 @@ struct HostView: View {
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
+            .accessibilityIdentifier("more")
         }
         .confirmationDialog("Forget \(model.host)? You'll need a new pairing code from Warp.", isPresented: $confirmForget,
                             titleVisibility: .visible) {
@@ -120,15 +126,59 @@ struct HostView: View {
     }
 }
 
+/// The paired computer didn't answer, twice in a row: Warp closed there, the computer off or asleep, or a Warp that is
+/// gone (a test one, a reinstalled computer). Try again, or forget it and pair again.
+struct UnreachableCard: View {
+    @EnvironmentObject var model: Model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.title3)
+                Text("Can't reach \(model.host.isEmpty ? "the computer" : model.host)").font(.headline)
+                    .accessibilityIdentifier("unreachable")
+            }
+            Text("Warp on it isn't answering. Check that the computer is on and Warp is open there, or pair again if that Warp is gone.")
+                .font(.footnote).foregroundStyle(.secondary)
+            HStack(spacing: 12) {
+                Button {
+                    Task { await model.refresh() }
+                } label: {
+                    Group {
+                        if model.connecting { ProgressView() } else { Text("Try again") }
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.connecting)
+                .accessibilityIdentifier("try-again")
+                Button {
+                    Task { await model.forget() }
+                } label: {
+                    Text("Pair again").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("pair-again")
+            }
+        }
+        .padding(.vertical, 6)
+    }
+}
+
 struct ConnectionRow: View {
     var path: NetPath?
     var rtt: Double?
+    var connecting = false
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: icon).foregroundStyle(color).font(.title3)
+            if path == nil && connecting {
+                ProgressView().frame(width: 24)
+            } else {
+                Image(systemName: icon).foregroundStyle(color).font(.title3)
+            }
             VStack(alignment: .leading, spacing: 2) {
-                Text(label).font(.headline)
+                Text(label).font(.headline).accessibilityIdentifier("connection")
                 if let a = path?.addr, !a.isEmpty {
                     Text(a).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
@@ -144,7 +194,7 @@ struct ConnectionRow: View {
         switch path?.kind {
         case "direct": return "Direct connection"
         case "relay": return "Through a relay"
-        default: return "Not connected"
+        default: return connecting ? "Connecting…" : "Not connected"
         }
     }
     private var icon: String {
