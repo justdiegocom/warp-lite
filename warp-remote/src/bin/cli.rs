@@ -6,6 +6,10 @@
 //!     ping [n]          n round trips (default 5)
 //!     path [seconds]    which network path the connection uses, once a second (default 10)
 //!     forget            forget the paired Warp
+//!     watch <window> <pane id> [n]      what that pane shows (JSON), n times a second apart (default 1)
+//!     type <window> <pane id> <text>    types that text and Enter (needs Allow typing in Warp)
+//!     key <window> <pane id> <key>...   presses keys (enter, esc, up, down, left, right, tab, backspace, ctrl_c)
+//!     pick <window> <pane id> <n>       chooses option n (from 1) of the question the pane shows
 //!
 //! `--relay-only` connects only through n0's relay (as a phone behind a strict NAT would);
 //! `--local` stays on loopback. The state directory (default ~/.warp-remote-cli) keeps this device's key and the paired Warp.
@@ -122,10 +126,44 @@ async fn run(o: Opts) -> Result<()> {
             Ok(())
         }
         ["forget"] => c.forget(),
-        _ => Err(err("usage: warp-remote-cli [--state dir] [--name n] [--local | --relay-only] [--json] pair <ticket> | sessions | ping [n] | path [s] | forget")),
+        ["watch", w, p, rest @ ..] => {
+            let (w, p) = pane(w, p)?;
+            let n: u32 = rest.first().map(|s| s.parse()).transpose()?.unwrap_or(1);
+            let mut since = 0;
+            for i in 0..n {
+                let v = c.watch(w, p, since, None).await?;
+                since = v.rev;
+                println!("{}", serde_json::to_string(&v)?);
+                if i + 1 < n {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+            c.unwatch(w, p).await
+        }
+        ["type", w, p, text @ ..] => {
+            let (w, p) = pane(w, p)?;
+            c.input(w, p, &text.join(" "), &["enter"], None, "").await
+        }
+        ["key", w, p, keys @ ..] => {
+            let (w, p) = pane(w, p)?;
+            c.input(w, p, "", keys, None, "").await
+        }
+        ["pick", w, p, n] => {
+            let (w, p) = pane(w, p)?;
+            let n: u32 = n.parse()?;
+            let v = c.watch(w, p, 0, None).await?;
+            let q = v.prompt.ok_or_else(|| err("no question on that pane"))?;
+            c.input(w, p, "", &[], Some(n.saturating_sub(1)), &q.id).await
+        }
+        _ => Err(err("usage: warp-remote-cli [--state dir] [--name n] [--local | --relay-only] [--json] pair <ticket> | sessions | ping [n] | path [s] | forget | watch <window> <pane id> [n] | type <window> <pane id> <text> | key <window> <pane id> <key>... | pick <window> <pane id> <n>")),
     };
     c.close().await;
     r
+}
+
+/// A pane as `sessions --json` lists it: its window (decimal) and its pane id.
+fn pane(w: &str, p: &str) -> Result<(u64, u32)> {
+    Ok((w.parse()?, p.parse()?))
 }
 
 fn fmt_path(c: &Client) -> String {

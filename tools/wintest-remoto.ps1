@@ -1,8 +1,9 @@
 # Phone access through warp-remote (the sidecar next to warp-lite.exe), against a test Warp with its own
 # WARPLITE_DIR (never the real one), using warp-remote-cli.exe as the phone. (1) Nothing paired: no warp-remote
 # runs. (2) Pair phone shows a code; a newer code replaces it; the client pairs with it and lists the panes of
-# both windows of this Warp; the codes are one-time and an unknown device is turned away; while it is connected
-# the title bar shows it. (3) Quit-all ends warp-remote; opening Warp again with a phone paired starts it and the
+# both windows of this Warp; the codes are one-time and an unknown device is turned away; the client sees a pane's text,
+# can't type into it until the device is allowed in Warp, then types a command that runs there, and the title bar says
+# so; while it is connected the title bar shows it. (3) Quit-all ends warp-remote; opening Warp again with a phone paired starts it and the
 # client gets in with no code; an update restart replaces it with a new one. (4) Removing the device in Warp turns
 # it away, and with nothing paired warp-remote ends. -External: the first code is for a client elsewhere (in
 # remote-ticket.txt); the test waits for external-done.txt before going on.
@@ -35,14 +36,15 @@ function RemoteCli($state) {
   $out = & "$dir\warp-remote-cli.exe" --state $state --name 'wintest phone' @args 2>&1 | ForEach-Object { "$_" }
   [pscustomobject]@{ Ok = $LASTEXITCODE -eq 0; Out = ($out -join ' / ') }
 }
-$devs = 1 + [int][bool]$External  # paired devices once this test's phone is (the external one comes first)
+$devs = 1 + [int][bool]$External  # paired devices once this test's phone is (the external one comes first; it is the last)
 $fail = 0
 function Check($ok, $what) { if (-not $ok) { $script:fail++ }; '{0} {1}' -f $(if ($ok) { 'OK  ' } else { 'FALLO' }), $what }
 
 # 1. Two windows of one Warp; nothing paired.
 $a = Warp @('wait', 'rename:first', 'splitR', 'wait', 'wait', 'remote-state', "wait-file:$dir\go-pair.txt",
   'remote-pair', 'remote-wait', 'remote-ticket', "shot:$dir\remote-pair.bmp", "wait-file:$dir\go-pair2.txt",
-  'remote-pair', 'remote-wait', 'remote-ticket', "wait-file:$dir\go-shot.txt", 'remote-state', "shot:$dir\remote-connected.bmp",
+  'remote-pair', 'remote-wait', 'remote-ticket', "wait-file:$dir\go-typing.txt", "remote-typing:$($devs - 1):on",
+  "wait-file:$dir\go-typed.txt", 'remote-typing-state', "wait-file:$dir\go-shot.txt", 'remote-state', "shot:$dir\remote-connected.bmp",
   "wait-file:$dir\go-quit.txt", 'quit-all')
 Start-Sleep 4
 $b = Warp @('wait', 'rename:second', "wait-file:$dir\go-quit.txt")
@@ -77,6 +79,27 @@ Check ($r.Ok -and $winsSeen -eq 2 -and @($s).Count -ge 3 -and ($tabs -contains '
 $r = RemoteCli $phone --json ping 5
 $med = $null; try { $med = ($r.Out | ConvertFrom-Json).median_ms } catch {}
 Check ($r.Ok -and $med -ne $null) "ping: median $med ms"
+# A pane's text; typing only once allowed in Warp (Paired devices → Allow typing), then it runs there.
+$p = @($s | Where-Object { $_.tab_name -eq 'first' -and $_.pane_id })[0]
+$r = RemoteCli $phone watch $p.window $p.pane_id
+$v = $null; try { $v = $r.Out | ConvertFrom-Json } catch {}
+Check ($r.Ok -and $v.kind -eq 'screen' -and @($v.screen).Count -gt 0 -and -not $v.typing) "pane $($p.pane_id) as text: $($v.kind), $(@($v.screen).Count) rows, typing=$($v.typing)"
+$r = RemoteCli $phone type $p.window $p.pane_id "Write-Output ('phone' + '-typed-' + 42)"
+Check (-not $r.Ok -and $r.Out -match 'typing_off') "typing refused until allowed: $($r.Out)"
+Go 'typing'
+Start-Sleep 2
+$r = RemoteCli $phone type $p.window $p.pane_id "Write-Output ('phone' + '-typed-' + 42)"
+Start-Sleep 3
+$r2 = RemoteCli $phone watch $p.window $p.pane_id
+$v = $null; try { $v = $r2.Out | ConvertFrom-Json } catch {}
+$ran = @($v.screen | Where-Object { $_ -match '^phone-typed-42$' }).Count
+Check ($r.Ok -and $ran -eq 1 -and $v.typing) "allowed: typed and it ran ($ran output line, typing=$($v.typing)) $($r.Out)"
+$r = RemoteCli $phone key $p.window $p.pane_id 'rm -rf'
+Check (-not $r.Ok -and $r.Out -match 'bad_request') "only known keys: $($r.Out)"
+$null = RemoteCli $phone key $p.window $p.pane_id esc  # the mark lasts 4 s after the last key
+Go 'typed'
+$st = WaitFor '^remote-typing: '
+Check ($st -eq 'remote-typing: allowed=1 shown=1') "title bar says a phone is typing: $st"
 # Connected for a while: the title bar shows it.
 $hold = Start-Process -FilePath "$dir\warp-remote-cli.exe" -ArgumentList "--state `"$phone`" --name `"wintest phone`" path 8" -PassThru
 Start-Sleep 3

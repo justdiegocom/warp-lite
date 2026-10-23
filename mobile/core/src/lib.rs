@@ -10,6 +10,10 @@
 //! - `sessions`: `host`, `sessions` (see warp-remote's protocol), `path`
 //! - `ping`: `rtt_ms`, `path`
 //! - `disconnect`, `forget`
+//! - `watch` (`window`, `pane_id`, `since`, optional `before`): `pane` (warp-remote's `PaneView`: a chat or the screen's
+//!   text, the question it shows, whether this phone may type)
+//! - `unwatch` (`window`, `pane_id`)
+//! - `input` (`window`, `pane_id`, optional `text`, `keys`, `option` + `prompt`): types into the pane
 //!
 //! `path` is `{"kind":"direct"|"relay"|"none","addr":...,"rtt_ms":...}`.
 
@@ -81,6 +85,26 @@ impl WrCore {
                     c.forget()?;
                     json!({})
                 }
+                "watch" => {
+                    let (w, p) = pane(req);
+                    let since = req.get("since").and_then(Value::as_u64).unwrap_or(0);
+                    let before = req.get("before").and_then(Value::as_u64);
+                    json!({"pane": c.watch(w, p, since, before).await?})
+                }
+                "unwatch" => {
+                    let (w, p) = pane(req);
+                    c.unwatch(w, p).await?;
+                    json!({})
+                }
+                "input" => {
+                    let (w, p) = pane(req);
+                    let text = req.get("text").and_then(Value::as_str).unwrap_or("");
+                    let keys: Vec<&str> = req.get("keys").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+                    let option = req.get("option").and_then(Value::as_u64).map(|o| o as u32);
+                    let prompt = req.get("prompt").and_then(Value::as_str).unwrap_or("");
+                    c.input(w, p, text, &keys, option, prompt).await?;
+                    json!({})
+                }
                 _ => return Err(warp_remote::err(format!("unknown op {op:?}"))),
             })
         });
@@ -92,6 +116,12 @@ impl WrCore {
             Err(e) => error(&e),
         }
     }
+}
+
+/// A pane in a request: its window and pane id.
+fn pane(req: &Value) -> (u64, u32) {
+    let n = |k: &str| req.get(k).and_then(Value::as_u64).unwrap_or(0);
+    (n("window"), n("pane_id") as u32)
 }
 
 fn to_c(v: &Value) -> *mut c_char {
