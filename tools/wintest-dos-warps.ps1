@@ -90,15 +90,15 @@ Check ("$r" -eq 'window: main reopen=0 [hellomatik]') "opened again: $($r -join 
 
 # 4. «Open Warp here» with Warp open: a new tab in that folder, in A's window; the starts end at once.
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $winsA
-$p1 = Warp $winsA @('wait', 'rename:a-cd', "wait-file:$dir\go-dos-cd.txt", 'wait', 'active', 'windows', 'close')
-Start-Sleep 4
+$p1 = Warp $winsA @('wait', 'rename:a-cd', 'window-info', "wait-file:$dir\go-dos-cd.txt", 'wait', 'active', 'windows', 'close')
+WaitFor $winsA '^window: main reopen=0 \[a-cd\]'
 $env:WARPLITE_DIR = $winsA
 $cd = Start-Process -FilePath "$dir\warp-lite.exe" -ArgumentList '--cd "C:\Windows"' -PassThru
 $ended = $cd.WaitForExit(15000)
 Check ($ended -and $cd.ExitCode -eq 0 -and (Alive).Count -eq 1) "--cd handed to the running Warp, ended at once ($((Alive).Count) process)"
 New-Item -ItemType File -Force "$dir\go-dos-cd.txt" | Out-Null
 WaitAll $p1
-$d = @(Bench $winsA)
+$d = @(Bench $winsA | Where-Object { $_ -notlike 'window: *' })
 Check (($d -match '^active: tab 1 \[.*\] C:\\Windows').Count -eq 1 -and ($d -match '^windows: w\d+=\[a-cd:1\] \[[^\]]*:1\]$').Count -eq 1) "a new tab in C:\Windows, in that window: $($d -join ' / ')"
 Remove-Item -Force -ErrorAction SilentlyContinue "$dir\go-dos-cd.txt"
 

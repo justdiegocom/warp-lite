@@ -83,7 +83,7 @@ $a = Warp $wins @('wait', 'label:A', 'rename:uno', 'move:0,0,500,380', 'tab', 'w
   'splitR', 'wait', "edit:cd '$($proj.FullName)'", 'submit', 'wait', 'edit:claude --model m1', 'submit', 'wait', 'wait', 'pids',
   (Wf 'a2'), 'drop-pane:1,self,120,205', 'where', 'drag-start:pane:0', 'drag-to:B,430,210', (Wf 'drop'), 'drag-drop', 'window-info',
   "shot:$dir\juntar-a-despues.bmp", 'tab', 'wait', 'rename:ajena', 'drag-tab:1,0', 'tabs', (Wf 'a4'), "drop-tab:0,$($x.Id),250,200", 'window-info',
-  'tab', 'wait', 'rename:encima', (Wf 'a5'), 'drop-tab:1,0,368,120', 'window-info', (Wf 'end'))
+  'tab', 'wait', 'rename:encima', (Wf 'a5'), 'drag-start:tab:1', (Wf 'a5b'), 'drag-to:0,368,120', 'drag-drop', 'window-info', (Wf 'end'))
 $aExit = $a.WaitForExit(15000)
 Remove-Item Env:\WARPLITE_CHILD_SCRIPT
 Check ($aExit -and $a.ExitCode -eq 0 -and (Alive).Count -eq 2) "a second start hands its window to the running Warp and ends ($((Alive).Count) processes: B's and X's)"
@@ -105,7 +105,7 @@ Go 'b1'
 $w = WaitFor '^windows: '
 Check ((Entry $w 'B') -match '^\[remoto:1:ssh -t devbox "tmux new -A -s main"\] \[destino:1\]$') "B: the tab first, its ssh running: $(Entry $w 'B')"
 Check ((Entry $w 'A') -match '^\[uno:\d\]$') "A, without it: $(Entry $w 'A')"
-$p1 = WaitFor '^pids: .* B/remoto/0=\d+'
+$p1 = WaitFor '^pids:.* B/remoto/0=\d+'
 $before = Pid1 $p0 'A/remoto/0'; $after = Pid1 $p1 'B/remoto/0'
 Check ($before -gt 0 -and $before -eq $after -and (Get-Process -Id $after -ErrorAction SilentlyContinue)) "the same shell in B: pid $before -> $after"
 $g = WaitFor '^grep marker-remoto-86:'
@@ -115,7 +115,7 @@ WaitShot 'b-pestana'
 # 2. A's split: its Claude Code pane (right) dropped on its other pane: swapped. Then dragged over B's pane (right
 #    half) and dropped there: the same Claude Code, not resumed or launched again.
 $n = WaitLaunched 'claude *'
-$p2 = WaitFor '^pids: .* A/uno/1=\d+'
+$p2 = WaitFor '^pids:.* A/uno/1=\d+'
 Start-Sleep 3
 Go 'a2'
 $s = WaitFor '^where: '
@@ -135,7 +135,7 @@ Check ("$(@(Launched) -like 'claude *')" -eq 'claude --model m1') "Claude Code n
 Go 'b2'
 $w = WaitFor '^windows: ' 2
 Check ((Entry $w 'B') -match '^\[remoto:2:ssh -t devbox "tmux new -A -s main",claude --model m1\] \[destino:1\]$') "B: its pane split, Claude Code on the right: $(Entry $w 'B')"
-$p3 = WaitFor '^pids: .* B/remoto/1=\d+'
+$p3 = WaitFor '^pids:.* B/remoto/1=\d+'
 $before = Pid1 $p2 'A/uno/1'; $after = Pid1 $p3 'B/remoto/1'
 Check ($before -gt 0 -and $before -eq $after) "the same shell for Claude Code: pid $before -> $after"
 WaitShot 'b-panel'
@@ -168,9 +168,14 @@ $wa = WaitFor '^window: other reopen=0 \[uno' 3
 Check ($wa -eq 'window: other reopen=0 [uno]') "A without it: $wa"
 
 # 5. P opens over A (in front of it, overlapping it): A's tab «encima» dropped on P's tabs where P covers A.
-$p = Warp $wins @('wait', 'label:P', 'rename:encima-destino', 'move:300,100,500,380', 'window-info', (Wf 'end'))
+$p = Warp $wins @('wait', 'label:P', 'rename:encima-destino', 'move:300,100,500,380', 'window-info', (Wf 'p5'), 'raise', (Wf 'end'))
 $null = WaitFor '^window: other reopen=0 \[encima-destino\]'
+# Pressing the mouse on A's tab brings A to front, as a click does; P comes back over it before the drag goes on.
 Go 'a5'
+Start-Sleep 2
+Go 'p5'
+Start-Sleep 2
+Go 'a5b'
 $d = WaitFor '^drag-to: 368,120 '
 Check ($d -match 'join=P under=P outside=0$') "over A's area where P is in front: $d"
 $wa = WaitFor '^window: other reopen=0 \[uno' 4
@@ -192,7 +197,8 @@ $frames = 0
 function Frame { $script:frames++; 'desk-shot:{0},{1}\juntar-f{2:d3}.bmp' -f $area, $dir, $script:frames }
 # The frames in the order they are taken: C before and while it drags the tab out, both windows after; N dragging it
 # back; C after.
-$cOut = @('wait', 'label:C', 'rename:main', 'move:10,10,470,330', 'tab', 'wait', 'rename:contador', 'edit:contador', 'submit', 'wait', 'wait',
+$cOut = @('wait', 'label:C', 'rename:main', 'move:10,10,470,330', 'edit:cd C:\', 'submit', 'tab', 'wait', 'rename:contador', 'edit:cd C:\', 'submit',
+  'edit:contador', 'submit', 'wait', 'wait',
   'pids', 'grep:count-86 ', (Frame), 'wait', (Frame), 'wait', (Frame), (Wf 'out'), 'drag-start:tab:1', (Frame)) +
   (@(1..6) | ForEach-Object { "drag-to:0,$(240 + 66 * $_),$(30 + 23 * $_)"; (Frame) }) +
   @('drag-drop', (Frame), 'wait', (Frame), 'wait', (Frame), 'wait', (Frame), 'window-count')
@@ -205,18 +211,19 @@ $c = Warp $winsC $cSteps
 Remove-Item Env:\WARPLITE_CHILD_SCRIPT
 # Each window's results are in its own file (N's sorts before C's): lines are picked by the panes they name.
 $g0 = WaitFor '^grep count-86 :.* C/contador/0=' 1 60 $winsC
-$p0 = WaitFor '^pids: .* C/contador/0=' 1 60 $winsC
+$p0 = WaitFor '^pids:.* C/contador/0=' 1 60 $winsC
 $k0 = @(Counter)
 Check ($k0.Count -eq 1 -and $g0 -match ' C/contador/0=\d+\[count-86 0\]') "C: the counter running ($($k0.Count) process, $g0)"
 Go 'out'
 $g1 = WaitFor '^grep count-86 :.* N/contador/0=' 1 60 $winsC
-$p1 = WaitFor '^pids: .* N/contador/0=' 1 60 $winsC
+$p1 = WaitFor '^pids:.* N/contador/0=' 1 60 $winsC
 $k1 = @(Counter)
 $first = if ($g0 -match '\[count-86 (\d+)\]$') { [int]$Matches[1] } else { -1 }
 $moved = if ($g1 -match 'N/contador/0=\d+\[count-86 0\]\[count-86 (\d+)\]') { [int]$Matches[1] } else { -1 }
 Check ($moved -gt $first -and $first -ge 0) "in the new window it goes on from where it was, its first line still there: $g1"
 Check ($k1.Count -eq 1 -and $k1[0].ProcessId -eq $k0[0].ProcessId) "the same counter process: $($k0.ProcessId) -> $($k1.ProcessId)"
-Check ((Pid1 $p0 'C/contador/0') -eq (Pid1 $p1 'N/contador/0') -and (Pid1 $p0 'C/contador/0') -gt 0) "the same shell: $p0 / $p1"
+$shell = Pid1 $p0 'C/contador/0'
+Check ($shell -gt 0 -and $shell -eq (Pid1 $p1 'N/contador/0')) "the same shell: $p0 / $p1"
 $cnt = WaitFor '^window-count: ' 1 60 $winsC
 Check ($cnt -eq 'window-count: 2') "two windows now: $cnt"
 Start-Sleep 2
@@ -225,14 +232,14 @@ Start-Sleep 6
 Go 'joined'
 $w = WaitFor '^windows: ' 1 60 $winsC
 $g2 = WaitFor '^grep count-86 :.* C/contador/0=' 2 60 $winsC
-$p2 = WaitFor '^pids: .* C/contador/0=' 2 60 $winsC
+$p2 = WaitFor '^pids:.* C/contador/0=' 2 60 $winsC
 $g3 = WaitFor '^grep count-86 :.* C/contador/0=' 3 60 $winsC
 $k2 = @(Counter)
 $back = if ($g2 -match 'C/contador/0=\d+\[count-86 0\]\[count-86 (\d+)\]') { [int]$Matches[1] } else { -1 }
 $later = if ($g3 -match 'C/contador/0=\d+\[count-86 0\]\[count-86 (\d+)\]') { [int]$Matches[1] } else { -1 }
 Check ($w -match '^windows: C=\[main:1\] \[contador:1:contador\]$' -or $w -match '^windows: C=\[contador:1:contador\] \[main:1\]$') "back in C, N closed: $w"
 Check ($back -gt $moved -and $later -gt $back) "it goes on counting back in C ($moved -> $back -> $later)"
-Check ($k2.Count -eq 1 -and $k2[0].ProcessId -eq $k0[0].ProcessId -and (Pid1 $p2 'C/contador/0') -eq (Pid1 $p0 'C/contador/0')) "the same counter process and shell after joining it back ($($k2.ProcessId); $p2)"
+Check ($k2.Count -eq 1 -and $k2[0].ProcessId -eq $k0[0].ProcessId -and $shell -gt 0 -and (Pid1 $p2 'C/contador/0') -eq $shell) "the same counter process and shell after joining it back ($($k2.ProcessId); $p2)"
 Go 'endc'
 if (-not $c.WaitForExit(30000)) { $c.Kill(); 'TIMEOUT' }
 for ($t = 0; $t -lt 20 -and @(Counter).Count; $t++) { Start-Sleep -Milliseconds 500 }

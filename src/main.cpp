@@ -26,11 +26,14 @@
 #include <bcrypt.h>
 #include <restartmanager.h>
 #include <dwrite_3.h>
+#include <dbghelp.h>
 
 #include <algorithm>
 #include <atomic>
 #include <climits>
 #include <cmath>
+#include <csignal>
+#include <exception>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -111,7 +114,7 @@ static const size_t kScrollback = 5000;
 
 enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS, WM_APP_PROMPT, WM_APP_NETCHANGE, WM_APP_NOTE, WM_APP_OPEN };
 enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6, TIMER_PATHS = 7,
-       TIMER_REMOTE = 8, TIMER_PAIR = 9, TIMER_PULSE = 10, TIMER_PHONE = 11, TIMER_JOIN = 12 };
+       TIMER_REMOTE = 8, TIMER_PAIR = 9, TIMER_PULSE = 10, TIMER_PHONE = 11, TIMER_JOIN = 12, TIMER_SAVE = 13 };
 
 // ---------------------------------------------------------------------------
 // Modelo: pestañas -> árbol de paneles
@@ -231,6 +234,7 @@ struct Pane {
   unsigned id = 0;  // this process's serial number: a notification's click and a phone find the pane by it
   bool attention = false, toasted = false;
   Window* win = nullptr;  // the window it is in now (UI thread only: the reader thread posts to g_host)
+  std::wstring savedCwd;  // its folder when its window's session was last told (SessionChanged)
   // Reader thread → UI thread: rows to draw again, and its title changed (headers and tabs, at most 4 times a second).
   std::atomic<bool> repaint{false}, titleChanged{false};
 };
@@ -484,6 +488,7 @@ struct Window {
   DWORD lastFrame = 0, lastFull = 0;
   bool frameTimer = false, pulseTimer = false, pathTimer = false;
   bool titleDirty = false;  // a pane's title changed: its headers and tabs are drawn again (at most 4 times a second)
+  bool saveDue = false;     // its session changed: saved soon (SessionChanged)
   int unreadShown = -1;     // total on its taskbar button (-1: set it again)
   bool dead = false;        // destroyed: freed once the message that destroyed it is over (see FreeDeadWindows)
   // Tests: its name (label: step), its script (--script; childScript: the one for the windows it opens), the waits of
@@ -506,6 +511,7 @@ static std::vector<Window*> g_windows;  // every window of this process
 // It never goes away while they run.
 static HWND g_host;
 static std::vector<Window*> g_dead;  // destroyed windows, freed by the message loop (FreeDeadWindows)
+static volatile LONG g_crashArmed;   // windows are open: a crash relaunches Warp (not while it starts or ends; «Crashes»)
 
 // Handles window w until the end of the scope (WndProc, and whatever acts on another window).
 struct InWindow {
@@ -530,6 +536,17 @@ struct WindowInit {
   RECT place{};
 };
 static Window* OpenWindow(const WindowInit& in);
+// A window's session changed (a tab or pane opened, closed or moved, a folder, a name, what runs, its place): it is
+// saved a moment later, at most once a second for all of them, so a crash loses nothing that matters (see «Crashes»).
+// The file is replaced whole (a temporary file renamed over it).
+static bool g_saveTimer = false;
+static void SessionChanged(Window* w = nullptr) {
+  if (!w) w = g_win;
+  if (!w || w->dead) return;
+  w->saveDue = true;
+  if (!g_saveTimer && g_host) SetTimer(g_host, TIMER_SAVE, 1000, nullptr), g_saveTimer = true;
+}
+
 // The window with that handle, if it is one of this process's and still open.
 static Window* LiveWindow(HWND h) {
   for (Window* w : g_windows)
@@ -1190,6 +1207,7 @@ static Pane* SplitActive(bool vertical) {
   Equalize(t.root);
   Relayout();
   SpawnPane(np);
+  SessionChanged();
   return np;
 }
 
@@ -1205,6 +1223,7 @@ static Pane* NewTab(int at = -1, const std::wstring& dir = L"") {
   g_win->activeTab = at;
   Relayout();
   SpawnPane(p);
+  SessionChanged();
   return p;
 }
 
@@ -1265,6 +1284,7 @@ static void ClosePane(Pane* p) {
     DestroyPane(p);
   }
   Relayout();
+  SessionChanged();
 }
 
 static void EndRename(bool commit);
@@ -1329,6 +1349,7 @@ static void SwapPanes(Pane* x, Pane* y) {
   x->node = ny;
   y->node = nx;
   Relayout();
+  SessionChanged();
 }
 
 static void CyclePane(int dir) {
@@ -1731,6 +1752,7 @@ static bool WriteSessionFile(const std::wstring& path, const std::string& data) 
 }
 
 static void SaveSession() {
+  g_win->saveDue = false;
   if (g_win->tabs.empty() || g_win->sessionPath.empty()) return;
   std::ostringstream o;
   o << "BW1\nactive " << g_win->activeTab << "\nui " << g_win->zoom << " " << g_win->fontPx << "\nlang " << kLangCodes[g_lang]
@@ -1751,14 +1773,8 @@ static void SaveSession() {
     SaveNode(o, t.root);
   }
   o << SessionFlags(g_win->reopen, g_win->restartAll);
-  std::string data = o.str();
-  std::wstring tmp = g_win->sessionPath + L".tmp";
-  HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
-  if (f == INVALID_HANDLE_VALUE) return;
-  DWORD w;
-  WriteFile(f, data.data(), (DWORD)data.size(), &w, nullptr);
-  CloseHandle(f);
-  MoveFileExW(tmp.c_str(), g_win->sessionPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+  for (Pane* p : WindowPanes()) p->savedCwd = p->cwd;
+  WriteSessionFile(g_win->sessionPath, o.str());
 }
 
 // The main window with its last tab closed: only its place, size and settings are kept, and it
@@ -2528,6 +2544,7 @@ static bool HandleShortcut(WPARAM vk) {
         if (j < 0 || j >= (int)g_win->tabs.size()) return true;
         std::swap(g_win->tabs[g_win->activeTab], g_win->tabs[j]);
         g_win->activeTab = j;
+        SessionChanged();
         InvalidateRect(g_win->hwnd, nullptr, FALSE);
         return true;
       }
@@ -6125,7 +6142,7 @@ static void UpdateRunning() {
     if (name != p->agentName) p->agentName = name, changed.insert(p->win);
   }
   for (Window* w : changed)
-    if (w) InvalidateRect(w->hwnd, nullptr, FALSE);
+    if (w) InvalidateRect(w->hwnd, nullptr, FALSE), SessionChanged(w);  // what runs is in its session (relaunched, resumed)
 }
 
 static void Text(HDC dc, const std::wstring& s, RECT r, COLORREF c, UINT flags) {
@@ -7677,7 +7694,7 @@ static bool TestInstance() {
 //   write to <session>.bench)
 //   drag-start:tab:<i>|pane:<j> drag-to:<window>,<x>,<y> drag-drop drop-tab:<i>,<window>,<x>,<y> drop-pane:<j>,<window>,<x>,<y>
 //   (<window>: self, 0 for the screen, the label of a window of this Warp or the pid of another Warp) join-hint windows
-//   label:<name> window-count pids grep:<text> desk-shot:<x>,<y>,<w>,<h>,<file.bmp> (drag-to, drop-*, join-hint, windows,
+//   label:<name> raise crash window-count pids grep:<text> desk-shot:<x>,<y>,<w>,<h>,<file.bmp> (drag-to, drop-*, join-hint, windows,
 //   window-count, pids and grep write to <session>.bench)
 
 static void SetStartWithWindows(bool on);
@@ -8885,6 +8902,11 @@ static void RunScriptStep() {
     ScriptLog(L"windows: " + WindowsText());
   } else if (s.rfind(L"label:", 0) == 0) {  // this window's name in the steps and results of the tests
     g_win->label = s.substr(6);
+  } else if (s == L"crash") {  // an access violation, as a bug would cause (see «Crashes»; scripts run only in a test's Warp)
+    volatile int* nowhere = (volatile int*)(ULONG_PTR)(g_win->scriptPos >> 30);  // 0, but not known before it runs
+    *nowhere = 86;
+  } else if (s == L"raise") {  // this window over the others, without taking the focus
+    SetWindowPos(g_win->hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
   } else if (s == L"window-count") {  // windows of this Warp open
     ScriptLog(L"window-count: " + std::to_wstring(g_windows.size()));
   } else if (s == L"pids") {  // the shell of every pane of this Warp: <window>/<tab>/<pane>=<pid>
@@ -9601,7 +9623,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (!g_win->script.empty()) SetTimer(hwnd, TIMER_SCRIPT, 3000, nullptr);
       return 0;
     }
-    case WM_SIZE: Relayout(); return 0;
+    case WM_SIZE:
+      Relayout();
+      SessionChanged();  // its place and size are in its session
+      return 0;
+    case WM_EXITSIZEMOVE: SessionChanged(); return 0;
     case WM_DPICHANGED: {
       ApplyDpi(HIWORD(wp));
       g_win->unreadShown = -1;  // the taskbar badge at the new size
@@ -9919,6 +9945,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           if (j > g_win->tabDrag) std::rotate(g_win->tabs.begin() + g_win->tabDrag, g_win->tabs.begin() + g_win->tabDrag + 1, g_win->tabs.begin() + j + 1);
           else std::rotate(g_win->tabs.begin() + j, g_win->tabs.begin() + g_win->tabDrag, g_win->tabs.begin() + g_win->tabDrag + 1);
           g_win->activeTab = g_win->tabDrag = j;
+          SessionChanged();
           InvalidateRect(hwnd, nullptr, FALSE);
         }
         SetCursor(LoadCursor(nullptr, over || OutsideWindow(sp) ? IDC_SIZEALL : IDC_ARROW));
@@ -10018,6 +10045,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
       }
       if (g_win->dragNode || g_win->selecting) {
+        if (g_win->dragNode) SessionChanged();  // a divider moved
         g_win->dragNode = nullptr;
         g_win->selecting = false;
         ReleaseCapture();
@@ -10156,40 +10184,37 @@ static bool ReopensFile(const std::wstring& file) {
 // (WARPLITE_SESSION in the tests, or no %APPDATA%).
 static void FindWindowDir() {
   wchar_t buf[MAX_PATH];
-  if (GetEnvironmentVariableW(L"WARPLITE_SESSION", buf, MAX_PATH)) {
-    g_sessionFile = buf;
-    return;
-  }
-  if (GetEnvironmentVariableW(L"WARPLITE_DIR", buf, MAX_PATH)) {
-    g_windowDir = buf;
-  } else {
-    if (!GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) {
-      g_sessionFile = L"warp-lite-session.txt";
-      return;
-    }
-    g_windowDir = std::wstring(buf) + L"\\warp-lite";
-    // Se llamaba better-warp, y antes había una sola sesión: se convierten en la primera ventana
-    // (only into a folder without windows: copied on every start, it came back whenever window-1.txt was gone).
-    CreateDirectoryW(g_windowDir.c_str(), nullptr);
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW((g_windowDir + L"\\window-*.txt").c_str(), &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-      FindClose(h);
-    } else {
-      std::wstring single = g_windowDir + L"\\session.txt";
-      CopyFileW((std::wstring(buf) + L"\\BetterWarp\\session.txt").c_str(), single.c_str(), TRUE);
-      if (GetFileAttributesW(single.c_str()) != INVALID_FILE_ATTRIBUTES)
-        MoveFileExW(single.c_str(), (g_windowDir + L"\\window-1.txt").c_str(), 0);
-    }
-  }
+  if (GetEnvironmentVariableW(L"WARPLITE_SESSION", buf, MAX_PATH)) g_sessionFile = buf;
+  else if (GetEnvironmentVariableW(L"WARPLITE_DIR", buf, MAX_PATH)) g_windowDir = buf;
+  else if (GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) g_windowDir = std::wstring(buf) + L"\\warp-lite";
+  else g_sessionFile = L"warp-lite-session.txt";
+}
+
+// The folder, made by the Warp that runs (not by a start that hands off).
+static void PrepareWindowDir() {
+  if (g_windowDir.empty()) return;
   CreateDirectoryW(g_windowDir.c_str(), nullptr);
+  wchar_t buf[MAX_PATH];
+  if (GetEnvironmentVariableW(L"WARPLITE_DIR", buf, MAX_PATH) || !GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) return;
+  // Se llamaba better-warp, y antes había una sola sesión: se convierten en la primera ventana
+  // (only into a folder without windows: copied on every start, it came back whenever window-1.txt was gone).
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((g_windowDir + L"\\window-*.txt").c_str(), &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    FindClose(h);
+  } else {
+    std::wstring single = g_windowDir + L"\\session.txt";
+    CopyFileW((std::wstring(buf) + L"\\BetterWarp\\session.txt").c_str(), single.c_str(), TRUE);
+    if (GetFileAttributesW(single.c_str()) != INVALID_FILE_ATTRIBUTES)
+      MoveFileExW(single.c_str(), (g_windowDir + L"\\window-1.txt").c_str(), 0);
+  }
 }
 
 // The saved windows a start opens, the first one being the one the start itself asked for: the main window
 // (window-main.txt) and the others that come back («Reopen on restart», or all of them after an update restart); the
 // rest are discarded. None: a new window (""). relaunch: after an update, the windows of a Warp before this one may
-// still be exiting.
-static std::vector<std::wstring> StartFiles(bool relaunch) {
+// still be exiting. recover: after a crash, all of them come back (see «Crashes»).
+static std::vector<std::wstring> StartFiles(bool relaunch, bool recover) {
   if (g_windowDir.empty()) return {g_sessionFile};
   // One start at a time (an older Warp may be starting too): only one of them takes the main window.
   HANDLE lock = CreateMutexW(nullptr, FALSE, InstanceMutex(L"start").c_str());
@@ -10221,7 +10246,7 @@ static std::vector<std::wstring> StartFiles(bool relaunch) {
   if (!isOpen(mainFile)) out.push_back(mainFile);
   for (auto& file : files) {
     if (isOpen(file)) continue;  // open in an older Warp
-    if (!ReopensFile(file)) {
+    if (!recover && !ReopensFile(file)) {
       DeleteFileW(file.c_str());  // still open when Warp quit (or Windows shut down): discarded
       continue;
     }
@@ -10310,7 +10335,7 @@ static void CloseWindowState() {
   g_win->dead = true;
   g_windows.erase(std::remove(g_windows.begin(), g_windows.end(), g_win), g_windows.end());
   g_dead.push_back(g_win);
-  if (g_windows.empty()) PostQuitMessage(0);
+  if (g_windows.empty()) g_crashArmed = 0, PostQuitMessage(0);
 }
 
 static void FreeDeadWindows() {
@@ -10326,6 +10351,148 @@ static void FreeDeadWindows() {
     delete w;
   }
   g_dead.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Crashes: one process holds every window of a Warp, so a crash would close them all at once. Their sessions are on
+// disk (SessionChanged), and an unhandled exception (an access violation, an uncaught C++ exception, abort) relaunches
+// Warp at once with --relaunch --crashed: every window comes back, as after an update restart, with ssh + tmux
+// launched again and Claude Code and Codex resumed. The new process first writes a minidump of the one that crashed
+// (crash-<time>.dmp in this Warp's folder, the last 3 kept), and both leave a line in crash.log there. At most once a
+// minute: a crash less than 60 s after the last relaunch only leaves its line. Nothing of this runs until a crash.
+
+static wchar_t g_crashExe[MAX_PATH], g_crashLog[MAX_PATH + 40], g_crashStamp[MAX_PATH + 40], g_crashVersion[32];
+
+// A line in crash.log, without the heap (it may be what broke).
+static void CrashLog(const char* text) {
+  HANDLE f = CreateFileW(g_crashLog, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return;
+  SYSTEMTIME t;
+  GetLocalTime(&t);
+  char b[640];
+  int n = snprintf(b, sizeof b, "%04d-%02d-%02d %02d:%02d:%02d %s\r\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, text);
+  DWORD w;
+  if (n > 0) WriteFile(f, b, (DWORD)std::min(n, (int)sizeof b - 1), &w, nullptr);
+  CloseHandle(f);
+}
+
+static LONG WINAPI OnCrash(EXCEPTION_POINTERS* ep) {
+  static volatile LONG once = 0;
+  if (InterlockedExchange(&once, 1)) Sleep(INFINITE);  // another thread is dealing with it already
+  DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0xE0000086;
+  void* at = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+  HMODULE mod = nullptr;
+  wchar_t path[MAX_PATH] = L"?";
+  if (at && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)at, &mod))
+    GetModuleFileNameW(mod, path, MAX_PATH);
+  const wchar_t* name = wcsrchr(path, L'\\') ? wcsrchr(path, L'\\') + 1 : path;
+  char line[400];
+  snprintf(line, sizeof line, "crash %08lx at %ls+%llx (Warp %ls, process %lu, thread %lu)", (unsigned long)code, name,
+           (unsigned long long)((char*)at - (char*)mod), g_crashVersion, GetCurrentProcessId(), GetCurrentThreadId());
+  CrashLog(line);
+  if (!g_crashArmed) {
+    CrashLog("  not relaunched: no window was open");
+    TerminateProcess(GetCurrentProcess(), code);
+  }
+  // At most once a minute (crash.stamp: when the last relaunch was).
+  FILETIME ft;
+  GetSystemTimeAsFileTime(&ft);
+  ULONGLONG now = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime, last = 0;
+  HANDLE f = CreateFileW(g_crashStamp, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, 0, nullptr);
+  if (f != INVALID_HANDLE_VALUE) {
+    DWORD r = 0;
+    if (!ReadFile(f, &last, sizeof last, &r, nullptr) || r != sizeof last) last = 0;
+    SetFilePointer(f, 0, nullptr, FILE_BEGIN);
+    WriteFile(f, &now, sizeof now, &r, nullptr);
+    CloseHandle(f);
+  }
+  if (last && now > last && now - last < 60ull * 10000000) {
+    snprintf(line, sizeof line, "  not relaunched: %llu s after the last relaunch", (now - last) / 10000000);
+    CrashLog(line);
+    TerminateProcess(GetCurrentProcess(), code);
+  }
+  // The new Warp takes a minidump of this one (DumpCrashed), which waits for it, then ends.
+  wchar_t name2[64], cmd[MAX_PATH + 160];
+  swprintf(name2, 64, L"Local\\warp-lite-dumped-%lu", GetCurrentProcessId());
+  HANDLE dumped = CreateEventW(nullptr, TRUE, FALSE, name2);
+  swprintf(cmd, MAX_PATH + 160, L"\"%ls\" --relaunch --crashed %lu %lu %llx", g_crashExe, GetCurrentProcessId(), GetCurrentThreadId(),
+           (unsigned long long)(ULONG_PTR)ep);
+  STARTUPINFOW si{sizeof si};
+  PROCESS_INFORMATION pi{};
+  if (CreateProcessW(g_crashExe, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CrashLog("  relaunched");
+    if (dumped) WaitForSingleObject(dumped, 15000);
+  } else {
+    CrashLog("  couldn't relaunch");
+  }
+  TerminateProcess(GetCurrentProcess(), code);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// What the C++ runtime ends the process with (an exception nobody caught, abort) is a crash too.
+static void OnTerminate() { OnCrash(nullptr); }
+static void OnAbort(int) { OnCrash(nullptr); }
+
+static void CrashPaths() {
+  GetModuleFileNameW(nullptr, g_crashExe, MAX_PATH);
+  std::wstring base = g_windowDir.empty() ? g_sessionFile + L"." : g_windowDir + L"\\";
+  wcsncpy(g_crashLog, (base + L"crash.log").c_str(), MAX_PATH + 39);
+  wcsncpy(g_crashStamp, (base + L"crash.stamp").c_str(), MAX_PATH + 39);
+}
+
+static void ArmCrashes() {
+  CrashPaths();
+  wcsncpy(g_crashVersion, g_upd.running.c_str(), 31);
+  ULONG stack = 64 * 1024;  // room for OnCrash after a stack overflow of this thread
+  SetThreadStackGuarantee(&stack);
+  SetUnhandledExceptionFilter(OnCrash);
+  std::set_terminate(OnTerminate);
+  signal(SIGABRT, OnAbort);
+}
+
+// --crashed <pid> <thread> <exception pointers>: the Warp that crashed waits while this one writes its minidump.
+static void DumpCrashed(DWORD pid, DWORD tid, ULONG_PTR ep) {
+  wchar_t name[64];
+  swprintf(name, 64, L"Local\\warp-lite-dumped-%lu", pid);
+  HANDLE dumped = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+  HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+  wchar_t img[MAX_PATH] = L"";
+  DWORD n = MAX_PATH;
+  bool ours = proc && QueryFullProcessImageNameW(proc, 0, img, &n) && !_wcsicmp(img, g_crashExe);  // only a Warp like this one
+  typedef BOOL(WINAPI * PFN_Dump)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
+                                   PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
+  HMODULE dbg = ours && dumped ? LoadLibraryExW(L"dbghelp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32) : nullptr;
+  auto dump = dbg ? (PFN_Dump)(void*)GetProcAddress(dbg, "MiniDumpWriteDump") : nullptr;
+  SYSTEMTIME t;
+  GetLocalTime(&t);
+  wchar_t file[64];
+  swprintf(file, 64, L"crash-%04d%02d%02d-%02d%02d%02d.dmp", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+  std::wstring base = g_windowDir.empty() ? g_sessionFile + L"." : g_windowDir + L"\\", path = base + file;
+  bool ok = false;
+  if (dump) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    MINIDUMP_EXCEPTION_INFORMATION mei{tid, (PEXCEPTION_POINTERS)ep, TRUE};
+    ok = f != INVALID_HANDLE_VALUE && dump(proc, pid, f, (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules),
+                                           ep ? &mei : nullptr, nullptr, nullptr);
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    if (!ok) DeleteFileW(path.c_str());
+  }
+  if (dumped) SetEvent(dumped), CloseHandle(dumped);
+  if (proc) CloseHandle(proc);
+  CrashLog(ok ? ("  minidump " + ToUtf8(file)).c_str() : "  no minidump");
+  // The last 3 are kept.
+  std::vector<std::wstring> dumps;
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((base + L"crash-*.dmp").c_str(), &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do dumps.push_back(fd.cFileName);
+    while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  std::sort(dumps.begin(), dumps.end());
+  for (size_t i = 0; i + 3 < dumps.size(); i++) DeleteFileW((base + dumps[i]).c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -10486,6 +10653,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             p->history.push_back(p->edit);
           }
         }
+        if (p->cwd != p->savedCwd) SessionChanged();  // a new folder
         Relayout();
       }
       return 0;
@@ -10525,6 +10693,14 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       } else if (wp == TIMER_REMOTE) {
         KillTimer(hwnd, TIMER_REMOTE);
         RemoteAtStart();
+      } else if (wp == TIMER_SAVE) {  // the sessions that changed (SessionChanged)
+        KillTimer(hwnd, TIMER_SAVE);
+        g_saveTimer = false;
+        for (Window* w : g_windows)
+          if (w->saveDue) {
+            InWindow in(w);
+            SaveSession();
+          }
       }
       return 0;
     case WM_COPYDATA: {
@@ -10629,15 +10805,25 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     }
     return 0;
   }
-  bool relaunch = false;
+  bool relaunch = false, crashed = false;
+  DWORD crashPid = 0, crashTid = 0;
+  ULONG_PTR crashEp = 0;
   for (int i = 1; i < argc; i++)
-    if (!wcscmp(argv[i], L"--relaunch")) relaunch = true;  // after an update: the Warp before this one is closing
+    if (!wcscmp(argv[i], L"--relaunch")) relaunch = true;  // after an update or a crash: the Warp before this one is closing
   for (int i = 1; i + 1 < argc; i++) {
     if (!wcscmp(argv[i], L"--window")) windowArg = argv[++i];
     else if (!wcscmp(argv[i], L"--cd")) openDir = argv[++i];
     else if (!wcscmp(argv[i], L"--script")) script = argv[++i];
+    else if (!wcscmp(argv[i], L"--crashed") && i + 3 < argc) {  // see «Crashes»
+      crashed = true;
+      crashPid = wcstoul(argv[i + 1], nullptr, 10), crashTid = wcstoul(argv[i + 2], nullptr, 10);
+      crashEp = (ULONG_PTR)wcstoull(argv[i + 3], nullptr, 16);
+      i += 3;
+    }
   }
   LocalFree(argv);
+  FindWindowDir();
+  if (crashed && relaunch) CrashPaths(), DumpCrashed(crashPid, crashTid, crashEp);
   if (!TestInstance()) script.clear();  // --script runs only in a test's Warp
   if (!openDir.empty()) {
     // El Explorador pasa "C:\" y Windows lo lee como «C:"»: se arregla la barra del final.
@@ -10701,7 +10887,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   // After an update from a Warp of one process per window: its windows may still be closing.
   if (relaunch)
     for (int t = 0; t < 200 && !SiblingWindows().empty(); t++) Sleep(100);
-  FindWindowDir();
+  PrepareWindowDir();
+  ArmCrashes();
   LoadUpdateSettings();
   struct { const unsigned char *a, *b; } fonts[] = {{hack_regular, hack_regular_end},
                                                      {hack_bold, hack_bold_end},
@@ -10729,10 +10916,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   // notifications»).
   SetCurrentProcessExplicitAppUserModelID(kAppId);
   // This start's own window first (the script and --cd are its), on screen before the others open.
-  std::vector<std::wstring> files = windowArg.empty() ? StartFiles(relaunch) : std::vector<std::wstring>{windowArg};
+  std::vector<std::wstring> files = windowArg.empty() ? StartFiles(relaunch, crashed && relaunch) : std::vector<std::wstring>{windowArg};
   WindowInit first;
   first.file = files[0], first.openDir = openDir, first.script = script, first.childScript = g_childEnv, first.show = show;
   if (!OpenWindow(first)) return 1;
+  g_crashArmed = 1;
   if (files.size() > 1) {
     auto* rest = new std::vector<WindowInit>;
     for (size_t i = 1; i < files.size(); i++) {
@@ -10763,5 +10951,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     TranslateMessage(&m);
     DispatchMessageW(&m);
   }
+  g_crashArmed = 0;  // ending: a crash from here on doesn't bring the windows back
   return 0;
 }
