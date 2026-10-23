@@ -13,6 +13,11 @@
 //! - sidecar → Warp: `warp-lite-remote` posted to every window of that Warp (wParam: phones
 //!   connected; lParam: 0 state, 1 a phone was paired, 2 the pairing code ended), and the ticket as
 //!   `WM_COPYDATA` `kCopyRemoteTicket` (`ticket\t<text>\t<seconds>` or `error\t<message>`).
+//! - sidecar → a window, about one of its panes (by its id), `WM_COPYDATA` `kCopyRemotePane`, which a window only
+//!   takes from this sidecar's window: `screen <id> <scrollback rows>` and `info <id>` (answered with `WM_COPYDATA`
+//!   `kCopyRemoteAnswer` before it returns: `screen\t<rows>\t<cols>\n<line>\n…`, `info\t<agent>\t<running>\t<cwd>\t
+//!   <transcript>`), and `input <id> <device id> text\t<text>` / `key\t<name>` (TRUE if typed; the window checks the
+//!   device may type too).
 
 use std::{
     ptr::null,
@@ -28,8 +33,12 @@ use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WAIT_ABANDONED, WAIT_OBJECT_0, WPARAM},
     System::{
         DataExchange::COPYDATASTRUCT,
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+        },
         LibraryLoader::GetModuleHandleW,
-        Threading::{CreateMutexW, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+        Threading::{CreateMutexW, GetCurrentProcess, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
     },
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW, GetMessageW,
@@ -39,14 +48,27 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{Result, err, proto::Session};
+use crate::{
+    Result, err,
+    proto::Session,
+    watch::{PaneInfo, PaneInput, PaneScreen},
+};
 
 /// Same values as in Warp's main.cpp.
 const COPY_PANE_LIST: usize = 0x574c5300;
 const COPY_REMOTE: usize = 0x57524d00;
 const COPY_REMOTE_TICKET: usize = 0x57525400;
+const COPY_REMOTE_PANE: usize = 0x57525000;
+const COPY_REMOTE_ANSWER: usize = 0x57524100;
 const WM_APP_LIST: u32 = WM_APP + 1;
 const WM_APP_STOP: u32 = WM_APP + 2;
+const WM_APP_PANE: u32 = WM_APP + 3;
+/// Scrollback rows sent with a pane's screen.
+const SCROLLBACK_ROWS: usize = 200;
+
+/// A request about a pane, waiting for the window thread: the window, the text, and where its answer goes
+/// (Ok(Some(answer)), Ok(None) when the window just said yes).
+type PaneRequest = (isize, String, oneshot::Sender<Result<Option<String>>>);
 pub const EVENT_STATE: isize = 0;
 pub const EVENT_PAIRED: isize = 1;
 pub const EVENT_PAIRING_ENDED: isize = 2;
@@ -78,6 +100,9 @@ struct Shared {
     /// (window, its pane lines) while a list is being collected.
     collected: Mutex<Vec<(isize, String)>>,
     waiting: Mutex<Vec<oneshot::Sender<Vec<Session>>>>,
+    pane_requests: Mutex<Vec<PaneRequest>>,
+    /// The answer of the window asked now (kCopyRemoteAnswer, sent while SendMessageTimeout waits).
+    answer: Mutex<Option<String>>,
 }
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
@@ -99,6 +124,8 @@ impl WarpLink {
             phones: AtomicUsize::new(0),
             collected: Mutex::new(Vec::new()),
             waiting: Mutex::new(Vec::new()),
+            pane_requests: Mutex::new(Vec::new()),
+            answer: Mutex::new(None),
         };
         SHARED.set(shared).map_err(|_| err("started twice"))?;
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -117,6 +144,38 @@ impl WarpLink {
         s.waiting.lock().unwrap().push(tx);
         unsafe { PostMessageW(s.hwnd.load(Ordering::Relaxed) as HWND, WM_APP_LIST, 0, 0) };
         tokio::time::timeout(Duration::from_secs(10), rx).await.map_err(|_| err("Warp didn't answer"))?.map_err(|_| err("Warp didn't answer"))
+    }
+
+    /// Asks a window of this Warp about one of its panes (see the module's doc).
+    async fn pane(&self, window: u64, text: String) -> Result<Option<String>> {
+        let s = SHARED.get().unwrap();
+        let (tx, rx) = oneshot::channel();
+        s.pane_requests.lock().unwrap().push((window as isize, text, tx));
+        unsafe { PostMessageW(s.hwnd.load(Ordering::Relaxed) as HWND, WM_APP_PANE, 0, 0) };
+        tokio::time::timeout(Duration::from_secs(10), rx).await.map_err(|_| err("Warp didn't answer"))?.map_err(|_| err("Warp didn't answer"))?
+    }
+
+    /// The text of a pane: its last scrollback rows, then its screen.
+    pub async fn screen(&self, window: u64, pane_id: u32) -> Result<PaneScreen> {
+        let a = self.pane(window, format!("screen {pane_id} {SCROLLBACK_ROWS}")).await?.ok_or_else(|| err("no answer"))?;
+        parse_screen(&a).ok_or_else(|| err("bad answer"))
+    }
+
+    pub async fn info(&self, window: u64, pane_id: u32) -> Result<PaneInfo> {
+        let a = self.pane(window, format!("info {pane_id}")).await?.ok_or_else(|| err("no answer"))?;
+        let f: Vec<&str> = a.split('\t').collect();
+        if f.len() < 5 || f[0] != "info" {
+            return Err(err("bad answer"));
+        }
+        Ok(PaneInfo { agent: f[1].into(), running: f[2].into(), cwd: f[3].into(), transcript: f[4].into() })
+    }
+
+    pub async fn input(&self, window: u64, pane_id: u32, device: &str, what: &PaneInput) -> Result<()> {
+        let body = match what {
+            PaneInput::Text(t) => format!("text\t{t}"),
+            PaneInput::Key(k) => format!("key\t{k}"),
+        };
+        self.pane(window, format!("input {pane_id} {device} {body}")).await.map(|_| ())
     }
 
     /// Withdraws the message window, first thing when quitting: Warp stops seeing this sidecar at once,
@@ -235,6 +294,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         return 0;
     }
+    if msg == WM_APP_PANE {
+        // Only to a window of this Warp (the phone names it), one at a time; its answer arrives re-entrantly.
+        let todo = std::mem::take(&mut *s.pane_requests.lock().unwrap());
+        let ours = warp_windows(s.key);
+        for (window, text, tx) in todo {
+            if !ours.contains(&window) {
+                let _ = tx.send(Err(err("no such window")));
+                continue;
+            }
+            *s.answer.lock().unwrap() = None;
+            let data: Vec<u16> = text.encode_utf16().collect();
+            let cd = COPYDATASTRUCT { dwData: COPY_REMOTE_PANE, cbData: (data.len() * 2) as u32, lpData: data.as_ptr() as *mut _ };
+            let mut r = 0usize;
+            let sent = unsafe {
+                SendMessageTimeoutW(window as HWND, WM_COPYDATA, hwnd as WPARAM, &cd as *const _ as LPARAM, SMTO_ABORTIFHUNG | SMTO_NORMAL, 2000, &mut r)
+            };
+            let answer = s.answer.lock().unwrap().take();
+            let _ = tx.send(if sent == 0 || r == 0 { Err(err("no such pane")) } else { Ok(answer) });
+        }
+        return 0;
+    }
     if msg == WM_COPYDATA {
         let cd = unsafe { &*(lp as *const COPYDATASTRUCT) };
         let text = if cd.lpData.is_null() {
@@ -245,6 +325,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         };
         if cd.dwData == COPY_PANE_LIST {
             s.collected.lock().unwrap().push((wp as isize, text));
+            return 1;
+        }
+        if cd.dwData == COPY_REMOTE_ANSWER {
+            *s.answer.lock().unwrap() = Some(text);
             return 1;
         }
         if cd.dwData == COPY_REMOTE {
@@ -275,8 +359,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
+/// A pane's text: `screen\t<rows>\t<cols>` then one line per row.
+fn parse_screen(a: &str) -> Option<PaneScreen> {
+    let (head, body) = a.split_once('\n').unwrap_or((a, ""));
+    let f: Vec<&str> = head.split('\t').collect();
+    if f.first() != Some(&"screen") {
+        return None;
+    }
+    let rows = f.get(1)?.parse().ok()?;
+    Some(PaneScreen { rows, lines: body.split('\n').map(String::from).collect() })
+}
+
+/// Everything this process starts (the ssh that follows a transcript on another host) ends with it, even if it is
+/// killed: it puts itself in a job object that kills what is left in it when its last handle closes.
+pub fn end_children_with_me() {
+    unsafe {
+        let job = CreateJobObjectW(null(), null());
+        if job.is_null() {
+            return;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+        if SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _, size) == 0
+            || AssignProcessToJobObject(job, GetCurrentProcess()) == 0
+        {
+            CloseHandle(job);
+        }
+        // The handle stays open (this process's) until it ends.
+    }
+}
+
 /// Warp's pane list: one line per pane, fields separated by tabs: tab, pane, title, folder, what is
-/// running, and (newer Warps) the tab's name and the agent (claude / codex).
+/// running, and (newer Warps) the tab's name, the agent (claude / codex) and the pane's id.
 pub fn parse_pane_list(window: u64, text: &str) -> Vec<Session> {
     text.lines()
         .filter_map(|l| {
@@ -294,6 +409,7 @@ pub fn parse_pane_list(window: u64, text: &str) -> Vec<Session> {
                 running: f[4].to_string(),
                 tab_name: f.get(5).map(|s| s.to_string()).unwrap_or_else(|| f[2].to_string()),
                 agent: f.get(6).map(|s| s.to_string()).unwrap_or_default(),
+                pane_id: f.get(7).and_then(|s| s.parse().ok()).unwrap_or(0),
             })
         })
         .collect()
@@ -348,9 +464,12 @@ mod tests {
 
     #[test]
     fn pane_list() {
-        let s = parse_pane_list(7, "0\t0\tclaude chat\tC:\\src\tclaude\twork\tclaude\n0\t1\tpwsh\tC:\\\t\n");
+        let s = parse_pane_list(7, "0\t0\tclaude chat\tC:\\src\tclaude\twork\tclaude\t12\n0\t1\tpwsh\tC:\\\t\n");
         assert_eq!(s.len(), 2);
-        assert_eq!((s[0].tab_name.as_str(), s[0].busy, s[0].agent.as_str()), ("work", true, "claude"));
-        assert_eq!((s[1].pane, s[1].busy, s[1].tab_name.as_str()), (1, false, "pwsh"));
+        assert_eq!((s[0].tab_name.as_str(), s[0].busy, s[0].agent.as_str(), s[0].pane_id), ("work", true, "claude", 12));
+        assert_eq!((s[1].pane, s[1].busy, s[1].tab_name.as_str(), s[1].pane_id), (1, false, "pwsh", 0));
+        let sc = parse_screen("screen\t2\t80\nold\nPS C:\\> dir\nPS C:\\> ").unwrap();
+        assert_eq!((sc.rows, sc.lines.len(), sc.visible()[0].as_str()), (2, 3, "PS C:\\> dir"));
+        assert!(parse_screen("info\tx").is_none());
     }
 }

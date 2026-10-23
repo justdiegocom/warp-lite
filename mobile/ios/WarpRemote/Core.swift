@@ -44,6 +44,7 @@ struct Answer: Decodable {
     var path: NetPath? = nil
     var sessions: [Session]? = nil
     var rtt_ms: Double? = nil
+    var pane: PaneState? = nil
 }
 
 struct NetPath: Decodable, Equatable {
@@ -53,7 +54,7 @@ struct NetPath: Decodable, Equatable {
 }
 
 /// One terminal pane of a Warp window on the computer.
-struct Session: Decodable, Identifiable, Equatable {
+struct Session: Decodable, Identifiable, Hashable {
     var window: UInt64
     var tab: Int
     var pane: Int
@@ -63,5 +64,47 @@ struct Session: Decodable, Identifiable, Equatable {
     var busy: Bool
     var running: String? = nil
     var agent: String? = nil
+    /// The pane's id in its window (nil from an older Warp, which can't show a pane's content).
+    var pane_id: UInt32? = nil
     var id: String { "\(window)-\(tab)-\(pane)" }
+}
+
+/// What a pane shows (warp-remote's PaneView): a chat from Claude Code's or Codex's transcript, or the screen as text.
+struct PaneState: Decodable {
+    var rev: UInt64
+    var kind: String
+    var agent: String? = nil
+    var status: String? = nil
+    var title: String? = nil
+    var items: [ChatItem]? = nil
+    var reset: Bool? = nil
+    var more: Bool? = nil
+    var screen: [String]? = nil
+    var prompt: Prompt? = nil
+    var typing: Bool? = nil
+    var note: String? = nil
+}
+
+struct ChatItem: Decodable, Identifiable, Equatable {
+    var id: UInt64
+    /// "user", "assistant" (markdown), "tool" (one line, details on tap) or "note".
+    var role: String
+    var text: String
+    var detail: String? = nil
+    var failed: Bool? = nil
+    var pending: Bool? = nil
+}
+
+/// A question on the pane's screen with its options (Claude Code's permission prompts and menus, Codex's approvals).
+struct Prompt: Decodable, Equatable {
+    var id: String
+    var question: String
+    var context: [String]? = nil
+    var options: [PromptOption]
+    var selected: Int? = nil
+}
+
+struct PromptOption: Decodable, Equatable {
+    var label: String
+    var hint: String? = nil
 }

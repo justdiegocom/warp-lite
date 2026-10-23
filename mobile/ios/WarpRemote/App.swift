@@ -28,7 +28,7 @@ final class Model: ObservableObject {
     @Published var sessions: [Session] = []
     @Published var error: String?
     @Published var busy = false
-    private let core = Core()
+    let core = Core()
     private var pinger: Task<Void, Never>?
 
     func start() async {

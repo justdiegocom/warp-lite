@@ -47,6 +47,7 @@ fn panes() -> Vec<Session> {
             busy: true,
             running: "claude".into(),
             agent: "claude".into(),
+            pane_id: 1,
         },
         Session { window: 2, tab: 1, pane: 1, tab_name: "logs".into(), title: "pwsh".into(), cwd: "C:\\".into(), ..Default::default() },
     ]

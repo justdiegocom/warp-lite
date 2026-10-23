@@ -21,7 +21,7 @@ use tokio::time::timeout;
 use crate::{
     ALPN, Result,
     host::{Net, endpoint_builder},
-    proto::{self, Request, Response, Session, code},
+    proto::{self, PaneView, Request, Response, Session, code},
     store::{self, HostRecord},
     ticket::Ticket,
 };
@@ -60,6 +60,8 @@ struct Live {
     recv: RecvStream,
     host: String,
     next_id: u64,
+    /// The protocol version both sides speak (the lower of the two).
+    version: u32,
 }
 
 pub struct Client {
@@ -97,7 +99,7 @@ impl Client {
     pub async fn pair(&mut self, ticket: &str) -> Result<HostRecord> {
         let t = Ticket::decode(ticket)?;
         self.disconnect();
-        let (conn, mut send, mut recv, host, paired) = self.dial(t.addr.clone()).await?;
+        let (conn, mut send, mut recv, host, paired, version) = self.dial(t.addr.clone()).await?;
         if !paired {
             proto::write_frame(&mut send, &Request::Pair { secret: HEXLOWER.encode(&t.secret) }).await?;
             match read(&conn, &mut recv).await? {
@@ -108,7 +110,7 @@ impl Client {
         }
         let record = HostRecord { addr: t.addr, name: host.clone() };
         store::save_host(&self.dir, &record)?;
-        self.live = Some(Live { conn, send, recv, host, next_id: 1 });
+        self.live = Some(Live { conn, send, recv, host, next_id: 1, version });
         Ok(record)
     }
 
@@ -129,7 +131,7 @@ impl Client {
             }
         }
         let host = self.host().ok_or_else(|| remote(code::NOT_PAIRED, "no paired computer"))?;
-        let (conn, send, recv, name, paired) = self.dial(host.addr.clone()).await?;
+        let (conn, send, recv, name, paired, version) = self.dial(host.addr.clone()).await?;
         if !paired {
             conn.close(proto::CLOSE_BYE.into(), b"");
             return Err(remote(code::NOT_PAIRED, "this computer doesn't know this device any more: pair again"));
@@ -137,11 +139,18 @@ impl Client {
         if name != host.name {
             let _ = store::save_host(&self.dir, &HostRecord { addr: host.addr, name: name.clone() });
         }
-        self.live = Some(Live { conn, send, recv, host: name, next_id: 1 });
+        self.live = Some(Live { conn, send, recv, host: name, next_id: 1, version });
         Ok(())
     }
 
-    async fn dial(&self, addr: EndpointAddr) -> Result<(Connection, SendStream, RecvStream, String, bool)> {
+    /// The protocol version of the connection (connecting first): 2 or more lets the phone watch panes and type.
+    pub async fn version(&mut self) -> Result<u32> {
+        self.connect().await?;
+        Ok(self.live.as_ref().map(|l| l.version).unwrap_or(1))
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn dial(&self, addr: EndpointAddr) -> Result<(Connection, SendStream, RecvStream, String, bool, u32)> {
         let conn = timeout(CONNECT_TIMEOUT, self.ep.connect(addr, ALPN))
             .await
             .map_err(|_| remote(code::UNAVAILABLE, "the computer didn't answer (is Warp open?)"))??;
@@ -149,7 +158,7 @@ impl Client {
         let hello = Request::Hello { version: proto::VERSION, name: self.name.clone() };
         proto::write_frame(&mut send, &hello).await.map_err(|e| explain(&conn, e))?;
         match read(&conn, &mut recv).await? {
-            Response::Hello { host, paired, .. } => Ok((conn, send, recv, host, paired)),
+            Response::Hello { host, paired, version } => Ok((conn, send, recv, host, paired, version)),
             Response::Error { code, message } => Err(remote(&code, message)),
             other => Err(remote(code::BAD_REQUEST, format!("unexpected answer {other:?}"))),
         }
@@ -192,6 +201,50 @@ impl Client {
         let t0 = Instant::now();
         match self.request(&Request::Ping { id }).await? {
             Response::Pong { id: got } if got == id => Ok(t0.elapsed()),
+            other => Err(remote(code::BAD_REQUEST, format!("unexpected answer {other:?}"))),
+        }
+    }
+
+    /// v2: what that pane shows; subscribes to it (see [`Request::Watch`]).
+    pub async fn watch(&mut self, window: u64, pane_id: u32, since: u64, before: Option<u64>) -> Result<PaneView> {
+        self.need_v2().await?;
+        match self.request(&Request::Watch { window, pane_id, since, before }).await? {
+            Response::Pane(v) => Ok(*v),
+            Response::Error { code, message } => Err(remote(&code, message)),
+            other => Err(remote(code::BAD_REQUEST, format!("unexpected answer {other:?}"))),
+        }
+    }
+
+    pub async fn unwatch(&mut self, window: u64, pane_id: u32) -> Result<()> {
+        self.need_v2().await?;
+        self.expect_ok(&Request::Unwatch { window, pane_id }).await
+    }
+
+    /// v2: types into that pane: `text` (one line), then `keys`; or `option` of the question with id `prompt`.
+    pub async fn input(&mut self, window: u64, pane_id: u32, text: &str, keys: &[&str], option: Option<u32>, prompt: &str) -> Result<()> {
+        self.need_v2().await?;
+        let req = Request::Input {
+            window,
+            pane_id,
+            text: text.into(),
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            option,
+            prompt: prompt.into(),
+        };
+        self.expect_ok(&req).await
+    }
+
+    async fn need_v2(&mut self) -> Result<()> {
+        if self.version().await? < 2 {
+            return Err(remote(code::UNSUPPORTED_VERSION, "update Warp on the computer to see and type into terminals"));
+        }
+        Ok(())
+    }
+
+    async fn expect_ok(&mut self, req: &Request) -> Result<()> {
+        match self.request(req).await? {
+            Response::Ok => Ok(()),
+            Response::Error { code, message } => Err(remote(&code, message)),
             other => Err(remote(code::BAD_REQUEST, format!("unexpected answer {other:?}"))),
         }
     }

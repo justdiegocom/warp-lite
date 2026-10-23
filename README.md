@@ -50,8 +50,11 @@ A pane counts one when its program sends a desktop notification (OSC 9, OSC 777 
 See your terminals from your phone, at home or away, with nothing to set up and no account. Warp is always the host; the phone app (`mobile/ios`, SwiftUI) connects to it.
 
 - **Pair phone…** in the title-bar menu shows a QR code (and the same code as text) that the app scans or pastes. The code works once and expires after 2 minutes; devices that weren't paired are turned away.
-- **Paired devices** in the same menu lists them; choosing one removes it, and it is disconnected at once.
+- **Paired devices** in the same menu lists them; each one can be removed (it is disconnected at once) or allowed to type (**Allow typing**, off until chosen).
 - The app lists every tab and pane of every Warp window, with its folder, whether something is running and whether it's Claude Code or Codex, and shows whether the connection is direct or through a relay and its round-trip time. A phone icon in Warp's title bar shows when a phone is connected.
+- **Tap a terminal**: one running Claude Code or Codex reads as a chat, from its own transcript: your messages, its answers, and each tool call in one line («Edited main.cpp», «Ran build.sh») with the details on tap, under a status (working, waiting for you, finished). Also behind `ssh host` (with tmux too): Warp reads the conversation there through your own ssh setup (non-interactive, read-only, and only while the phone shows that pane). Any other pane shows its text, wrapped to the phone.
+- **Questions as buttons**: Claude Code's permission prompts, trust dialog and menus (and Codex's approvals) show their options as big buttons; a tap picks that option in the terminal, only if the same question is still there.
+- **Reply** from the phone, plus Esc, Enter, ↑, ↓, Tab and Ctrl+C keys, for a device allowed to type; the title bar says *Phone typing* while it does. Text goes in as one line, and only an explicit Enter submits.
 - Works across NATs and mobile data: [iroh](https://iroh.computer) (QUIC, end-to-end encrypted) connects directly when hole punching works and through n0's public relays otherwise.
 - The networking lives in `warp-remote.exe` (Rust, `warp-remote/`), next to Warp.exe. It only runs while a phone is paired or pairing is in progress, and ends with the last Warp window. Only then does anything talk to n0's servers (the relay, and the address lookup that lets the phone find this computer again); with no phone paired, Warp makes no network connections beyond the update check. Protocol: `warp-remote/src/proto.rs`.
 
@@ -69,7 +72,7 @@ tools/build.sh          # cross-compiles with zig (x86_64-windows-gnu) → dist/
 
 On Windows: `tools/build.ps1` (it takes `dist/warp-remote.exe` from `tools/build.sh`, which cross-compiles it with `cargo zigbuild`).
 
-Phone app, with Xcode and xcodegen: `mobile/ios/build.sh sim` (Simulator), `mobile/ios/build.sh device <TEAM_ID>` or `mobile/ios/build.sh ipa` (unsigned). Tests of the protocol: `cargo nextest run` in `warp-remote/`; `warp-remote-cli` is a client like the app, for scripts.
+Phone app, with Xcode and xcodegen: `mobile/ios/build.sh sim` (Simulator), `mobile/ios/build.sh device <TEAM_ID>` or `mobile/ios/build.sh ipa` (unsigned); `mobile/ios/build.sh demo` drives the app in the booted Simulator against a real Warp with real taps (see `WarpRemoteUITests/DemoTests.swift`). Tests of the protocol: `cargo nextest run` in `warp-remote/`; `warp-remote-cli` is a client like the app, for scripts (`sessions`, `watch`, `type`, `key`, `pick`).
 
 ## License
 
