@@ -317,10 +317,8 @@ static std::wstring Tf(Str s, int v) {
 // the others only with «Reopen on restart» (g_reopen) or after an update restart (g_restartAll).
 static std::wstring g_windowDir;
 static std::wstring g_sessionFile;  // WARPLITE_SESSION (tests): the one session file; this Warp's settings go next to it
-static UINT g_msgQuitAll;           // mensaje registrado: «cerrar todas» (wParam 1: update restart, all come back)
-static UINT g_msgListPanes, g_msgFocusPane;  // selector de terminales entre ventanas (Ctrl+Shift+K)
-static UINT g_msgFocusToast;  // one of this window's Windows notifications was clicked (wParam: the pane's id)
-static UINT g_msgRemote, g_msgRemoteState;   // warp-remote → windows: phones / events; windows → it: how many phones
+static UINT g_msgListPanes;                  // warp-remote asks for the panes (see «Phone»)
+static UINT g_msgRemote, g_msgRemoteState;   // warp-remote → this Warp: phones / events; this Warp → it: how many phones
 static int g_remotePhones = 0;               // phones connected now (title-bar indicator, see «Phone»)
 // Las ventanas de un mismo Warp (mismo %APPDATA%\warp-lite, o la misma carpeta en las pruebas) se
 // reconocen por esta marca: así las pruebas nunca tocan las ventanas de verdad.
@@ -2456,8 +2454,11 @@ static bool RemoteCommand(const std::wstring& cmd);
 // (a test's, or the real one from a test). update: they all come back at the next start. Its warp-remote
 // goes too (after an update the new one starts with the windows).
 static void QuitAll(bool update) {
-  for (HWND h : SiblingWindows()) PostMessageW(h, g_msgQuitAll, update ? 1 : 0, 0);
-  PostMessageW(g_win->hwnd, g_msgQuitAll, update ? 1 : 0, 0);
+  for (Window* w : g_windows) {
+    w->keepSession = true;
+    if (update) w->restartAll = true;  // update restart: this window comes back too, once
+    PostMessageW(w->hwnd, WM_CLOSE, 0, 0);
+  }
   RemoteCommand(L"quit");
 }
 
@@ -2904,12 +2905,12 @@ static std::wstring PaneListText() {
     Leaves(g_win->tabs[i].root, ls);
     for (int j = 0; j < (int)ls.size(); j++) {
       Pane* p = ls[j];
-      // Then the tab's name, the agent (Claude Code / Codex) and the pane's id, for warp-remote (older windows read the
-      // first 5).
+      // Then the tab's name, the agent (Claude Code / Codex), the pane's id and its window, for warp-remote.
       std::wstring tab = g_win->tabs[i].name.empty() ? ShortTitle(g_win->tabs[i].active) : g_win->tabs[i].name;
       const wchar_t* agent = p->agent == AGENT_CLAUDE ? L"claude" : p->agent == AGENT_CODEX ? L"codex" : L"";
       out += std::to_wstring(i) + L"\t" + std::to_wstring(j) + L"\t" + clean(PaneLabel(p)) + L"\t" + clean(p->cwd) + L"\t" +
-             clean(p->runningCmd) + L"\t" + clean(tab) + L"\t" + agent + L"\t" + std::to_wstring(p->id) + L"\n";
+             clean(p->runningCmd) + L"\t" + clean(tab) + L"\t" + agent + L"\t" + std::to_wstring(p->id) + L"\t" +
+             std::to_wstring((unsigned long long)(ULONG_PTR)g_win->hwnd) + L"\n";
     }
   }
   return out;
@@ -6693,14 +6694,14 @@ static bool RemoteCommand(const std::wstring& cmd) {
   if (!h) return false;
   COPYDATASTRUCT cd{kCopyRemote, (DWORD)(cmd.size() * sizeof(wchar_t)), (void*)cmd.data()};
   DWORD_PTR r = 0;
-  return SendMessageTimeoutW(h, WM_COPYDATA, (WPARAM)(g_win ? g_win->hwnd : g_host), (LPARAM)&cd, SMTO_ABORTIFHUNG, 2000, &r) && r;
+  return SendMessageTimeoutW(h, WM_COPYDATA, (WPARAM)g_host, (LPARAM)&cd, SMTO_ABORTIFHUNG, 2000, &r) && r;
 }
 
 // Starts this Warp's warp-remote if it isn't running. pair: and asks it for a pairing code for this window
 // (the answer comes as WM_COPYDATA kCopyRemoteTicket).
 static bool StartRemote(bool pair) {
   wchar_t hwnd[40];
-  swprintf(hwnd, 40, L"%llx", (unsigned long long)(ULONG_PTR)(g_win ? g_win->hwnd : g_host));
+  swprintf(hwnd, 40, L"%llx", (unsigned long long)(ULONG_PTR)g_host);  // the code comes back to it (OnRemoteTicket)
   if (RemoteWindow()) return !pair || RemoteCommand(L"pair " + std::wstring(hwnd));
   wchar_t self[MAX_PATH];
   GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -6728,7 +6729,10 @@ static void ClosePairCard() {
   InvalidateRect(g_win->hwnd, nullptr, FALSE);
 }
 
+static HWND g_pairAsker;  // the window whose pairing card asked for the code warp-remote is getting
+
 static void RequestPairCode() {
+  g_pairAsker = g_win->hwnd;
   g_win->pair.ticket.clear(), g_win->pair.error.clear(), g_win->pair.qr.clear(), g_win->pair.copied = false;
   g_win->pair.shown = GetTickCount();
   if (!StartRemote(true)) g_win->pair.error = L"warp-remote.exe";
@@ -6839,13 +6843,10 @@ static void RemoveDevice(const std::wstring& id) {
 // in it, about once a second while the phone shows it, and types into it for a device allowed to.
 static const ULONG_PTR kCopyRemotePane = 0x57525000, kCopyRemoteAnswer = 0x57524100;
 
+// A pane of this Warp by its id, in whichever window it is now.
 static Pane* PaneById(unsigned id) {
-  for (auto& t : g_win->tabs) {
-    std::vector<Pane*> ls;
-    Leaves(t.root, ls);
-    for (Pane* p : ls)
-      if (p->id == id) return p;
-  }
+  for (Pane* p : g_live)
+    if (p->id == id && p->win && !p->win->dead) return p;
   return nullptr;
 }
 
@@ -6948,6 +6949,7 @@ static BOOL OnRemotePane(HWND from, const std::wstring& t) {
   in >> cmd >> id;
   Pane* p = PaneById(id);
   if (!p) return FALSE;
+  InWindow iw(p->win);
   std::wstring answer;
   if (cmd == L"screen") {
     int back = 0;
@@ -6972,7 +6974,7 @@ static BOOL OnRemotePane(HWND from, const std::wstring& t) {
   }
   COPYDATASTRUCT cd{kCopyRemoteAnswer, (DWORD)(answer.size() * sizeof(wchar_t)), (void*)answer.data()};
   DWORD_PTR r = 0;
-  SendMessageTimeoutW(from, WM_COPYDATA, (WPARAM)g_win->hwnd, (LPARAM)&cd, SMTO_ABORTIFHUNG, 2000, &r);
+  SendMessageTimeoutW(from, WM_COPYDATA, (WPARAM)g_host, (LPARAM)&cd, SMTO_ABORTIFHUNG, 2000, &r);
   return TRUE;
 }
 
@@ -6986,16 +6988,33 @@ static void RemoteAtStart() {
   }
 }
 
-// What warp-remote tells every window: phones connected (lp 0), a phone was paired (1), the code ended (2).
+// What warp-remote tells this Warp: phones connected (lp 0: the window in front says when one more is), a phone was
+// paired (1: the pairing card closes, saying so), the code ended (2).
 static void OnRemoteEvent(WPARAM wp, LPARAM lp) {
   if (lp == 0) {
-    if ((int)wp > g_remotePhones && !g_win->pair.open) Toast(T(S_PHONE_CONNECTED));
+    Window* front = (int)wp > g_remotePhones ? FrontWindow() : nullptr;
     g_remotePhones = (int)wp;
-  } else if (lp == 1 && g_win->pair.open) {
-    ClosePairCard();
-    Toast(T(S_PHONE_PAIRED), 3000);
+    if (front && !front->pair.open) {
+      InWindow in(front);
+      Toast(T(S_PHONE_CONNECTED));
+    }
+  } else if (lp == 1) {
+    for (Window* w : g_windows)
+      if (w->pair.open) {
+        InWindow in(w);
+        ClosePairCard();
+        Toast(T(S_PHONE_PAIRED), 3000);
+      }
   }
-  InvalidateRect(g_win->hwnd, nullptr, FALSE);
+  InvalidateAll();
+}
+
+// warp-remote's pairing code, for the window that asked for it.
+static void OnRemoteTicket(const std::wstring& t) {
+  if (Window* w = LiveWindow(g_pairAsker)) {
+    InWindow in(w);
+    OnPairTicket(t);
+  }
 }
 
 static void DrawPairCard(HDC dc, int w, int h) {
@@ -8068,8 +8087,6 @@ static const FontChoice kFonts[] = {
 static const int kFontCount = sizeof kFonts / sizeof kFonts[0];
 static const int kBuiltinFonts = 3;  // Hack, Cascadia Mono, Consolas; the downloaded ones go after a separator
 static const wchar_t* kFontUrl = L"https://raw.githubusercontent.com/google/fonts/main/";
-static UINT g_msgFont;              // another window changed the font: reload it from the settings
-static UINT g_msgText;              // another window changed the text brightness: likewise
 static std::wstring g_fontWanted;   // switch to this font when its download finishes
 static std::wstring g_fontError;    // why the last download failed (tests)
 static std::set<std::wstring> g_fontFilesLoaded;  // cached files already added to this process
@@ -9180,7 +9197,7 @@ static void RunScriptStep() {
     delay = 1500;
   } else if (s.rfind(L"osc52-drag:", 0) == 0) {  // OSC 52 as tmux sends it when a mouse drag ends
     g_appMouseUp = std::max<DWORD>(GetTickCount(), 1);
-    SendMessageW(g_win->hwnd, WM_APP_CLIP, 0, (LPARAM) new std::wstring(s.substr(11)));
+    SendMessageW(g_host, WM_APP_CLIP, 0, (LPARAM) new std::wstring(s.substr(11)));  // as the reader thread posts it
   } else if (s == L"ctrl-c") {  // what Ctrl+C does with no selection: copies a pending tmux copy, if any
     ScriptLog(std::wstring(L"ctrl-c: ") + (CopyPending() ? L"copia" : L"al programa"));
   } else if (s == L"clipboard") {
@@ -10073,59 +10090,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     TaskbarReady();
     return 0;
   }
-  if (msg == g_msgQuitAll && g_msgQuitAll) {
-    g_win->keepSession = true;
-    if (wp) g_win->restartAll = true;  // update restart: this window comes back too, once
-    PostMessageW(hwnd, WM_CLOSE, 0, 0);
-    return 0;
-  }
-  if (msg == g_msgListPanes && g_msgListPanes) {  // otra ventana abre el selector: se le mandan los paneles
-    HWND to = (HWND)wp;
-    if (!IsWindow(to) || GetPropW(to, kInstanceProp) != InstanceKey()) return 0;
-    std::wstring t = PaneListText();
-    COPYDATASTRUCT cd{kCopyPaneList, (DWORD)(t.size() * sizeof(wchar_t)), (void*)t.data()};
-    SendMessageW(to, WM_COPYDATA, (WPARAM)hwnd, (LPARAM)&cd);
-    return 0;
-  }
-  if (msg == g_msgRemote && g_msgRemote) {  // warp-remote: phones connected, a phone paired
-    OnRemoteEvent(wp, lp);
-    return 0;
-  }
-  if (msg == g_msgFocusPane && g_msgFocusPane) {  // elegida en el selector de otra ventana
-    FocusPane((int)wp, (int)lp);
-    return 0;
-  }
-  if (msg == g_msgFocusToast && g_msgFocusToast) {  // one of this window's toasts was clicked (ToastClicked)
-    for (int i = 0; i < (int)g_win->tabs.size(); i++) {
-      std::vector<Pane*> ls;
-      Leaves(g_win->tabs[i].root, ls);
-      for (int j = 0; j < (int)ls.size(); j++)
-        if (ls[j]->id == (unsigned)wp) FocusPane(i, j);  // it keeps pulsing until clicked or typed in
-    }
-    BringToFront(hwnd);  // allowed by the process the click started
-    return 0;
-  }
-  if (msg == g_msgFont && g_msgFont) {  // another window changed the font
-    std::wstring face = ReadFontSetting();
-    if (!face.empty() && _wcsicmp(face.c_str(), g_fontFace.c_str()) && (FontInstalled(face) || LoadFontFiles(face)))
-      ApplyTerminalFont(face);
-    return 0;
-  }
-  if (msg == g_msgText && g_msgText) {  // another window changed the text brightness
-    COLORREF c;
-    if (ReadTextSetting(&c) && c != g_termFg) ApplyTextColor(c);
-    return 0;
-  }
-  if (msg == WM_COPYDATA) {
-    auto* cd = (COPYDATASTRUCT*)lp;
-    std::wstring t(cd->lpData ? (const wchar_t*)cd->lpData : L"", cd->cbData / sizeof(wchar_t));
-    if (cd->dwData == kCopyRemoteTicket && (HWND)wp == RemoteWindow()) {  // the pairing code asked for
-      OnPairTicket(t);
-      return TRUE;
-    }
-    if (cd->dwData == kCopyRemotePane && (HWND)wp && (HWND)wp == RemoteWindow()) return OnRemotePane((HWND)wp, t);  // a phone
-    return FALSE;
-  }
   return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -10565,9 +10529,31 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     case WM_COPYDATA: {
       auto* cd = (COPYDATASTRUCT*)lp;
-      if (cd->dwData != kCopyLaunch || !cd->lpData) return FALSE;
-      return OnLaunch(std::wstring((const wchar_t*)cd->lpData, cd->cbData / sizeof(wchar_t)));
+      if (!cd->lpData) return FALSE;
+      std::wstring t((const wchar_t*)cd->lpData, cd->cbData / sizeof(wchar_t));
+      if (cd->dwData == kCopyLaunch) return OnLaunch(t);
+      HWND from = (HWND)wp;  // warp-remote, only this Warp's (see «Phone»)
+      if (!from || from != RemoteWindow()) return FALSE;
+      if (cd->dwData == kCopyRemoteTicket) return OnRemoteTicket(t), TRUE;  // the pairing code asked for
+      if (cd->dwData == kCopyRemotePane) return OnRemotePane(from, t);       // a phone, about a pane
+      return FALSE;
     }
+  }
+  if (msg == g_msgRemote && g_msgRemote) {  // warp-remote: phones connected, a phone paired
+    OnRemoteEvent(wp, lp);
+    return 0;
+  }
+  if (msg == g_msgListPanes && g_msgListPanes) {  // warp-remote asks for every pane of this Warp: they go to it
+    HWND to = (HWND)wp;
+    if (!IsWindow(to) || GetPropW(to, kInstanceProp) != InstanceKey()) return 0;
+    std::wstring t;
+    for (Window* w : g_windows) {
+      InWindow in(w);
+      t += PaneListText();
+    }
+    COPYDATASTRUCT cd{kCopyPaneList, (DWORD)(t.size() * sizeof(wchar_t)), (void*)t.data()};
+    SendMessageW(to, WM_COPYDATA, (WPARAM)hwnd, (LPARAM)&cd);
+    return 0;
   }
   return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -10691,14 +10677,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     }
   }
 
-  g_msgQuitAll = RegisterWindowMessageW(L"warp-lite-quit-all");
   g_msgUpdated = RegisterWindowMessageW(L"warp-lite-updated");
   g_msgListPanes = RegisterWindowMessageW(L"warp-lite-list-panes");
-  g_msgFocusPane = RegisterWindowMessageW(L"warp-lite-focus-pane");
-  g_msgFont = RegisterWindowMessageW(L"warp-lite-font");
-  g_msgText = RegisterWindowMessageW(L"warp-lite-brightness");
   g_msgTaskbar = RegisterWindowMessageW(L"TaskbarButtonCreated");
-  g_msgFocusToast = RegisterWindowMessageW(L"warp-lite-focus-toast");
   g_msgRemote = RegisterWindowMessageW(L"warp-lite-remote");
   g_msgRemoteState = RegisterWindowMessageW(L"warp-lite-remote-state");
   // The hidden window first: a start right after this one finds it at once.
