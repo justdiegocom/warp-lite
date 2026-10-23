@@ -20,6 +20,7 @@
 #include <objbase.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <inspectable.h>
 #include <wincodec.h>
 #include <winhttp.h>
 #include <bcrypt.h>
@@ -110,7 +111,7 @@ static const size_t kScrollback = 5000;
 
 enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS, WM_APP_PROMPT, WM_APP_NETCHANGE, WM_APP_NOTE };
 enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6, TIMER_PATHS = 7,
-       TIMER_REMOTE = 8, TIMER_PAIR = 9 };
+       TIMER_REMOTE = 8, TIMER_PAIR = 9, TIMER_PULSE = 10 };
 
 // ---------------------------------------------------------------------------
 // Modelo: pestañas -> árbol de paneles
@@ -221,6 +222,13 @@ struct Pane {
   int unread = 0;
   DWORD noteTick = 0;      // last event (counted or not), to merge an OSC notification with its BEL
   bool noteQuiet = false;  // a finish was seen through the title or OSC 7501: its own bell/notification is not new
+  // Reader thread, with the lock (OnNote takes the first two): the title and body the last OSC 9/777/99 notification
+  // carried, and the kitty notification being gathered from its chunks (its id, title and body).
+  std::string noteTitle, noteBody, kittyPending, kittyTitle, kittyBody;
+  // UI thread. attention: a counted event the user hasn't clicked or typed in yet (see «Attention»); toasted: its
+  // Windows notification may still be in the action center (see «Windows notifications»).
+  unsigned id = 0;  // this process's serial number: a notification's click finds the pane by it
+  bool attention = false, toasted = false;
 };
 
 static HWND g_hwnd;
@@ -273,7 +281,7 @@ enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, 
            S_FONT_SIZE, S_TEXT_BRIGHTNESS, S_DEFAULT, S_RECONNECTING, S_RECONNECT_WAIT, S_REOPEN, S_OPEN, S_COPY_PATH, S_COPY_LINK,
            S_OPEN_LOCATION, S_UNREAD, S_PAIR_PHONE, S_PAIRED_DEVICES, S_NO_DEVICES, S_REMOVE_DEVICE, S_PAIR_TITLE, S_PAIR_HINT,
            S_PAIR_STARTING, S_PAIR_EXPIRES, S_PAIR_EXPIRED, S_PAIR_NEW, S_COPY, S_COPIED, S_PAIR_FAILED, S_PHONE_PAIRED,
-           S_PHONE_CONNECTED, S_COUNT };
+           S_PHONE_CONNECTED, S_WIN_NOTIFY, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
@@ -288,7 +296,8 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Paired devices", L"No paired devices", L"Remove \u201c%ls\u201d", L"Pair phone",
      L"Scan it with the Warp app on your phone, or paste the text there.", L"Getting a pairing code…",
      L"Expires in %d:%02d", L"This code has expired.", L"New code", L"Copy", L"Copied",
-     L"Couldn't start pairing: %ls", L"Phone paired", L"Phone connected"},
+     L"Couldn't start pairing: %ls", L"Phone paired", L"Phone connected",
+     L"Windows notifications"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
@@ -303,7 +312,8 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Vincular móvil…", L"Dispositivos vinculados", L"Ningún dispositivo vinculado", L"Quitar \u00ab%ls\u00bb",
      L"Vincular móvil", L"Escanéalo con la app Warp del móvil, o pega allí el texto.", L"Preparando el código…",
      L"Caduca en %d:%02d", L"Este código ha caducado.", L"Código nuevo", L"Copiar", L"Copiado",
-     L"No se pudo empezar a vincular: %ls", L"Móvil vinculado", L"Móvil conectado"},
+     L"No se pudo empezar a vincular: %ls", L"Móvil vinculado", L"Móvil conectado",
+     L"Notificaciones de Windows"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -329,6 +339,7 @@ static bool g_isMain = false, g_reopen = false, g_restartAll = false;
 static bool g_keepSession = false;  // closing for quit-all / Windows shutdown: its last pane closing doesn't discard it
 static UINT g_msgQuitAll;           // mensaje registrado: «cerrar todas» (wParam 1: update restart, all come back)
 static UINT g_msgListPanes, g_msgFocusPane;  // selector de terminales entre ventanas (Ctrl+Shift+K)
+static UINT g_msgFocusToast;  // one of this window's Windows notifications was clicked (wParam: the pane's id)
 static UINT g_msgRemote, g_msgRemoteState;   // warp-remote → windows: phones / events; windows → it: how many phones
 static int g_remotePhones = 0;               // phones connected now (title-bar indicator, see «Phone»)
 static std::wstring g_openDir;      // --cd <carpeta> («Abrir Warp aquí»): pestaña nueva ya en ella
@@ -559,20 +570,38 @@ static std::string KeyValue(const std::string& s, const std::string& key, char s
   return "";
 }
 
-// A whole OSC 9 / 99 / 777 / 7501 from a program (not the prompt's 9;9;<token>).
+// A whole OSC 9 / 99 / 777 / 7501 from a program (not the prompt's 9;9;<token>). A notification's title and body
+// go with it, for its Windows notification.
 static void OscNote(Pane* p, int command, const std::string& s) {
+  auto alert = [p](const std::string& title, const std::string& body) {
+    p->noteTitle = title.substr(0, 1024);
+    p->noteBody = body.substr(0, 1024);
+    PostNote(p, NOTE_ALERT);
+  };
   if (command == 9) {  // 9;<text>; ConEmu's 9;<number>;... (9;9 folder, 9;4 progress) are not notifications
     size_t n = 0;
     while (n < s.size() && s[n] >= '0' && s[n] <= '9') n++;
-    if (!n || (n < s.size() && s[n] != ';')) PostNote(p, NOTE_ALERT);
+    if (!n || (n < s.size() && s[n] != ';')) alert(s, "");
   } else if (command == 777) {  // 777;notify;<title>;<body>
-    if (s == "notify" || s.rfind("notify;", 0) == 0) PostNote(p, NOTE_ALERT);
-  } else if (command == 99) {  // 99;<key=value:...>;<text>, in chunks: d=0 = more to come; one per id
-    std::string meta = s.substr(0, s.find(';')), id = KeyValue(meta, "i", ':'), kind = KeyValue(meta, "p", ':');
-    if (KeyValue(meta, "d", ':') == "0" || kind == "?" || kind == "close" || kind == "alive") return;
+    if (s == "notify" || s.rfind("notify;", 0) == 0) {
+      std::string rest = s.substr(std::min<size_t>(s.size(), 7));
+      size_t semi = rest.find(';');
+      alert(rest.substr(0, semi), semi == std::string::npos ? "" : rest.substr(semi + 1));
+    }
+  } else if (command == 99) {  // 99;<key=value:...>;<text>, in chunks: d=0 = more to come; one per id; p=title|body
+    size_t semi = s.find(';');
+    std::string meta = s.substr(0, semi), id = KeyValue(meta, "i", ':'), kind = KeyValue(meta, "p", ':');
+    if (kind == "?" || kind == "close" || kind == "alive") return;
     if (!id.empty() && id == p->kittyId) return;
+    if (id.empty() || id != p->kittyPending) p->kittyPending = id, p->kittyTitle.clear(), p->kittyBody.clear();
+    std::string& part = kind == "body" ? p->kittyBody : p->kittyTitle;
+    if ((kind.empty() || kind == "title" || kind == "body") && KeyValue(meta, "e", ':') != "1" && semi != std::string::npos &&
+        part.size() < 1024)
+      part += s.substr(semi + 1);  // base64 (e=1) is left out
+    if (KeyValue(meta, "d", ':') == "0") return;
     p->kittyId = id;
-    PostNote(p, NOTE_ALERT);
+    alert(p->kittyTitle, p->kittyBody);
+    p->kittyPending.clear(), p->kittyTitle.clear(), p->kittyBody.clear();
   } else if (command == 7501) {  // 7501;state=working|blocked|idle|done|error|clear:app=...
     std::string st = KeyValue(s, "state", ':');
     if (st == "working") AgentState(p, p->statusState, NOTE_BUSY);
@@ -683,7 +712,9 @@ static int CbSbClear(void* user) {
 }
 
 static Pane* NewPane() {
+  static unsigned serial = 0;
   Pane* p = new Pane();
+  p->id = ++serial;
   InitializeCriticalSection(&p->cs);
   InitializeCriticalSection(&p->writeCs);
   p->vt = vterm_new(p->rows, p->cols);
@@ -2045,23 +2076,37 @@ static HRESULT g_taskbarHr = S_FALSE, g_overlayHr = S_FALSE;  // tests (step «t
 static void SetOverlay(int total);
 static void TaskbarReady();
 static std::vector<uint32_t> BadgePixels(int n, int size);
+static void SyncPulse();
+static void NotifyWindows(Pane* p, const std::wstring& title, const std::wstring& body);
+static void ToastRemove(Pane* p);
 
-// Clears what the user is looking at and keeps the taskbar button in step. Cheap: it runs before every message.
+// Clears what the user is looking at and keeps the taskbar button and the attention pulse in step. Cheap: it runs
+// before every message.
 static void SyncUnread() {
   if (g_tabs.empty()) return;
   bool changed = false;
   Pane* a = CurTab().active;
-  if (a && a->unread && PaneSeen(a)) a->unread = 0, changed = true;
+  if (a && a->unread && PaneSeen(a)) {
+    a->unread = 0, changed = true;
+    if (a->toasted) ToastRemove(a);  // read: its Windows notification leaves the action center too
+  }
   int total = 0;
   for (Pane* p : g_live) total += p->unread;
   if (total != g_unreadShown) g_unreadShown = total, SetOverlay(total), changed = true;
   if (changed) InvalidateRect(g_hwnd, nullptr, FALSE);
+  SyncPulse();
 }
 
 static void OnNote(Pane* p, int kind) {
   if (kind == NOTE_BUSY) {
     p->noteQuiet = false;
     return;
+  }
+  std::string title, body;  // what an OSC notification said, for the Windows one
+  if (kind == NOTE_ALERT) {
+    EnterCriticalSection(&p->cs);
+    title.swap(p->noteTitle), body.swap(p->noteBody);
+    LeaveCriticalSection(&p->cs);
   }
   // The finish was already seen through the title or OSC 7501: the program's own bell or notification for it
   // (Claude Code rings about 60 s later) is the same news, until it works again or is typed to.
@@ -2074,6 +2119,7 @@ static void OnNote(Pane* p, int kind) {
     what = merged ? L"merged" : PaneSeen(p) ? L"seen" : L"counted";
     if (!merged && !PaneSeen(p)) {
       p->unread = std::min(p->unread + 1, 999);
+      p->attention = true;  // it pulses until clicked or typed in, also once it is in view (see «Attention»)
       // The taskbar button flashes and stays lit until the window is in front (focus isn't taken), but not over a
       // full-screen game or a presentation, where it would bring the taskbar up.
       QUERY_USER_NOTIFICATION_STATE qs;
@@ -2081,10 +2127,25 @@ static void OnNote(Pane* p, int kind) {
         FLASHWINFO fi{sizeof fi, g_hwnd, FLASHW_TRAY, 3, 0};
         FlashWindowEx(&fi);
       }
+      NotifyWindows(p, ToWide(title), ToWide(body));
       SyncUnread();
     }
   }
   if (!g_script.empty()) g_noteLog += std::wstring(g_noteLog.empty() ? L"" : L" ") + kNoteNames[kind] + L":" + what;
+}
+
+// Attention: a pane with a counted event keeps a soft accent outline pulsing (DrawAttention, SyncPulse) after its
+// badge is gone, so the user arriving from the taskbar, the tab or a Windows notification sees which terminal it was.
+// Only a click in it or a key typed into it ends it; going to its tab or bringing Warp to front doesn't.
+static void Attend(Pane* p) {
+  if (!p || !p->attention) return;
+  p->attention = false;
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static bool IsModifierKey(WPARAM vk) {
+  return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN || vk == VK_CAPITAL ||
+         (vk >= VK_LSHIFT && vk <= VK_RMENU);
 }
 
 static void ActivateTab(int i) {
@@ -2643,6 +2704,14 @@ struct Switcher {
 };
 static Switcher g_sw;
 
+// A pane's name: its Claude Code conversation, its tab's name when alone in it, or its title.
+static std::wstring PaneLabel(Pane* p) {
+  int ti = TabIndexOf(p);
+  std::vector<Pane*> ls;
+  if (ti >= 0) Leaves(g_tabs[ti].root, ls);
+  return !p->agentName.empty() ? p->agentName : ls.size() == 1 && !g_tabs[ti].name.empty() ? g_tabs[ti].name : ShortTitle(p);
+}
+
 // Una línea por panel: pestaña, panel, título, carpeta y orden en marcha, separados por tabuladores.
 static std::wstring PaneListText() {
   auto clean = [](std::wstring t) {
@@ -2656,12 +2725,10 @@ static std::wstring PaneListText() {
     Leaves(g_tabs[i].root, ls);
     for (int j = 0; j < (int)ls.size(); j++) {
       Pane* p = ls[j];
-      std::wstring title = !p->agentName.empty() ? p->agentName
-                           : ls.size() == 1 && !g_tabs[i].name.empty() ? g_tabs[i].name : ShortTitle(p);
       // Then the tab's name and the agent (Claude Code / Codex), for warp-remote (older windows read the first 5).
       std::wstring tab = g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name;
       const wchar_t* agent = p->agent == AGENT_CLAUDE ? L"claude" : p->agent == AGENT_CODEX ? L"codex" : L"";
-      out += std::to_wstring(i) + L"\t" + std::to_wstring(j) + L"\t" + clean(title) + L"\t" + clean(p->cwd) + L"\t" +
+      out += std::to_wstring(i) + L"\t" + std::to_wstring(j) + L"\t" + clean(PaneLabel(p)) + L"\t" + clean(p->cwd) + L"\t" +
              clean(p->runningCmd) + L"\t" + clean(tab) + L"\t" + agent + L"\n";
     }
   }
@@ -3453,6 +3520,7 @@ static bool HandleKeyDown(WPARAM vk, LPARAM) {
     g_clipPending.clear();
   if (HandleShortcut(vk)) return true;
   Pane* p = CurTab().active;
+  if (!IsModifierKey(vk)) Attend(p);  // a key for the pane (not one of Warp's shortcuts): the user is at it
   // Any key in a pane that is reconnecting stops it (bare modifiers don't); Esc while waiting does
   // only that.
   if (p->recon.state != RC_OFF && vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU && vk != VK_LWIN &&
@@ -5766,9 +5834,48 @@ static void DrawBadge(HDC dc, int n, RECT r) {
   SelectObject(dc, of);
 }
 
+// The attention pulse (see «Attention»): the pane's outline (DrawAttention), its header and its tab take the accent in
+// and out, by PulseLevel.
+static const DWORD kPulseMs = 1200;  // one breath, bright to dim and back
+static int g_motion = -1;            // Windows animates (SPI_GETCLIENTAREAANIMATION); -1: ask again
+static int g_motionTest = -1;        // tests: 0 or 1 instead of Windows' setting
+static int g_pulseAt = -1;           // tests: that point of the breath (ms) instead of the clock
+
+static bool Motion() {
+  if (g_motionTest >= 0) return g_motionTest;
+  if (g_motion < 0) {
+    BOOL on = TRUE;
+    g_motion = !SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &on, 0) || on;
+  }
+  return g_motion;
+}
+
+// How much accent: a cosine from all of it down to 0.15 and back; steady at 0.8 when Windows doesn't animate.
+static float PulseLevel() {
+  if (!Motion()) return 0.8f;
+  DWORD t = g_pulseAt >= 0 ? (DWORD)g_pulseAt : GetTickCount();
+  float c = std::cos((float)(t % kPulseMs) / kPulseMs * 6.2831853f);
+  return 0.15f + 0.85f * (0.5f + 0.5f * c);
+}
+
+static COLORREF Mix(COLORREF a, COLORREF b, float k) {
+  auto ch = [k](int x, int y) { return (int)(x + (y - x) * k + 0.5f); };
+  return RGB(ch(GetRValue(a), GetRValue(b)), ch(GetGValue(a), GetGValue(b)), ch(GetBValue(a), GetBValue(b)));
+}
+
+// The header and the tab behind their text: a share of the outline's accent, so the text stays readable.
+static const float kPulseFill = 0.4f;
+
+static bool TabPulses(int i) {
+  std::vector<Pane*> ls;
+  Leaves(g_tabs[i].root, ls);
+  return std::any_of(ls.begin(), ls.end(), [](Pane* p) { return p->attention; });
+}
+
 static void DrawTabItem(HDC dc, int i, RECT r, bool vertical) {
   bool act = i == g_activeTab, hover = g_hoverTab == i;
   if (act || hover) Fill(dc, r, act ? kTabActiveBg : RGB(0x1a, 0x1a, 0x1a));
+  if (act && TabPulses(i)) Fill(dc, r, Mix(kTabActiveBg, kAccent, kPulseFill * PulseLevel()));  // a pane in view pulses
   if (vertical && act) Fill(dc, RECT{r.left, r.top, r.left + Px(3), r.bottom}, kAccent);
   RECT tr{r.left + (vertical ? Px(14) : Px(28)), r.top, r.right - Px(28), r.bottom};
   UINT align = vertical ? DT_LEFT : DT_CENTER;
@@ -5873,7 +5980,8 @@ static void DrawTitleBar(HDC dc, int w, int h) {
 static void DrawPaneHeader(HDC dc, Pane* p, bool active) {
   RECT h = HeaderRect(p);
   if (h.bottom <= h.top) return;
-  Fill(dc, h, active ? kHdrActiveBg : kBg);
+  COLORREF bg = active ? kHdrActiveBg : kBg;
+  Fill(dc, h, p->attention ? Mix(bg, kAccent, kPulseFill * PulseLevel()) : bg);
   SetBkMode(dc, TRANSPARENT);
   SelectObject(dc, g_uiFont);
   RECT tr{h.left + Px(34), h.top, h.right - Px(34), h.bottom};
@@ -5883,6 +5991,41 @@ static void DrawPaneHeader(HDC dc, Pane* p, bool active) {
   SelectObject(dc, g_iconFont);
   Text(dc, L"\uE8BB", xr, kTabText, DT_CENTER);
   SetBkMode(dc, OPAQUE);
+}
+
+// Attention outline (see «Attention» and PulseLevel): an accent frame on the inner edge of the pane, inside the text's
+// kPad margin so it never covers a cell, mixed into what is under it (the header's or the terminal's background).
+// Solid fills, no blending: a pulse frame costs a few of them. The rows and the input box of DrawPane cover its sides
+// and bottom, so it is drawn again after them.
+// The frame's sides: left, right, top, bottom.
+static void AttentionSides(Pane* p, RECT s[4]) {
+  RECT r = p->rc;
+  int w = std::min(Px(3), kPad);
+  s[0] = RECT{r.left, r.top, r.left + w, r.bottom};
+  s[1] = RECT{r.right - w, r.top, r.right, r.bottom};
+  s[2] = RECT{r.left, r.top, r.right, r.top + w};
+  s[3] = RECT{r.left, r.bottom - w, r.right, r.bottom};
+}
+
+static void DrawAttention(HDC dc, Pane* p) {
+  if (!p->attention) return;
+  float k = PulseLevel();
+  RECT h = HeaderRect(p), s[4];
+  AttentionSides(p, s);
+  COLORREF head = Mix(p == CurTab().active ? kHdrActiveBg : kBg, kAccent, k), body = Mix(kBg, kAccent, k);
+  for (RECT r : s) {
+    RECT a = r, b = r;  // the part over the header (split panes only) and the rest
+    a.bottom = std::min(r.bottom, h.bottom), b.top = std::max(r.top, h.bottom);
+    if (h.bottom > h.top && a.bottom > a.top) Fill(dc, a, head);
+    if (b.bottom > b.top) Fill(dc, b, body);
+  }
+}
+
+// Copies the frame from the back buffer to the window.
+static void BlitAttention(HDC to, HDC from, Pane* p) {
+  RECT s[4];
+  AttentionSides(p, s);
+  for (RECT r : s) BitBlt(to, r.left, r.top, r.right - r.left, r.bottom - r.top, from, r.left, r.top, SRCCOPY);
 }
 
 static void Panel(HDC dc, RECT r) {
@@ -6423,6 +6566,7 @@ static void Render(HDC dc, int w, int h) {
   for (Pane* p : ls) {
     DrawPane(dc, p, p == t.active, g_focused);
     DrawPaneHeader(dc, p, p == t.active);
+    DrawAttention(dc, p);
   }
   DrawDividers(dc, t.root);
   for (Pane* p : ls) DrawReconnect(dc, p);
@@ -6477,8 +6621,70 @@ static void PaintDirty() {
   HDC wdc = GetDC(g_hwnd);
   for (Pane* p : ls) {
     RECT u = DrawPane(g_backDC, p, p == CurTab().active, g_focused, true);
-    if (u.right > u.left) BitBlt(wdc, u.left, u.top, u.right - u.left, u.bottom - u.top, g_backDC, u.left, u.top, SRCCOPY);
+    if (u.right <= u.left) continue;
+    bool frame = p->attention;  // the rows were drawn across its sides
+    if (frame) DrawAttention(g_backDC, p);
+    BitBlt(wdc, u.left, u.top, u.right - u.left, u.bottom - u.top, g_backDC, u.left, u.top, SRCCOPY);
+    if (frame) BlitAttention(wdc, g_backDC, p);
   }
+  ReleaseDC(g_hwnd, wdc);
+}
+
+// The attention pulse (see «Attention»): TIMER_PULSE runs only while a pane of the tab in view has attention, the
+// window isn't minimized and Windows animates; otherwise the outline, if any, is steady and nothing runs. Checked
+// before every message (SyncUnread), so a minimize, a tab switch or a click stops it at once.
+static const UINT kPulseFrameMs = 33;
+static bool g_pulseTimer = false;
+
+static void SyncPulse() {
+  bool want = false;
+  for (Pane* p : g_live)
+    if (p->attention) {
+      want = true;
+      break;
+    }
+  if (want) {
+    std::vector<Pane*> ls;
+    Leaves(CurTab().root, ls);
+    want = !IsIconic(g_hwnd) && Motion() && std::any_of(ls.begin(), ls.end(), [](Pane* p) { return p->attention; });
+  }
+  if (want == g_pulseTimer) return;
+  g_pulseTimer = want;
+  if (want) SetTimer(g_hwnd, TIMER_PULSE, kPulseFrameMs, nullptr);
+  else KillTimer(g_hwnd, TIMER_PULSE);
+}
+
+// One frame of the pulse: only the outlines, the headers and the tab in view, into the back buffer and onto the window.
+// What is drawn over the panes (update notice, find bar, menus) keeps its place: their last rectangles are left out.
+static void PulseTick() {
+  if (!g_backDC || g_tabs.empty() || IsIconic(g_hwnd) || g_dragPane) return;
+  std::vector<Pane*> ls;
+  Leaves(CurTab().root, ls);
+  HDC wdc = GetDC(g_hwnd);
+  int saved = SaveDC(g_backDC);
+  for (const RECT* o : {&g_upd.rc, &g_find.rc, &g_sw.rc, &g_pick.rc, &g_comp.rc})
+    if (o->right > o->left) {
+      ExcludeClipRect(g_backDC, o->left, o->top, o->right, o->bottom);
+      ExcludeClipRect(wdc, o->left, o->top, o->right, o->bottom);
+    }
+  for (Pane* p : ls)
+    if (p->attention) {
+      RECT h = HeaderRect(p);  // split panes only
+      DrawPaneHeader(g_backDC, p, p == CurTab().active);
+      DrawAttention(g_backDC, p);
+      if (h.bottom > h.top) BitBlt(wdc, h.left, h.top, h.right - h.left, h.bottom - h.top, g_backDC, h.left, h.top, SRCCOPY);
+      BlitAttention(wdc, g_backDC, p);
+    }
+  if (g_renameTab < 0)  // its tab (not while it is being renamed)
+    for (auto& [i, r] : ComputeTabs().tabs)
+      if (i == g_activeTab) {
+        SelectObject(g_backDC, g_uiFont);
+        SetBkMode(g_backDC, TRANSPARENT);
+        DrawTabItem(g_backDC, i, r, g_vertTabs);
+        SetBkMode(g_backDC, OPAQUE);
+        BitBlt(wdc, r.left, r.top, r.right - r.left, r.bottom - r.top, g_backDC, r.left, r.top, SRCCOPY);
+      }
+  RestoreDC(g_backDC, saved);
   ReleaseDC(g_hwnd, wdc);
 }
 
@@ -6601,6 +6807,290 @@ static bool SaveScreenshot(const std::wstring& path) {
 }
 
 // ---------------------------------------------------------------------------
+// Windows notifications (title-bar menu → «Windows notifications», off by default): each event a badge counts (see
+// «Unread badges», same dedupe) also shows a toast, silent, one per pane (the next one replaces it), gone from the
+// action center once the pane is looked at, and none over a full-screen game or a presentation (Focus Assist decides
+// the rest). Its title is the notification's own (OSC 9/777/99) or the pane's name; its text, the notification's body
+// or the pane's folder.
+// Clicking it opens warp-lite:focus/<window>/<pid>/<pane id>, a protocol the installer registers: that Warp.exe passes
+// it to the window (ToastClicked), which goes to the pane, still pulsing, and comes to front. A protocol and not the
+// toast's Activated event: it reaches whichever window process showed it, also from the action center, and it is the
+// same path the tests drive. A closing window takes its toasts with it.
+// Windows shows a desktop app's toasts when its AppUserModelID is on a Start menu shortcut: the installer puts kAppId
+// on Warp.lnk, and every Warp process takes it before its window exists, so the taskbar keeps them with that shortcut.
+// WinRT through combase.dll, loaded with the first toast: nothing of it loads or runs before.
+
+static const wchar_t* kAppId = L"justdiego.Warp";  // the same in setup.cpp
+static const wchar_t* kToastScheme = L"warp-lite";  // the same in setup.cpp
+
+// notify.txt: «toasts 1». Read each time: every window is its own process, and a toggle in one is for all.
+static std::wstring NotifySettingsPath() {
+  return g_windowDir.empty() ? g_sessionPath + L".notify" : g_windowDir + L"\\notify.txt";
+}
+
+static bool ToastsOn() {
+  int v = 0;
+  if (FILE* f = _wfopen(NotifySettingsPath().c_str(), L"r")) {
+    if (fscanf(f, "toasts %d", &v) != 1) v = 0;
+    fclose(f);
+  }
+  return v != 0;
+}
+
+static void SetToasts(bool on) {
+  if (FILE* f = _wfopen(NotifySettingsPath().c_str(), L"w")) {
+    fprintf(f, "toasts %d\n", on ? 1 : 0);
+    fclose(f);
+  }
+}
+
+// Windows.UI.Notifications and Windows.Data.Xml.Dom by hand (the toolchain has no WinRT headers): each interface up to
+// the last method used, in the order of its IDL.
+struct IToastNotification;
+struct IToastNotifier : IInspectable {
+  virtual HRESULT STDMETHODCALLTYPE Show(IToastNotification* n) = 0;
+  virtual HRESULT STDMETHODCALLTYPE Hide(IToastNotification* n) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_Setting(int* value) = 0;  // NotificationSetting: 0 enabled, 1-4 why not
+};
+struct IToastNotificationHistory : IInspectable {
+  virtual HRESULT STDMETHODCALLTYPE RemoveGroup(HSTRING group) = 0;
+  virtual HRESULT STDMETHODCALLTYPE RemoveGroupWithId(HSTRING group, HSTRING app) = 0;
+  virtual HRESULT STDMETHODCALLTYPE RemoveGroupedTagWithId(HSTRING tag, HSTRING group, HSTRING app) = 0;
+};
+struct IToastNotificationManagerStatics : IInspectable {
+  virtual HRESULT STDMETHODCALLTYPE CreateToastNotifier(IToastNotifier** result) = 0;
+  virtual HRESULT STDMETHODCALLTYPE CreateToastNotifierWithId(HSTRING app, IToastNotifier** result) = 0;
+};
+struct IToastNotificationManagerStatics2 : IInspectable {
+  virtual HRESULT STDMETHODCALLTYPE get_History(IToastNotificationHistory** value) = 0;
+};
+struct IToastNotificationFactory : IInspectable {
+  virtual HRESULT STDMETHODCALLTYPE CreateToastNotification(IInspectable* xml, IToastNotification** value) = 0;
+};
+struct IToastNotification : IInspectable {};
+struct IToastNotification2 : IInspectable {
+  virtual HRESULT STDMETHODCALLTYPE put_Tag(HSTRING value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE get_Tag(HSTRING* value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE put_Group(HSTRING value) = 0;
+};
+struct IXmlDocumentIO : IInspectable {
+  virtual HRESULT STDMETHODCALLTYPE LoadXml(HSTRING xml) = 0;
+};
+static const GUID kIidToastStatics = {0x50ac103f, 0xd235, 0x4598, {0xbb, 0xef, 0x98, 0xfe, 0x4d, 0x1a, 0x3a, 0xd4}};
+static const GUID kIidToastStatics2 = {0x7ab93c52, 0x0e48, 0x4750, {0xba, 0x9d, 0x1a, 0x41, 0x13, 0x98, 0x18, 0x47}};
+static const GUID kIidToastFactory = {0x04124b20, 0x82c6, 0x4229, {0xb1, 0x09, 0xfd, 0x9e, 0xd4, 0x66, 0x2b, 0x53}};
+static const GUID kIidToast2 = {0x9dfb9fd1, 0x143a, 0x490e, {0x90, 0xbf, 0xb9, 0xfb, 0xa7, 0x13, 0x2d, 0xe7}};
+static const GUID kIidXmlIO = {0x6cd0e74e, 0xee65, 0x4489, {0x9e, 0xbf, 0xca, 0x43, 0xe8, 0x7b, 0xa6, 0x37}};
+static const GUID kIidXmlDoc = {0xf7f3a506, 0x1e87, 0x42d6, {0xbc, 0xfb, 0xb8, 0xc8, 0x09, 0xfa, 0x54, 0x94}};
+
+typedef HRESULT(WINAPI* PFN_RoGetActivationFactory)(HSTRING, REFIID, void**);
+typedef HRESULT(WINAPI* PFN_RoActivateInstance)(HSTRING, IInspectable**);
+typedef HRESULT(WINAPI* PFN_WindowsCreateString)(const wchar_t*, UINT32, HSTRING*);
+typedef HRESULT(WINAPI* PFN_WindowsDeleteString)(HSTRING);
+struct Toaster {
+  int state = 0;  // 0 not tried yet, 1 ready, -1 Windows can't
+  PFN_RoGetActivationFactory factoryOf = nullptr;
+  PFN_RoActivateInstance activate = nullptr;
+  PFN_WindowsCreateString hstring = nullptr;
+  PFN_WindowsDeleteString hfree = nullptr;
+  IToastNotifier* notifier = nullptr;
+  IToastNotificationHistory* history = nullptr;
+  IToastNotificationFactory* factory = nullptr;
+  // tests (step «toast-probe»): what each call returned
+  HRESULT staticsHr = S_FALSE, notifierHr = S_FALSE, historyHr = S_FALSE, factoryHr = S_FALSE;
+};
+static Toaster g_toaster;
+static std::vector<std::wstring> g_toastLog;  // tests: the toasts asked for (step «toasts»); a test never shows one
+static std::wstring g_toastLaunch;             // tests: the last one's launch URI (step «toast-click»)
+static HANDLE g_toastProc;                      // tests: the process a «toast-click» started
+
+// An HSTRING for the length of one call.
+struct HStr {
+  HSTRING h = nullptr;
+  HStr(const std::wstring& s) {
+    if (g_toaster.hstring) g_toaster.hstring(s.c_str(), (UINT32)s.size(), &h);
+  }
+  ~HStr() {
+    if (h) g_toaster.hfree(h);
+  }
+  operator HSTRING() const { return h; }
+};
+
+static bool LoadCombase() {
+  if (g_toaster.hfree) return true;
+  HMODULE cb = LoadLibraryW(L"combase.dll");
+  if (!cb) return false;
+  g_toaster.factoryOf = (PFN_RoGetActivationFactory)(void*)GetProcAddress(cb, "RoGetActivationFactory");
+  g_toaster.activate = (PFN_RoActivateInstance)(void*)GetProcAddress(cb, "RoActivateInstance");
+  g_toaster.hstring = (PFN_WindowsCreateString)(void*)GetProcAddress(cb, "WindowsCreateString");
+  auto hfree = (PFN_WindowsDeleteString)(void*)GetProcAddress(cb, "WindowsDeleteString");
+  if (!g_toaster.factoryOf || !g_toaster.activate || !g_toaster.hstring || !hfree) return false;
+  g_toaster.hfree = hfree;
+  return true;
+}
+
+// The notifier for kAppId, the action center's history and the toast factory, once per process.
+static bool ToastInit() {
+  if (g_toaster.state) return g_toaster.state > 0;
+  g_toaster.state = -1;
+  if (!LoadCombase()) return false;
+  IToastNotificationManagerStatics* st = nullptr;
+  IToastNotificationManagerStatics2* st2 = nullptr;
+  g_toaster.staticsHr = g_toaster.factoryOf(HStr(L"Windows.UI.Notifications.ToastNotificationManager"), kIidToastStatics, (void**)&st);
+  if (FAILED(g_toaster.staticsHr) || !st) return false;
+  g_toaster.notifierHr = st->CreateToastNotifierWithId(HStr(kAppId), &g_toaster.notifier);
+  g_toaster.historyHr = st->QueryInterface(kIidToastStatics2, (void**)&st2);
+  if (SUCCEEDED(g_toaster.historyHr) && st2) g_toaster.historyHr = st2->get_History(&g_toaster.history), st2->Release();
+  st->Release();
+  g_toaster.factoryHr = g_toaster.factoryOf(HStr(L"Windows.UI.Notifications.ToastNotification"), kIidToastFactory, (void**)&g_toaster.factory);
+  if (FAILED(g_toaster.notifierHr) || !g_toaster.notifier || FAILED(g_toaster.factoryHr) || !g_toaster.factory) return false;
+  g_toaster.state = 1;
+  return true;
+}
+
+// A toast from its XML, with its tag and group (what replaces and removes it). hr: each step's result, for the tests.
+static IToastNotification* MakeToast(const std::wstring& xml, const std::wstring& tag, const std::wstring& group,
+                                     HRESULT hr[3] = nullptr) {
+  HRESULT local[3] = {S_FALSE, S_FALSE, S_FALSE};
+  if (!hr) hr = local;
+  IInspectable* doc = nullptr;
+  IXmlDocumentIO* io = nullptr;
+  IInspectable* xdoc = nullptr;
+  IToastNotification* n = nullptr;
+  IToastNotification2* n2 = nullptr;
+  hr[0] = g_toaster.activate(HStr(L"Windows.Data.Xml.Dom.XmlDocument"), &doc);
+  if (SUCCEEDED(hr[0]) && doc && SUCCEEDED(hr[0] = doc->QueryInterface(kIidXmlIO, (void**)&io)) && io &&
+      SUCCEEDED(hr[0] = io->LoadXml(HStr(xml))) && SUCCEEDED(hr[0] = doc->QueryInterface(kIidXmlDoc, (void**)&xdoc)) && xdoc)
+    hr[1] = g_toaster.factory->CreateToastNotification(xdoc, &n);
+  if (n && SUCCEEDED(hr[2] = n->QueryInterface(kIidToast2, (void**)&n2)) && n2) {
+    hr[2] = n2->put_Tag(HStr(tag));
+    if (SUCCEEDED(hr[2])) hr[2] = n2->put_Group(HStr(group));
+    n2->Release();
+  }
+  if (xdoc) xdoc->Release();
+  if (io) io->Release();
+  if (doc) doc->Release();
+  if (n && FAILED(hr[2])) n->Release(), n = nullptr;
+  return n;
+}
+
+// Text for the toast's XML: escaped, without control characters or broken surrogates, cut at max characters.
+static std::wstring XmlText(const std::wstring& s, size_t max) {
+  std::wstring o;
+  size_t n = 0;
+  for (size_t i = 0; i < s.size(); i++) {
+    wchar_t c = s[i];
+    bool pair = c >= 0xD800 && c < 0xDC00 && i + 1 < s.size() && s[i + 1] >= 0xDC00 && s[i + 1] < 0xE000;
+    if (c >= 0xD800 && c < 0xE000 && !pair) continue;
+    if (c == 0xFFFE || c == 0xFFFF) continue;
+    if (n++ == max) {
+      o += L'…';
+      break;
+    }
+    if (c < 0x20 || (c >= 0x7f && c < 0xa0)) c = L' ';
+    switch (c) {
+      case L'&': o += L"&amp;"; break;
+      case L'<': o += L"&lt;"; break;
+      case L'>': o += L"&gt;"; break;
+      case L'"': o += L"&quot;"; break;
+      case L'\'': o += L"&apos;"; break;
+      default: o += c;
+    }
+    if (pair) o += s[++i];
+  }
+  return o;
+}
+
+// What a click opens: the protocol with this window and pane (only digits: nothing to escape).
+static std::wstring ToastLaunch(Pane* p) {
+  wchar_t launch[96];
+  swprintf(launch, 96, L"%ls:focus/%llu/%lu/%u", kToastScheme, (unsigned long long)(ULONG_PTR)g_hwnd,
+           (unsigned long)GetCurrentProcessId(), p->id);
+  return launch;
+}
+
+// The toast: no sound, and nothing from the program but text.
+static std::wstring ToastXml(Pane* p, const std::wstring& head, const std::wstring& text, const std::wstring& from) {
+  std::wstring x = L"<toast launch=\"" + ToastLaunch(p) + L"\" activationType=\"protocol\"><visual><binding template=\"ToastGeneric\"><text>" +
+                   XmlText(head, 120) + L"</text>";
+  if (!text.empty()) x += L"<text>" + XmlText(text, 300) + L"</text>";
+  if (!from.empty()) x += L"<text placement=\"attribution\">" + XmlText(from, 80) + L"</text>";
+  return x + L"</binding></visual><audio silent=\"true\"/></toast>";
+}
+
+static std::wstring ToastTag(Pane* p) { return L"p" + std::to_wstring(p->id); }
+static std::wstring ToastGroup() { return L"w" + std::to_wstring(GetCurrentProcessId()); }
+
+static void NotifyWindows(Pane* p, const std::wstring& title, const std::wstring& body) {
+  if (!ToastsOn()) return;
+  QUERY_USER_NOTIFICATION_STATE qs = (QUERY_USER_NOTIFICATION_STATE)0;  // 0: Windows didn't say
+  if (FAILED(SHQueryUserNotificationState(&qs))) qs = (QUERY_USER_NOTIFICATION_STATE)0;
+  bool accepts = qs == QUNS_ACCEPTS_NOTIFICATIONS;
+  std::wstring label = PaneLabel(p);
+  std::wstring xml = ToastXml(p, title.empty() ? label : title, body.empty() ? p->cwd : body, title.empty() ? L"" : label);
+  if (!g_script.empty()) {  // tests: what would be shown (and whether Windows would take one now), never shown
+    g_toastLog.push_back(L"tag=" + ToastTag(p) + L" group=" + ToastGroup() + L" accepts=" + std::to_wstring((int)qs) + L" " + xml);
+    g_toastLaunch = ToastLaunch(p);
+    return;
+  }
+  if (!accepts || !ToastInit()) return;
+  IToastNotification* n = MakeToast(xml, ToastTag(p), ToastGroup());
+  if (!n) return;
+  // The pane's previous one goes first: replaced in place (same tag), Windows may leave its old text on screen.
+  if (p->toasted && g_toaster.history) g_toaster.history->RemoveGroupedTagWithId(HStr(ToastTag(p)), HStr(ToastGroup()), HStr(kAppId));
+  p->toasted = SUCCEEDED(g_toaster.notifier->Show(n));
+  n->Release();
+}
+
+static void ToastRemove(Pane* p) {
+  p->toasted = false;
+  if (g_toaster.state > 0 && g_toaster.history)
+    g_toaster.history->RemoveGroupedTagWithId(HStr(ToastTag(p)), HStr(ToastGroup()), HStr(kAppId));
+}
+
+// A click on a toast, in the process the protocol started (wWinMain, before anything else): the window it came from
+// goes to its pane and comes to front. With that window gone, the Warp window in front comes forward; with none,
+// nothing. Anything can open the protocol: only its exact form is taken (warp-lite:focus/<window>/<pid>/<pane id>,
+// digits only), and it only ever focuses one of this Warp's own windows.
+static void ToastClicked(const std::wstring& uri) {
+  std::wstring head = std::wstring(kToastScheme) + L":focus/";
+  if (uri.size() > 96 || _wcsnicmp(uri.c_str(), head.c_str(), head.size())) return;
+  unsigned long long v[3] = {0, 0, 0};
+  size_t i = head.size();
+  for (int k = 0; k < 3; k++) {
+    size_t d = i;
+    while (i < uri.size() && uri[i] >= L'0' && uri[i] <= L'9') i++;
+    if (i == d || i - d > 19) return;
+    v[k] = wcstoull(uri.substr(d, i - d).c_str(), nullptr, 10);
+    if (k < 2 && (i >= uri.size() || uri[i++] != L'/')) return;
+  }
+  if (i < uri.size() && uri[i] == L'/') i++;  // a trailing slash, if Windows adds one
+  if (i != uri.size()) return;
+  std::vector<HWND> mine = SiblingWindows();  // no window here: all of this Warp's
+  HWND w = (HWND)(ULONG_PTR)v[0];
+  DWORD owner = 0;
+  if (std::find(mine.begin(), mine.end(), w) != mine.end() && GetWindowThreadProcessId(w, &owner) && owner == v[1]) {
+    AllowSetForegroundWindow(owner);
+    DWORD_PTR r;
+    SendMessageTimeoutW(w, g_msgFocusToast, (WPARAM)v[2], 0, SMTO_ABORTIFHUNG, 2000, &r);
+    BringToFront(w);
+  } else if (!mine.empty()) {
+    BringToFront(mine[0]);
+  }
+}
+
+// A closing window takes its toasts out of the action center: nothing would answer their click.
+static void ToastsForget() {
+  if (g_toaster.state > 0 && g_toaster.history) g_toaster.history->RemoveGroupWithId(HStr(ToastGroup()), HStr(kAppId));
+}
+
+// --script and its steps (edit:, submit...) run only in a test's Warp, with its own session (WARPLITE_SESSION or
+// WARPLITE_DIR): never in the real one, whatever its command line says.
+static bool TestInstance() {
+  return GetEnvironmentVariableW(L"WARPLITE_SESSION", nullptr, 0) || GetEnvironmentVariableW(L"WARPLITE_DIR", nullptr, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Guion de prueba: pasos separados por '|', uno cada ~1,2 s.
 //   type:<texto> enter splitR splitD tab close-pane left right up down swap-<dir> rename:<nombre>
 //   zoom:<%> move:x,y,w,h maximize rename-start rename-type:<texto> shot:<fichero.bmp> wait quit
@@ -6609,7 +7099,9 @@ static bool SaveScreenshot(const std::wstring& path) {
 //   cells join:<hex>,<hex>... brightness font-size (these write to <session>.bench) select:<text> select-to:<text> copy brightness:<RRGGBB>
 //   font-size:<px> link-action:<col>,<row> hover-time:<col>,<row> path-probes path-spans:<row> path-scan-time (these
 //   write to <session>.bench; hover reports paths as "path <full path>")
-//   focus:on|off feed:<tab>:<hex> badge-icon:<n>,<px>,<file.bmp> badges notes taskbar (the last three write to <session>.bench)
+//   focus:on|off feed:<tab>[/<pane>]:<hex> badge-icon:<n>,<px>,<file.bmp> badges notes taskbar (the last three write to <session>.bench)
+//   click-pane:<j> pulse-at:<ms>|off motion:on|off|windows minimize restore toasts:on|off toast-click[:<uri>|+:<text>] attention
+//   where toasts toast-probe toast-click-done (the last five write to <session>.bench) back-sample (too) backshot:<file.bmp>
 //   remote-pair remote-wait remote-close remote-remove:<n> wait-file:<path> remote-ticket remote-state (these two
 //   write to <session>.bench)
 
@@ -7576,9 +8068,10 @@ static void RunScriptStep() {
       SendMessageW(g_hwnd, WM_MOUSEMOVE, MK_LBUTTON, at(q));
     }
     SendMessageW(g_hwnd, WM_LBUTTONUP, 0, at(b));
-  } else if (s.rfind(L"key:", 0) == 0) {  // key:tab|down|up|enter|esc — por el bucle de mensajes, como una tecla
+  } else if (s.rfind(L"key:", 0) == 0) {  // key:tab|down|up|enter|shift|esc — por el bucle de mensajes, como una tecla
     std::wstring k = s.substr(4);
-    WPARAM vk = k == L"tab" ? VK_TAB : k == L"down" ? VK_DOWN : k == L"up" ? VK_UP : k == L"enter" ? VK_RETURN : VK_ESCAPE;
+    WPARAM vk = k == L"tab" ? VK_TAB : k == L"down" ? VK_DOWN : k == L"up" ? VK_UP : k == L"enter" ? VK_RETURN
+              : k == L"shift" ? VK_SHIFT : VK_ESCAPE;
     PostMessageW(g_hwnd, WM_KEYDOWN, vk, 0);
     delay = 600;
   } else if (s == L"edit-text" && p) {
@@ -7681,11 +8174,14 @@ static void RunScriptStep() {
     ScriptLog(r);
   } else if (s.rfind(L"focus:", 0) == 0) {  // focus:on|off — as if the window got or lost the keyboard focus
     SendMessageW(g_hwnd, s.substr(6) == L"on" ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);
-  } else if (s.rfind(L"feed:", 0) == 0) {  // feed:<tab>:<hex> — bytes to that tab's active pane as if its program wrote them
+  } else if (s.rfind(L"feed:", 0) == 0) {  // feed:<tab>[/<pane>]:<hex> — bytes to that pane (or the tab's active one) as if its program wrote them
     int ti = _wtoi(s.c_str() + 5);
-    size_t c = s.find(L':', 5);
+    size_t c = s.find(L':', 5), slash = s.find(L'/', 5);
+    std::vector<Pane*> ls;
+    if (ti >= 0 && ti < (int)g_tabs.size()) Leaves(g_tabs[ti].root, ls);
+    size_t pj = slash < c ? (size_t)_wtoi(s.c_str() + slash + 1) : ls.size();
     if (ti >= 0 && ti < (int)g_tabs.size() && c != std::wstring::npos) {
-      Pane* q = g_tabs[ti].active;
+      Pane* q = pj < ls.size() ? ls[pj] : g_tabs[ti].active;
       std::string bytes = HexDecode(ToUtf8(s.substr(c + 1)));
       EnterCriticalSection(&q->cs);
       vterm_input_write(q->vt, bytes.data(), bytes.size());
@@ -7733,6 +8229,119 @@ static void RunScriptStep() {
       }
       WriteBmp(s.substr(c + 1), v.data(), px, px);
     }
+  } else if (s == L"attention") {  // which panes pulse (tab<i>/pane<j>=1), the pulse timer and whether Windows animates
+    SyncUnread();
+    std::wstring r = L"attention:";
+    for (int i = 0; i < (int)g_tabs.size(); i++) {
+      std::vector<Pane*> ls;
+      Leaves(g_tabs[i].root, ls);
+      for (size_t k = 0; k < ls.size(); k++)
+        r += L" tab" + std::to_wstring(i) + L"/pane" + std::to_wstring(k) + L"=" + (ls[k]->attention ? L"1" : L"0");
+    }
+    ScriptLog(r + L" timer=" + (g_pulseTimer ? L"1" : L"0") + L" motion=" + (Motion() ? L"1" : L"0") + L" back=" +
+              (g_backDC ? L"1" : L"0"));
+  } else if (s == L"where") {  // the pane in view: tab<i>/pane<j>
+    std::vector<Pane*> ls;
+    Leaves(CurTab().root, ls);
+    ScriptLog(L"where: tab" + std::to_wstring(g_activeTab) + L"/pane" +
+              std::to_wstring(std::find(ls.begin(), ls.end(), CurTab().active) - ls.begin()));
+  } else if (s == L"back-sample") {  // the back buffer (what the window shows) at the outline, header (-: none) and tab of the first pane in view with attention
+    std::wstring r = L"back:";
+    std::vector<Pane*> ls;
+    Leaves(CurTab().root, ls);
+    auto at = [](int x, int y) {
+      COLORREF c = g_backDC ? GetPixel(g_backDC, x, y) : CLR_INVALID;
+      wchar_t b[8];
+      swprintf(b, 8, L"%02X%02X%02X", GetRValue(c), GetGValue(c), GetBValue(c));
+      return c == CLR_INVALID ? std::wstring(L"?") : std::wstring(b);
+    };
+    for (Pane* q : ls)
+      if (q->attention && r.size() == 5) {
+        RECT h = HeaderRect(q), side[4];
+        AttentionSides(q, side);
+        r += L" outline=" + at(side[0].left, (side[0].top + side[0].bottom) / 2);
+        r += L" header=" + (h.bottom > h.top ? at(h.left + (h.right - h.left) / 4, side[2].bottom + 1) : std::wstring(L"-"));
+        for (auto& [i, t] : ComputeTabs().tabs)
+          if (i == g_activeTab) r += L" tab=" + at(t.left + Px(4), t.top + Px(3));
+      }
+    ScriptLog(r.size() == 5 ? r + L" (none)" : r);
+    delay = 150;
+  } else if (s.rfind(L"backshot:", 0) == 0) {  // backshot:<file.bmp> — the back buffer as it is (what the window shows)
+    if (g_backDC && g_backBmp) {
+      BITMAPINFO bi{};
+      bi.bmiHeader = {sizeof bi.bmiHeader, g_backW, -g_backH, 1, 32, BI_RGB};
+      std::vector<uint32_t> px((size_t)g_backW * g_backH);
+      GetDIBits(g_backDC, g_backBmp, 0, g_backH, px.data(), &bi, DIB_RGB_COLORS);
+      WriteBmp(s.substr(9), px.data(), g_backW, g_backH);
+    }
+    delay = 100;
+  } else if (s.rfind(L"click-pane:", 0) == 0) {  // click-pane:<j> — a left click in the middle of pane j of the tab in view
+    std::vector<Pane*> ls;
+    Leaves(CurTab().root, ls);
+    size_t j = (size_t)_wtoi(s.c_str() + 11);
+    if (j < ls.size()) {
+      RECT c = ls[j]->content;
+      LPARAM at = MAKELPARAM((c.left + c.right) / 2, (c.top + c.bottom) / 2);
+      SendMessageW(g_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, at);
+      SendMessageW(g_hwnd, WM_LBUTTONUP, 0, at);
+    }
+  } else if (s.rfind(L"pulse-at:", 0) == 0) {  // pulse-at:<ms>|off — the pulse frozen at that point of its breath
+    g_pulseAt = s.substr(9) == L"off" ? -1 : _wtoi(s.c_str() + 9);
+  } else if (s.rfind(L"motion:", 0) == 0) {  // motion:on|off|windows — as if Windows animated or not
+    std::wstring m = s.substr(7);
+    g_motionTest = m == L"on" ? 1 : m == L"off" ? 0 : -1;
+  } else if (s == L"minimize" || s == L"restore") {
+    ShowWindow(g_hwnd, s == L"minimize" ? SW_MINIMIZE : SW_RESTORE);
+  } else if (s.rfind(L"toasts:", 0) == 0) {  // as if toggled in the title-bar menu
+    SetToasts(s.substr(7) == L"on");
+  } else if (s == L"toasts") {  // the toasts asked for since the last «toasts»: tag, group, accepts=<QUNS> and the XML
+    for (auto& t : g_toastLog) ScriptLog(L"toast: " + t);
+    if (g_toastLog.empty()) ScriptLog(L"toast: (none)");
+    g_toastLog.clear();
+  } else if (s == L"toast-probe" && p) {  // the real WinRT calls of a toast, all but Show: what each returned
+    bool init = ToastInit();
+    HRESULT hr[3] = {S_FALSE, S_FALSE, S_FALSE};
+    int setting = -1;
+    HRESULT sh = g_toaster.notifier ? g_toaster.notifier->get_Setting(&setting) : E_POINTER;
+    if (IToastNotification* n = init ? MakeToast(ToastXml(p, L"Warp", L"probe", L""), L"probe", ToastGroup(), hr) : nullptr)
+      n->Release();
+    wchar_t b[400];
+    swprintf(b, 400, L"toast-probe: combase=%d statics=0x%08lX notifier=0x%08lX history=0x%08lX factory=0x%08lX xml=0x%08lX "
+             L"create=0x%08lX tag=0x%08lX setting=0x%08lX/%d",
+             g_toaster.hfree ? 1 : 0, (unsigned long)g_toaster.staticsHr, (unsigned long)g_toaster.notifierHr,
+             (unsigned long)g_toaster.historyHr, (unsigned long)g_toaster.factoryHr, (unsigned long)hr[0], (unsigned long)hr[1],
+             (unsigned long)hr[2], (unsigned long)sh, setting);
+    ScriptLog(b);
+  } else if (s == L"toast-click-done") {  // the process of the last «toast-click»: ended (its exit code) or still running (ended now)
+    DWORD code = 0;
+    bool ended = g_toastProc && WaitForSingleObject(g_toastProc, 0) == WAIT_OBJECT_0 && GetExitCodeProcess(g_toastProc, &code);
+    ScriptLog(L"toast-click: " + (!g_toastProc ? std::wstring(L"none") : ended ? L"ended " + std::to_wstring(code) : L"running"));
+    if (g_toastProc && !ended) TerminateProcess(g_toastProc, 1);
+    if (g_toastProc) CloseHandle(g_toastProc), g_toastProc = nullptr;
+  } else if (s == L"toast-click" || s.rfind(L"toast-click:", 0) == 0 || s.rfind(L"toast-click+:", 0) == 0) {
+    // As Windows does on a click: «Warp.exe --toast "<URI>"», another process. toast-click: the last toast's URI, for
+    // this test's Warp; toast-click+:<text> the same with that text after it (a crafted link that must do nothing);
+    // toast-click:<uri> that text as is, from a clean environment (no test session, APPDATA in <session>.appdata).
+    bool crafted = s.rfind(L"toast-click:", 0) == 0;
+    std::wstring uri = crafted ? s.substr(12) : s.size() > 11 ? g_toastLaunch + s.substr(13) : g_toastLaunch, env;
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --toast \"" + uri + L"\"";
+    if (crafted) {
+      wchar_t* block = GetEnvironmentStringsW();
+      for (wchar_t* v = block; *v; v += wcslen(v) + 1)
+        if (_wcsnicmp(v, L"WARPLITE_", 9) && _wcsnicmp(v, L"APPDATA=", 8) && _wcsnicmp(v, L"LOCALAPPDATA=", 13)) env.append(v), env.push_back(0);
+      FreeEnvironmentStringsW(block);
+      for (const wchar_t* k : {L"APPDATA=", L"LOCALAPPDATA="}) env += k + g_sessionPath + L".appdata", env.push_back(0);
+      env.push_back(0);
+    }
+    if (g_toastProc) CloseHandle(g_toastProc), g_toastProc = nullptr;
+    STARTUPINFOW si{sizeof si};
+    PROCESS_INFORMATION pi{};
+    if (!uri.empty() && CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, crafted ? CREATE_UNICODE_ENVIRONMENT : 0,
+                                       crafted ? (void*)env.data() : nullptr, nullptr, &si, &pi))
+      CloseHandle(pi.hThread), g_toastProc = pi.hProcess;
+    delay = 3000;
   } else if (s.rfind(L"link-menu:", 0) == 0 && p) {  // link-menu:col,row[,n] — the right-click menu there; n runs item n (never «Open»)
     int c = 0, r = 0, n = 0;
     swscanf(s.c_str() + 10, L"%d,%d,%d", &c, &r, &n);
@@ -8062,6 +8671,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_windowDir.empty())
           AppendMenuW(menu, MF_STRING | (g_isMain || g_reopen ? MF_CHECKED : 0) | (g_isMain ? MF_GRAYED : 0), 5, T(S_REOPEN));
         AppendMenuW(menu, MF_STRING | (StartsWithWindows() ? MF_CHECKED : 0), 1, T(S_STARTUP));
+        AppendMenuW(menu, MF_STRING | (ToastsOn() ? MF_CHECKED : 0), 7, T(S_WIN_NOTIFY));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         // Phone: pair one; the paired ones, each item removes that one.
         std::vector<PairedDevice> devs = PairedDevices();
@@ -8099,6 +8709,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           g_reopen = !g_reopen;
           SaveSession();
         }
+        if (cmd == 7) SetToasts(!ToastsOn());  // every window reads it when it has something to say
         if (cmd >= 100 && cmd < 100 + kLangCount) {
           g_lang = cmd - 100;
           SaveSession();
@@ -8210,6 +8821,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, TIMER_FRAME);
         g_frameTimer = false;
         PaintDirty();
+      } else if (wp == TIMER_PULSE) {
+        PulseTick();
       } else if (wp == TIMER_PATHS) {
         KillTimer(hwnd, TIMER_PATHS);
         g_pathTimer = false;
@@ -8304,6 +8917,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (cp >= 0xDC00 && cp < 0xE000 && high) cp = 0x10000 + ((high - 0xD800) << 10) + (cp - 0xDC00);
       high = 0;
       StopReconnect(CurTab().active);  // typing in the pane: the user takes over
+      Attend(CurTab().active);
       if (EditorActive(CurTab().active)) {
         if (msg == WM_CHAR && cp >= 0x20 && cp != 0x7f) {
           std::wstring t;
@@ -8340,6 +8954,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_SYSCOMMAND:
       if ((wp & 0xFFF0) == SC_KEYMENU) return 0;  // Alt no abre el menú de sistema
+      break;
+    case WM_SETTINGCHANGE:  // animations on or off: the attention outline pulses or stays steady
+      g_motion = -1;
+      if (wp == SPI_SETCLIENTAREAANIMATION) InvalidateRect(hwnd, nullptr, FALSE);
       break;
     case WM_MOUSEWHEEL: {
       POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -8432,6 +9050,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
       }
+      Attend(PaneAt(x, y));  // a click anywhere in a pane (header, text, input box) ends its attention pulse
       if (msg == WM_LBUTTONDOWN) {
         bool close;
         if (Pane* p = HeaderAt(x, y, &close)) {
@@ -8658,6 +9277,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       // Se cerraron todas sus pestañas: la ventana se descarta (the main one keeps an empty session,
       // ClosePane). Closed with tabs: only the windows that come back at the next start are kept.
       bool keep = g_isMain || (ReopensAtStart() && (!g_tabs.empty() || g_keepSession));
+      ToastsForget();
       if (!keep && !g_windowDir.empty() && !g_sessionPath.empty()) DeleteFileW(g_sessionPath.c_str());
       std::vector<Pane*> all(g_live.begin(), g_live.end());
       for (Pane* p : all) DestroyPane(p);
@@ -8699,6 +9319,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   }
   if (msg == g_msgFocusPane && g_msgFocusPane) {  // elegida en el selector de otra ventana
     FocusPane((int)wp, (int)lp);
+    return 0;
+  }
+  if (msg == g_msgFocusToast && g_msgFocusToast) {  // one of this window's toasts was clicked (ToastClicked)
+    for (int i = 0; i < (int)g_tabs.size(); i++) {
+      std::vector<Pane*> ls;
+      Leaves(g_tabs[i].root, ls);
+      for (int j = 0; j < (int)ls.size(); j++)
+        if (ls[j]->id == (unsigned)wp) FocusPane(i, j);  // it keeps pulsing until clicked or typed in
+    }
+    BringToFront(hwnd);  // allowed by the process the click started
     return 0;
   }
   if (msg == g_msgFont && g_msgFont) {  // another window changed the font
@@ -8890,6 +9520,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   int argc = 0;
   std::wstring windowArg;
   wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  // A click on one of Warp's toasts (setup.cpp registers its protocol as «Warp.exe --toast "%1"»): exactly that, and
+  // only the URI is read. A line with anything more (a crafted link breaking out of the quotes) does nothing; this
+  // process never opens a window, a session or a script.
+  if (argc >= 2 && !wcscmp(argv[1], L"--toast")) {
+    std::wstring uri = argc == 3 ? argv[2] : L"";
+    LocalFree(argv);
+    g_msgFocusToast = RegisterWindowMessageW(L"warp-lite-focus-toast");
+    ToastClicked(uri);
+    return 0;
+  }
   bool relaunch = false;
   for (int i = 1; i < argc; i++)
     if (!wcscmp(argv[i], L"--relaunch")) {  // tras actualizar: esperar a que se cierren las ventanas viejas (of this Warp)
@@ -8901,6 +9541,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     else if (!wcscmp(argv[i], L"--cd")) g_openDir = argv[++i];
     else if (!wcscmp(argv[i], L"--script")) {
       std::wstring s = argv[++i];
+      if (!TestInstance()) continue;
       size_t pos;
       while ((pos = s.find(L'|')) != std::wstring::npos) g_script.push_back(s.substr(0, pos)), s.erase(0, pos + 1);
       if (!s.empty()) g_script.push_back(s);
@@ -8914,6 +9555,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   g_msgFont = RegisterWindowMessageW(L"warp-lite-font");
   g_msgText = RegisterWindowMessageW(L"warp-lite-brightness");
   g_msgTaskbar = RegisterWindowMessageW(L"TaskbarButtonCreated");
+  g_msgFocusToast = RegisterWindowMessageW(L"warp-lite-focus-toast");
   g_msgRemote = RegisterWindowMessageW(L"warp-lite-remote");
   g_msgRemoteState = RegisterWindowMessageW(L"warp-lite-remote-state");
   if (!g_openDir.empty()) {
@@ -8947,7 +9589,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   g_sessionPath = SessionPath(windowArg, relaunch);
   if (g_sessionPath.empty()) return 0;  // that window is open already
   LoadUpdateSettings();
-  if (g_script.empty() && !windowArg.empty()) {  // pruebas: guion para las ventanas que se abren
+  if (g_script.empty() && !windowArg.empty() && TestInstance()) {  // pruebas: guion para las ventanas que se abren
     wchar_t sc[2048];
     if (GetEnvironmentVariableW(L"WARPLITE_CHILD_SCRIPT", sc, 2048)) {
       std::wstring s = sc;
@@ -8978,6 +9620,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
                                  GetSystemMetrics(SM_CYSMICON), 0);
   wc.lpszClassName = L"WarpLite";
   RegisterClassExW(&wc);
+  // Before the window: the taskbar groups it with the Start menu shortcut, which has the same ID (see «Windows
+  // notifications»).
+  SetCurrentProcessExplicitAppUserModelID(kAppId);
   HWND hwnd = CreateWindowExW(0, L"WarpLite", L"Warp", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                               1280, 760, nullptr, nullptr, inst, nullptr);
   if (!hwnd) return 1;

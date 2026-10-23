@@ -13,6 +13,14 @@ build_here() {
   ZIG=${ZIG:-$(command -v zig || echo /opt/homebrew/bin/zig)}
   T=x86_64-windows-gnu
   mkdir -p build dist
+  # A preview (see the end): its version into this copy of the sources, never into a checkout.
+  if [[ -n "${WARP_LITE_VERSION:-}" && ! -e .git ]]; then
+    V=$WARP_LITE_VERSION
+    [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad WARP_LITE_VERSION: $V" >&2; exit 1; }
+    perl -pi -e "s/kVersion = L\"[0-9.]*\"/kVersion = L\"$V\"/" src/setup.cpp
+    perl -pi -e "s/(FILEVERSION|PRODUCTVERSION) [0-9,]+/\$1 ${V//./,},0/; s/(\"(File|Product)Version\", )\"[0-9.]+\"/\$1\"$V\"/" src/warp-lite.rc
+    echo "preview version $V"
+  fi
   objs=()
   for c in third_party/libvterm/src/*.c; do
     o=build/$(basename "$c" .c).o
@@ -49,8 +57,13 @@ PY
 }
 
 if [[ "${1:-}" == "--local" ]]; then build_here; exit; fi
+# A preview built from here (the release workflow stamps its own version and builds with --local) carries the version
+# of the latest release: the updater only installs a strictly newer one, so an installed preview is not replaced by
+# that release (it was, 0.3.7 < the latest), and the release made once it is merged, a higher version, does replace it.
+VER=$(git ls-remote --tags --refs origin 'v*' 2>/dev/null | sed 's#.*refs/tags/v##' | sort -V | tail -n1 || true)
+[[ -n "$VER" ]] || echo "warning: no release tag found: this build keeps the version in the sources" >&2
 ssh -o BatchMode=yes "$REMOTE" "mkdir -p $RDIR"
 rsync -az --delete --exclude .git --exclude dist --exclude build --exclude target --exclude mobile ./ "$REMOTE:$RDIR/"
-ssh -o BatchMode=yes "$REMOTE" "cd $RDIR && PATH=/opt/homebrew/bin:\$HOME/.cargo/bin:\$PATH bash tools/build.sh --local"
+ssh -o BatchMode=yes "$REMOTE" "cd $RDIR && WARP_LITE_VERSION=$VER PATH=/opt/homebrew/bin:\$HOME/.cargo/bin:\$PATH bash tools/build.sh --local"
 mkdir -p dist
 rsync -az "$REMOTE:$RDIR/dist/warp-lite.exe" "$REMOTE:$RDIR/dist/warp-remote.exe" "$REMOTE:$RDIR/dist/warp-lite-setup.exe" dist/
