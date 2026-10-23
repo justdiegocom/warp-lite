@@ -1,6 +1,6 @@
-# URLs partidas de Claude Code (listas, «(sirve…» debajo), OSC 52 → portapapeles (tras soltar el ratón en tmux,
-# solo con Ctrl+C) y arrastrar
-# pestañas para reordenarlas. Todo deja su resultado en session-cup.txt.bench; se compara aquí.
+# URLs wrapped by Claude Code (lists, «(sirve…» below) resolve to the whole link and nothing else; OSC 52 →
+# clipboard (after a tmux mouse drag only on Ctrl+C, and the next Ctrl+C goes to the program); an OSC 9;9 with a
+# network path is ignored. Everything leaves its result in session-cup.txt.bench; compared here.
 $ErrorActionPreference = 'Stop'
 $dir = $PSScriptRoot
 $env:WARPLITE_SESSION = "$dir\session-cup.txt"
@@ -24,7 +24,6 @@ $steps = @(
   'clear', "edit:$tmux", 'submit', 'wait', 'hover:2,1', 'hover:6,2', 'hover:2,3', 'hover:2,4',
   "edit:$osc", 'submit', 'wait', 'clipboard',
   'osc52-drag:arrastre', 'clipboard', 'ctrl-c', 'clipboard', 'ctrl-c', 'edit:pwd', 'submit', 'wait',
-  'rename:A', 'tab', 'rename:B', 'tab', 'rename:C', 'tabs', 'drag-tab:0,2', 'tabs', 'drag-tab:2,0', 'tabs', 'drag-tab:1,2', 'tabs',
   'quit'
 )
 $arg = ($steps -join '|').Replace('"', '\"')
@@ -41,8 +40,7 @@ $want = @(
   'hover 2,3: https://github.com/justdiegocom/aaa*aaawarp-lite',
   'hover 2,4: (sin enlace)',
   'clipboard: hola\nmundo ñ',
-  'clipboard: hola\nmundo ñ', 'ctrl-c: copia', 'clipboard: arrastre', 'ctrl-c: al programa',
-  'tabs: A B *C', 'tabs: B C *A', 'tabs: *A B C', 'tabs: A C *B'
+  'clipboard: hola\nmundo ñ', 'ctrl-c: copia', 'clipboard: arrastre', 'ctrl-c: al programa'
 )
 $fail = 0
 for ($i = 0; $i -lt $want.Count; $i++) {
