@@ -109,7 +109,7 @@ static const int kGap = 1;           // separación entre paneles (px)
 static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
-enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS, WM_APP_PROMPT, WM_APP_NETCHANGE, WM_APP_NOTE };
+enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS, WM_APP_PROMPT, WM_APP_NETCHANGE, WM_APP_NOTE, WM_APP_OPEN };
 enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6, TIMER_PATHS = 7,
        TIMER_REMOTE = 8, TIMER_PAIR = 9, TIMER_PULSE = 10, TIMER_PHONE = 11, TIMER_JOIN = 12 };
 
@@ -117,6 +117,7 @@ enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TI
 // Modelo: pestañas -> árbol de paneles
 
 struct Pane;
+struct Window;
 
 struct Node {
   Node* parent = nullptr;
@@ -227,8 +228,11 @@ struct Pane {
   std::string noteTitle, noteBody, kittyPending, kittyTitle, kittyBody;
   // UI thread. attention: a counted event the user hasn't clicked or typed in yet (see «Attention»); toasted: its
   // Windows notification may still be in the action center (see «Windows notifications»).
-  unsigned id = 0;  // this process's serial number: a notification's click finds the pane by it
+  unsigned id = 0;  // this process's serial number: a notification's click and a phone find the pane by it
   bool attention = false, toasted = false;
+  Window* win = nullptr;  // the window it is in now (UI thread only: the reader thread posts to g_host)
+  // Reader thread → UI thread: rows to draw again, and its title changed (headers and tabs, at most 4 times a second).
+  std::atomic<bool> repaint{false}, titleChanged{false};
 };
 
 static std::set<Pane*> g_live;
@@ -308,19 +312,19 @@ static std::wstring Tf(Str s, int v) {
   swprintf(b, 128, T(s), v);
   return b;
 }
-// Varias ventanas: un proceso por ventana, cada una con su fichero window-<id>.txt en g_windowDir.
+// Several windows, all in one process (see «One Warp, many windows»), each with its file window-<id>.txt in g_windowDir.
 // The main window (window-main.txt, the first one Warp opens) always comes back at the next start;
 // the others only with «Reopen on restart» (g_reopen) or after an update restart (g_restartAll).
 static std::wstring g_windowDir;
+static std::wstring g_sessionFile;  // WARPLITE_SESSION (tests): the one session file; this Warp's settings go next to it
 static UINT g_msgQuitAll;           // mensaje registrado: «cerrar todas» (wParam 1: update restart, all come back)
 static UINT g_msgListPanes, g_msgFocusPane;  // selector de terminales entre ventanas (Ctrl+Shift+K)
-static UINT g_msgJoinHover, g_msgJoinLeave;  // a tab or pane dragged from another window is over this one / left (see «Join»)
 static UINT g_msgFocusToast;  // one of this window's Windows notifications was clicked (wParam: the pane's id)
 static UINT g_msgRemote, g_msgRemoteState;   // warp-remote → windows: phones / events; windows → it: how many phones
 static int g_remotePhones = 0;               // phones connected now (title-bar indicator, see «Phone»)
 // Las ventanas de un mismo Warp (mismo %APPDATA%\warp-lite, o la misma carpeta en las pruebas) se
 // reconocen por esta marca: así las pruebas nunca tocan las ventanas de verdad.
-static const ULONG_PTR kCopyOpenDir = 0x57434400, kCopyPaneList = 0x574c5300, kCopyJoin = 0x574a4e00;
+static const ULONG_PTR kCopyPaneList = 0x574c5300;
 static const wchar_t* kInstanceProp = L"warp-lite-instance";
 
 // Enlace bajo el ratón con Ctrl pulsado (Ctrl+clic lo abre).
@@ -403,7 +407,7 @@ struct PairCard {
   RECT rc{}, action{}, close{};
 };
 
-// The hint on this window while a tab or pane of another one is over it (g_msgJoinHover): that window, the point of the
+// The hint on this window while a tab or pane of another one is over it (JoinHover): that window, the point of the
 // screen and the mark drawn. TIMER_JOIN runs only while it is shown, in case that window is gone without a word.
 struct JoinHint {
   HWND from = nullptr;
@@ -434,6 +438,7 @@ struct Window {
   bool hasWinPos = false, winMax = false;  // its place and size last time (from its session)
   RECT winRect{};
   std::wstring openDir;  // --cd <folder> («Open Warp here»): a new tab already in it
+  Tab adopt{};           // a tab moved out of another window to this new one (Detach): its first tab
   // Scale and fonts: each window has its own DPI, zoom and font size.
   int dpi = 96, zoom = 100, fontPx = kDefaultFontPx;
   HFONT fonts[4] = {};  // regular, bold, italic, bold italic
@@ -480,9 +485,14 @@ struct Window {
   int backW = 0, backH = 0;
   DWORD lastFrame = 0, lastFull = 0;
   bool frameTimer = false, pulseTimer = false, pathTimer = false;
-  int unreadShown = -1;  // total on its taskbar button (-1: set it again)
-  // Tests: its script (--script), the waits of its steps, a drag, and what its events and toasts did.
+  bool titleDirty = false;  // a pane's title changed: its headers and tabs are drawn again (at most 4 times a second)
+  int unreadShown = -1;     // total on its taskbar button (-1: set it again)
+  bool dead = false;        // destroyed: freed once the message that destroyed it is over (see FreeDeadWindows)
+  // Tests: its name (label: step), its script (--script; childScript: the one for the windows it opens), the waits of
+  // its steps, a drag, and what its events and toasts did.
+  std::wstring label;
   std::vector<std::wstring> script;
+  std::wstring childScript;
   size_t scriptPos = 0;
   int waited = 0;
   POINT scriptDrag{};
@@ -493,8 +503,11 @@ struct Window {
 };
 static Window* g_win;                  // the window being handled
 static std::vector<Window*> g_windows;  // every window of this process
-// Where the reader threads and the workers post what they have: it never goes away while they run.
+// This process's hidden message window (see «One Warp, many windows»): the reader threads and the workers post what
+// they have to it, and it hands each thing to the window it is for on the UI thread, so they never touch a window.
+// It never goes away while they run.
 static HWND g_host;
+static std::vector<Window*> g_dead;  // destroyed windows, freed by the message loop (FreeDeadWindows)
 
 // Handles window w until the end of the scope (WndProc, and whatever acts on another window).
 struct InWindow {
@@ -504,6 +517,27 @@ struct InWindow {
   InWindow(const InWindow&) = delete;
   InWindow& operator=(const InWindow&) = delete;
 };
+static Window* FrontWindow();
+static void InvalidateAll();
+static void CloseWindowState();
+
+// A window to open: its session file (empty: a new one), a folder for a new tab in it (--cd), and in a test's Warp its
+// script and the one for the windows it opens. A tab moved out of another window (Detach): that tab, instead of a
+// session, with that window's scale and tab bar, at that place.
+struct WindowInit {
+  std::wstring file, openDir, script, childScript;
+  int show = SW_SHOWNORMAL;
+  Tab adopt{};
+  const Window* like = nullptr;
+  RECT place{};
+};
+static Window* OpenWindow(const WindowInit& in);
+// The window with that handle, if it is one of this process's and still open.
+static Window* LiveWindow(HWND h) {
+  for (Window* w : g_windows)
+    if (w->hwnd == h && h) return w;
+  return nullptr;
+}
 
 
 static int ScaledDpi() { return MulDiv(g_win->dpi, g_win->zoom, 100); }
@@ -586,7 +620,9 @@ static void BlankCell(VTermScreenCell* c) {
   c->bg.type = VTERM_COLOR_RGB | VTERM_COLOR_DEFAULT_BG;
 }
 
-static void RequestRepaint() {
+// Rows of p changed (any thread): its window draws them soon (OnDirty).
+static void RequestRepaint(Pane* p) {
+  p->repaint = true;
   if (!g_dirtyPosted.exchange(true)) PostMessage(g_host, WM_APP_DIRTY, 0, 0);
 }
 
@@ -625,7 +661,6 @@ static int CbDamage(VTermRect r, void* user) {
   return 1;
 }
 
-static std::atomic<bool> g_titleDirty{false};  // cambió un título: hay que repintar cabeceras y pestañas
 
 // Unread badges, reader thread side: what a program says when it finishes or needs input. It is only posted to the
 // window (WM_APP_NOTE); counting and dedupe happen on the UI thread (OnNote).
@@ -725,7 +760,7 @@ static int CbSetTermProp(VTermProp prop, VTermValue* v, void* user) {
       p->titleBuf.append(v->string.str, v->string.len);
       if (v->string.final) {
         std::wstring t = ToWide(p->titleBuf);
-        if (t != p->title) p->title = t, g_titleDirty = true;
+        if (t != p->title) p->title = t, p->titleChanged = true;
         AgentState(p, p->titleState, TitleState(t));
       }
       break;
@@ -852,6 +887,7 @@ static Pane* NewPane() {
     vterm_state_set_palette_color(st, i, &c);
   }
   vterm_screen_reset(p->scr, 1);
+  p->win = g_win;
   g_live.insert(p);
   return p;
 }
@@ -911,7 +947,7 @@ static DWORD WINAPI ReaderThread(LPVOID arg) {
     if (!p->firstOut) p->firstOut = now;
     p->lastOut = now;
     p->outSeq++;
-    RequestRepaint();
+    RequestRepaint(p);
   }
   return 0;
 }
@@ -987,22 +1023,37 @@ static bool SpawnPane(Pane* p) {
   return true;
 }
 
-static void DestroyPane(Pane* p) {
-  g_live.erase(p);
-  if (g_win->selPane == p) g_win->selPane = nullptr, g_win->hasSel = false;
-  if (g_win->dragPane == p || g_win->dropTarget == p) g_win->dragPane = g_win->dropTarget = nullptr;
-  if (g_win->link.p == p) g_win->link = LinkHit{};
-  if (g_win->find.p == p) g_win->find = FindState{};
-  if (g_win->pick.p == p) g_win->pick = DirPicker{};
-  if (p->wait) UnregisterWaitEx(p->wait, INVALID_HANDLE_VALUE);
-  if (p->hpc) pClosePseudoConsole(p->hpc);
+// A window lets go of a pane that closes or moves to another window: nothing of the window points to it any more.
+static void ForgetPane(Window* w, Pane* p) {
+  if (w->selPane == p) w->selPane = nullptr, w->hasSel = w->selecting = false;
+  if (w->dragPane == p || w->dropTarget == p) w->dragPane = w->dropTarget = nullptr;
+  if (w->link.p == p) w->link = LinkHit{};
+  if (w->find.p == p) w->find = FindState{};
+  if (w->pick.p == p) w->pick = DirPicker{};
+  if (w->comp.p == p) w->comp = CompState{};
+}
+
+// Ends a pane's console and shell: its reader thread then sees the end of its pipe. A window closing does this to all
+// its panes first, so their consoles close together.
+static void StopPane(Pane* p) {
+  if (p->wait) UnregisterWaitEx(p->wait, INVALID_HANDLE_VALUE), p->wait = nullptr;
+  if (p->hpc) pClosePseudoConsole(p->hpc), p->hpc = nullptr;
   if (p->proc) {
     if (WaitForSingleObject(p->proc, 0) == WAIT_TIMEOUT) TerminateProcess(p->proc, 0);
-    CloseHandle(p->proc);
+    CloseHandle(p->proc), p->proc = nullptr;
   }
+}
+
+static void DestroyPane(Pane* p) {
+  g_live.erase(p);
+  if (p->win) ForgetPane(p->win, p);
+  StopPane(p);
   if (p->reader) {
-    WaitForSingleObject(p->reader, 2000);
+    // A reader thread that doesn't end keeps its pane: freeing it under it would bring down the whole process, and
+    // every window with it.
+    bool ended = WaitForSingleObject(p->reader, 2000) == WAIT_OBJECT_0;
     CloseHandle(p->reader);
+    if (!ended) return;
   }
   if (p->inW) CloseHandle(p->inW);
   if (p->outR) CloseHandle(p->outR);
@@ -1096,6 +1147,13 @@ static void Equalize(Node* n) {
   Equalize(n->b);
 }
 
+// Every pane of the window being handled.
+static std::vector<Pane*> WindowPanes() {
+  std::vector<Pane*> ls;
+  for (auto& t : g_win->tabs) Leaves(t.root, ls);
+  return ls;
+}
+
 static Node* RootOf(Node* n) {
   while (n->parent) n = n->parent;
   return n;
@@ -1154,46 +1212,88 @@ static Pane* NewTab(int at = -1, const std::wstring& dir = L"") {
 
 static void SaveEmptyMain();
 
+// Takes leaf n out of its split in tab t: its sibling takes the split's place, and the tab's active pane, if it was
+// n's, becomes one of the panes left. n itself (with its pane) is left on its own.
+static void UnlinkLeaf(Tab& t, Node* n) {
+  Node* par = n->parent;
+  Node* sib = par->a == n ? par->b : par->a;
+  par->pane = sib->pane;
+  par->a = sib->a;
+  par->b = sib->b;
+  par->vertical = sib->vertical;
+  par->ratio = sib->ratio;
+  if (par->pane) par->pane->node = par;
+  if (par->a) par->a->parent = par;
+  if (par->b) par->b->parent = par;
+  delete sib;
+  n->parent = nullptr;
+  if (t.active == n->pane) {
+    std::vector<Pane*> ls;
+    Leaves(par, ls);
+    t.active = ls.front();
+  }
+  Equalize(t.root);
+}
+
+// Tab ti leaves this window (closed, or moved to another one): the active one stays in place or moves back.
+static void EraseTab(int ti) {
+  g_win->tabs.erase(g_win->tabs.begin() + ti);
+  if (g_win->activeTab >= (int)g_win->tabs.size()) g_win->activeTab = std::max(0, (int)g_win->tabs.size() - 1);
+  else if (g_win->activeTab > ti) g_win->activeTab--;
+}
+
+// A window left without tabs closes, and its session is discarded (WM_DESTROY); the main one keeps its place and
+// settings and comes back with a new tab. true if it closed.
+static bool CloseIfEmpty() {
+  if (!g_win->tabs.empty()) return false;
+  if (g_win->isMain && !g_win->keepSession) SaveEmptyMain();
+  DestroyWindow(g_win->hwnd);
+  return true;
+}
+
 static void ClosePane(Pane* p) {
   int ti = TabIndexOf(p);
   if (ti < 0) return;
   Tab& t = g_win->tabs[ti];
   Node* n = p->node;
   if (!n->parent) {
-    g_win->tabs.erase(g_win->tabs.begin() + ti);
+    EraseTab(ti);
     delete n;
     DestroyPane(p);
-    if (g_win->tabs.empty()) {
-      // Último panel cerrado: la ventana se cierra y se descarta su sesión (WM_DESTROY); the main one
-      // keeps its place and settings and comes back with a new tab.
-      if (g_win->isMain && !g_win->keepSession) SaveEmptyMain();
-      DestroyWindow(g_win->hwnd);
-      return;
-    }
-    if (g_win->activeTab >= (int)g_win->tabs.size()) g_win->activeTab = (int)g_win->tabs.size() - 1;
-    else if (g_win->activeTab > ti) g_win->activeTab--;
+    if (CloseIfEmpty()) return;  // Último panel cerrado
   } else {
-    Node* par = n->parent;
-    Node* sib = par->a == n ? par->b : par->a;
-    par->pane = sib->pane;
-    par->a = sib->a;
-    par->b = sib->b;
-    par->vertical = sib->vertical;
-    par->ratio = sib->ratio;
-    if (par->pane) par->pane->node = par;
-    if (par->a) par->a->parent = par;
-    if (par->b) par->b->parent = par;
-    delete sib;
+    UnlinkLeaf(t, n);
     delete n;
-    if (t.active == p) {
-      std::vector<Pane*> ls;
-      Leaves(par, ls);
-      t.active = ls.front();
-    }
-    Equalize(t.root);
     DestroyPane(p);
   }
   Relayout();
+}
+
+static void EndRename(bool commit);
+static void CloseSwitcher();
+
+// Takes a tab, or one pane of a split tab (single), out of this window without ending anything: what runs in it,
+// its scrollback and its state go wherever it is put (PutIn), and this window forgets its panes. The tab is erased
+// (a window left without tabs is the caller's to close: CloseIfEmpty); a pane taken from a split leaves the rest of its
+// tab closing up as when a pane closes.
+static Tab TakeOut(int ti, Pane* single) {
+  Tab& t = g_win->tabs[ti];
+  Tab out;
+  if (single && single->node->parent) {
+    UnlinkLeaf(t, single->node);
+    out = Tab{single->node, single, L"", false};
+  } else {
+    out = t;
+    out.hidden = false;
+    EraseTab(ti);
+  }
+  if (g_win->renameTab >= 0) EndRename(true);  // the tab indexes change
+  if (g_win->sw.open) CloseSwitcher();
+  std::vector<Pane*> moved;
+  Leaves(out.root, moved);
+  for (Pane* p : moved) ForgetPane(g_win, p);
+  Relayout();
+  return out;
 }
 
 // Panel vecino en una dirección (dx,dy), como Ctrl+Alt+flechas en Warp.
@@ -1776,10 +1876,10 @@ static bool LoadSession() {
       g_win->vertTabs = v != 0;
       continue;
     }
-    if (word == "lang") {
+    if (word == "lang") {  // one language for every window: the main one's
       std::string code;
       in >> code;
-      for (int i = 0; i < kLangCount; i++)
+      for (int i = 0; i < kLangCount && g_win->isMain; i++)
         if (code == kLangCodes[i]) g_lang = i;
       continue;
     }
@@ -1937,7 +2037,7 @@ static void SendText(Pane* p, const std::wstring& text) {
 static std::wstring SelectionText();
 
 static void SetClipboardText(const std::wstring& s) {
-  if (s.empty() || !OpenClipboard(g_win->hwnd)) return;
+  if (s.empty() || !OpenClipboard(g_win ? g_win->hwnd : g_host)) return;
   EmptyClipboard();
   HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (s.size() + 1) * sizeof(wchar_t));
   memcpy(GlobalLock(h), s.c_str(), (s.size() + 1) * sizeof(wchar_t));
@@ -2193,7 +2293,7 @@ static void SyncUnread() {
     if (a->toasted) ToastRemove(a);  // read: its Windows notification leaves the action center too
   }
   int total = 0;
-  for (Pane* p : g_live) total += p->unread;
+  for (Pane* p : WindowPanes()) total += p->unread;
   if (total != g_win->unreadShown) g_win->unreadShown = total, SetOverlay(total), changed = true;
   if (changed) InvalidateRect(g_win->hwnd, nullptr, FALSE);
   SyncPulse();
@@ -2327,21 +2427,15 @@ static void HiddenMenu(POINT screen) {
 // ---------------------------------------------------------------------------
 // Varias ventanas
 
+// A new window's file: its id is the time, the process and a serial number (two windows can open in the same tick).
+// With a single session file (tests), next to it.
 static std::wstring NewWindowFile() {
-  wchar_t id[32];
-  swprintf(id, 32, L"%llx%04x", (unsigned long long)GetTickCount64(), (unsigned)(GetCurrentProcessId() & 0xffff));
-  return g_windowDir + L"\\window-" + id + L".txt";
+  static unsigned serial = 0;
+  wchar_t id[48];
+  swprintf(id, 48, L"%llx%04x%02x", (unsigned long long)GetTickCount64(), (unsigned)(GetCurrentProcessId() & 0xffff), ++serial & 0xff);
+  return (g_windowDir.empty() ? g_sessionFile + L"." : g_windowDir + L"\\") + L"window-" + id + L".txt";
 }
 
-static void LaunchWindow(const std::wstring& file) {
-  wchar_t exe[MAX_PATH];
-  GetModuleFileNameW(nullptr, exe, MAX_PATH);
-  std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --window \"" + file + L"\"";
-  STARTUPINFOW si{sizeof si};
-  PROCESS_INFORMATION pi{};
-  if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
-    CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
-}
 
 static BOOL CALLBACK CountOthers(HWND h, LPARAM lp) {
   wchar_t cls[32];
@@ -2367,38 +2461,25 @@ static void QuitAll(bool update) {
   RemoteCommand(L"quit");
 }
 
-// A tab (or one of its panes, single) as a session file writes it: its «tab» line and its panes, each with the command
-// that resumes (Claude Code, Codex) or relaunches (ssh + tmux) what it was running. moved: its panes.
-static std::string TabSession(int tabIdx, Pane* single, std::vector<Pane*>& moved) {
-  Tab& t = g_win->tabs[tabIdx];
-  Node* root = single ? single->node : t.root;
-  Leaves(root, moved);
-  int ai = single ? 0 : (int)(std::find(moved.begin(), moved.end(), t.active) - moved.begin());
-  std::ostringstream o;
-  ComputeResumes();
-  o << "tab " << ai << " " << HexEncode(ToUtf8(single ? L"" : t.name)) << "\n";
-  SaveNode(o, root);
-  return o.str();
-}
-
-// Lleva una pestaña (o un solo panel) a una ventana nueva en el punto de la pantalla donde
-// se suelta: se escribe su sesión, se abre otro warp-lite con ella y aquí se cierra. Lo que
-// estaba en marcha (ssh + tmux) se relanza allí. The new window doesn't reopen at restart; its file
-// says «restart 1» only until it saves, so a Warp starting meanwhile opens it instead of discarding it.
+// Takes a tab (or one pane of a split) to a new window where it is dropped on the screen, of this window's size and
+// scale: it goes on running there as it was (the same shell and what runs in it, its scrollback, what is typed in its
+// box). The new window doesn't reopen at restart.
 static void Detach(int tabIdx, Pane* single, POINT screen) {
   if (tabIdx < 0 || tabIdx >= (int)g_win->tabs.size()) return;
-  std::vector<Pane*> moved;
-  std::string tab = TabSession(tabIdx, single, moved);
   RECT wr;
   GetWindowRect(g_win->hwnd, &wr);
-  int w = wr.right - wr.left, h = wr.bottom - wr.top;
-  RECT win{screen.x - Px(120), screen.y - Px(20), screen.x - Px(120) + w, screen.y - Px(20) + h};
-  std::ostringstream o;
-  o << SessionHeader(0, &win, false) << tab << SessionFlags(false, true);
-  std::wstring file = NewWindowFile();
-  if (!WriteSessionFile(file, o.str())) return;
-  LaunchWindow(file);
-  for (Pane* p : moved) ClosePane(p);
+  WindowInit in;
+  in.like = g_win;
+  in.place = RECT{screen.x - Px(120), screen.y - Px(20), screen.x - Px(120) + (wr.right - wr.left), screen.y - Px(20) + (wr.bottom - wr.top)};
+  in.script = in.childScript = g_win->childScript;
+  in.adopt = TakeOut(tabIdx, single);
+  if (Window* to = OpenWindow(in)) {
+    InWindow iw(to);
+    SaveSession();
+  } else {  // no new window: it stays here, as a tab
+    g_win->tabs.push_back(in.adopt);
+    ActivateTab((int)g_win->tabs.size() - 1);
+  }
   SaveSession();
 }
 
@@ -2775,7 +2856,8 @@ static std::vector<HWND> SiblingWindows() {
       [](HWND h, LPARAM lp) -> BOOL {
         Ctx* c = (Ctx*)lp;
         wchar_t cls[32];
-        if (h != g_win->hwnd && GetClassNameW(h, cls, 32) && !wcscmp(cls, L"WarpLite") && GetPropW(h, kInstanceProp) == c->key)
+        if ((!g_win || h != g_win->hwnd) && GetClassNameW(h, cls, 32) && !wcscmp(cls, L"WarpLite") &&
+            GetPropW(h, kInstanceProp) == c->key)
           c->out.push_back(h);
         return TRUE;
       },
@@ -2871,11 +2953,15 @@ static void OpenSwitcher() {
   g_win->sw = Switcher{};
   g_win->sw.open = true;
   AddPaneList(g_win->hwnd, PaneListText());
-  // Las otras ventanas contestan con WM_COPYDATA mientras se espera aquí.
-  for (HWND h : SiblingWindows()) {
-    DWORD_PTR r;
-    SendMessageTimeoutW(h, g_msgListPanes, (WPARAM)g_win->hwnd, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 500, &r);
-  }
+  for (Window* w : g_windows)  // then the other windows of this Warp
+    if (w != g_win) {
+      std::wstring t;
+      {
+        InWindow in(w);
+        t = PaneListText();
+      }
+      AddPaneList(w->hwnd, t);
+    }
   SwFilter();
   if (g_win->sw.sel >= kPickRows) g_win->sw.top = g_win->sw.sel - kPickRows + 1;
   InvalidateRect(g_win->hwnd, nullptr, FALSE);
@@ -2901,9 +2987,10 @@ static void SwChoose(int i) {
   CloseSwitcher();
   if (it.hwnd == g_win->hwnd) {
     FocusPane(it.tab, it.pane);
-  } else if (IsWindow(it.hwnd)) {
-    PostMessageW(it.hwnd, g_msgFocusPane, it.tab, it.pane);
-    BringToFront(it.hwnd);
+  } else if (Window* w = LiveWindow(it.hwnd)) {
+    InWindow in(w);
+    FocusPane(it.tab, it.pane);
+    BringToFront(w->hwnd);
   }
 }
 
@@ -3006,7 +3093,7 @@ static void LoadShellCommands(Pane* p) {
   }
   p->cmdsLoaded = true;
   p->existsMemo.clear();
-  InvalidateRect(g_win->hwnd, nullptr, FALSE);
+  if (p->win) InvalidateRect(p->win->hwnd, nullptr, FALSE);
 }
 
 // ¿Existe la orden? true/false, o -1 si aún no se puede saber (lista sin cargar).
@@ -3174,6 +3261,7 @@ static void OnNetworkChange() {
     DWORD due = now + 1500 + 700 * k;  // a moment for DHCP and DNS, and not all panes at once
     if (r.state != RC_WAITING || (int)(r.due - due) <= 0) continue;
     r.due = due, k++, last = now;
+    InWindow in(p->win);
     ReconnectLog(L"network changed -> attempt " + std::to_wstring(r.attempt) + L" sooner");
   }
 }
@@ -3262,8 +3350,9 @@ static std::wstring ReconnectState(Pane* p) {
 // ones that connected (still running, and talking to us for a few seconds).
 static void ReconnectTick() {
   DWORD now = GetTickCount();
-  bool repaint = false;
-  for (Pane* p : g_live) {
+  for (Pane* p : std::vector<Pane*>(g_live.begin(), g_live.end())) {
+    if (!g_live.count(p) || !p->win) continue;  // a pane closed by the one before (a reconnect sends a command)
+    InWindow in(p->win);
     Reconnect& r = p->recon;
     if (r.ended && now - r.endedAt >= 400) ClassifyEnd(p);
     if (r.state == RC_WAITING && (int)(now - r.due) >= 0) {
@@ -3278,9 +3367,8 @@ static void ReconnectTick() {
       }
     }
     std::wstring label = ReconnectLabel(p);
-    if (label != r.label) r.label = label, repaint = true;
+    if (label != r.label) r.label = label, InvalidateRect(g_win->hwnd, nullptr, FALSE);
   }
-  if (repaint) InvalidateRect(g_win->hwnd, nullptr, FALSE);
 }
 
 // ---------------------------------------------------------------------------
@@ -4613,7 +4701,7 @@ static void PathScanPane(Pane* p, bool revalidate) {
   p->pathHash = std::move(hash);
   p->pathSpans = std::move(spans);
   LeaveCriticalSection(&p->cs);
-  if (redraw) RequestRepaint();
+  if (redraw) RequestRepaint(p);
 }
 
 // TIMER_PATHS: a pass over the panes on screen whose text changed or that got answers.
@@ -4675,21 +4763,25 @@ static void OnPathChecks(PathChecks* job) {
     g_paths.dirs[key] = std::move(job->lists[i]);
   }
   PathSend();
-  if (changed) {
-    for (Pane* p : g_live)
-      if (p->pathRounds < kPathRounds) p->pathRounds++, p->pathDue = true;
-    ArmPathScan();
-  }
   g_paths.memoTick = 0;
-  POINT pt;
-  if (g_win->tabs.empty() || !(GetKeyState(VK_CONTROL) & 0x8000) || !GetCursorPos(&pt) || !ScreenToClient(g_win->hwnd, &pt))
-    return;
-  Pane* p = PaneAt(pt.x, pt.y);
-  LinkHit h = p ? LinkAt(p, pt.x, pt.y) : LinkHit{};
-  if (h.p != g_win->link.p || h.row != g_win->link.row || h.c0 != g_win->link.c0 || h.path != g_win->link.path)
-    InvalidateRect(g_win->hwnd, nullptr, FALSE);
-  g_win->link = h;
-  if (g_win->link.p) SetCursor(LoadCursor(nullptr, IDC_HAND));
+  for (Window* w : g_windows) {
+    InWindow in(w);
+    if (changed) {
+      for (Pane* p : WindowPanes())
+        if (p->pathRounds < kPathRounds) p->pathRounds++, p->pathDue = true;
+      ArmPathScan();
+    }
+    POINT pt;
+    if (w->tabs.empty() || !(GetKeyState(VK_CONTROL) & 0x8000) || !GetCursorPos(&pt) || WindowFromPoint(pt) != w->hwnd ||
+        !ScreenToClient(w->hwnd, &pt))
+      continue;
+    Pane* p = PaneAt(pt.x, pt.y);
+    LinkHit h = p ? LinkAt(p, pt.x, pt.y) : LinkHit{};
+    if (h.p != w->link.p || h.row != w->link.row || h.c0 != w->link.c0 || h.path != w->link.path)
+      InvalidateRect(w->hwnd, nullptr, FALSE);
+    w->link = h;
+    if (w->link.p) SetCursor(LoadCursor(nullptr, IDC_HAND));
+  }
 }
 
 static int TabWidth() { return Px(200); }
@@ -4775,13 +4867,13 @@ static Pane* HeaderAt(int x, int y, bool* close) {
 }
 
 // ---------------------------------------------------------------------------
-// Join: a tab or pane dragged out of this window and dropped on another window of this Warp moves there, the way Detach
-// moves one to a new window: its layout, folders and what was running travel as session text (TabSession) and are
-// opened again there (ssh + tmux relaunched, Claude Code and Codex resumed), then they close here; the scrollback stays
-// behind, as with Detach. Dropped on that window's tabs (or its tab sidebar) it becomes a new tab there; on one of its
-// panes, a split of that pane on the side nearest the point. While dragging, the window under the cursor draws where it
-// would go (posted messages: it never takes the focus before the drop). A window of another Warp (a test's, or the real
-// one from a test), a minimized one or one covered there by another program is no target: the drop is outside, as before.
+// Join: a tab or pane dragged out of this window and dropped on another window of this Warp moves there as it is, the
+// way Detach moves one to a new window: the same shell and what runs in it (ssh, tmux, Claude Code), its scrollback and
+// what is typed in its box; only its size changes, to its place there. Dropped on that window's tabs (or its tab
+// sidebar) it becomes a new tab there; on one of its panes, a split of that pane on the side nearest the point. While
+// dragging, the window under the cursor draws where it would go (it doesn't take the focus before the drop). A window of
+// another Warp (a test's, or the real one from a test), a minimized one or one covered there by another program is no
+// target: the drop is outside, as before.
 
 enum { SIDE_LEFT, SIDE_RIGHT, SIDE_TOP, SIDE_BOTTOM };
 static const wchar_t* const kSideNames[] = {L"left", L"right", L"top", L"bottom"};
@@ -4847,10 +4939,10 @@ static void JoinHintAt(HWND from, POINT screen) {
   if (!same) InvalidateRect(g_win->hwnd, nullptr, FALSE);
 }
 
-// Another window of this same Warp.
-static bool OfThisWarp(HWND h) {
-  wchar_t cls[32];
-  return h && h != g_win->hwnd && GetClassNameW(h, cls, 32) && !wcscmp(cls, L"WarpLite") && GetPropW(h, kInstanceProp) == InstanceKey();
+// Another window of this Warp (of this process).
+static Window* OtherWindow(HWND h) {
+  Window* w = LiveWindow(h);
+  return w != g_win ? w : nullptr;
 }
 
 // The top-level window in view at that point of the screen. A desktop that takes no input (a service session, where the
@@ -4864,70 +4956,45 @@ static HWND TopWindowAt(POINT screen) {
 // The window of this Warp that a tab or pane dropped at that point of the screen would join: the one in view there (not
 // covered by another program there, not minimized or hidden). Its own WS_VISIBLE: IsWindowVisible also asks the desktop,
 // which that service session's isn't.
-static HWND JoinTargetAt(POINT screen) {
-  HWND h = TopWindowAt(screen);
-  return OfThisWarp(h) && (GetWindowLongW(h, GWL_STYLE) & WS_VISIBLE) && !IsIconic(h) ? h : nullptr;
+static Window* JoinTargetAt(POINT screen) {
+  Window* w = OtherWindow(TopWindowAt(screen));
+  return w && (GetWindowLongW(w->hwnd, GWL_STYLE) & WS_VISIBLE) && !IsIconic(w->hwnd) && !w->tabs.empty() ? w : nullptr;
 }
 
-
+// The window that was showing where what is dragged from this one would go stops showing it.
 static void JoinLeave() {
-  if (g_win->joinOver) PostMessageW(g_win->joinOver, g_msgJoinLeave, (WPARAM)g_win->hwnd, 0);
+  if (Window* o = LiveWindow(g_win->joinOver)) {
+    HWND from = g_win->hwnd;
+    InWindow in(o);
+    if (o->joinHint.from == from) JoinHintClear();
+  }
   g_win->joinOver = nullptr;
 }
 
 // While a tab or pane is dragged: the other window of this Warp in view under the cursor (also over this one's area, if
-// it is in front there) is told where it is, and the one before that it left; returns it. Over this one, or over none
-// of this Warp, none.
-static HWND JoinHover(POINT screen) {
-  HWND to = JoinTargetAt(screen);
-  if (g_win->joinOver != to) JoinLeave();
-  g_win->joinOver = to;
-  if (to) PostMessageW(to, g_msgJoinHover, (WPARAM)g_win->hwnd, MAKELPARAM(screen.x, screen.y));
+// it is in front there) shows where it would go, and the one before stops; returns it. Over this one, or over none of
+// this Warp, none.
+static Window* JoinHover(POINT screen) {
+  Window* to = JoinTargetAt(screen);
+  if (LiveWindow(g_win->joinOver) != to) JoinLeave();
+  if (to) {
+    HWND from = g_win->hwnd;
+    g_win->joinOver = to->hwnd;
+    InWindow in(to);
+    JoinHintAt(from, screen);
+  }
   return to;
 }
 
-// Moves a tab (or a single pane) to that window, dropped at that point of the screen. It answers TRUE once it has opened
-// them, and only then are they closed here; a window left without tabs closes as when its last tab is closed (the main
-// one keeps its place; another one is discarded). Nothing changes if it doesn't answer.
-static bool JoinWindow(HWND to, int tabIdx, Pane* single, POINT screen) {
-  if (tabIdx < 0 || tabIdx >= (int)g_win->tabs.size()) return false;
-  std::vector<Pane*> moved;
-  std::string text = "BWJOIN1 " + std::to_string(screen.x) + " " + std::to_string(screen.y) + "\n" + TabSession(tabIdx, single, moved);
-  COPYDATASTRUCT cd{kCopyJoin, (DWORD)text.size(), (void*)text.data()};
-  DWORD_PTR r = 0;
-  if (!SendMessageTimeoutW(to, WM_COPYDATA, (WPARAM)g_win->hwnd, (LPARAM)&cd, SMTO_ABORTIFHUNG, 5000, &r) || !r) return false;
-  PostMessageW(to, g_msgJoinLeave, (WPARAM)g_win->hwnd, 0);  // behind any hover still queued there
-  BringToFront(to);  // this process is in front: it may hand that over
-  for (Pane* p : moved) ClosePane(p);
-  SaveSession();
-  return true;
-}
-
-// A tab or pane let go of at that point of the screen: over another window of this Warp in view there, it joins it;
-// outside this window, anywhere else, it opens in a new window there (never the only tab: that would just be this
-// window again); over this window, nothing (moving tabs and swapping panes within it is done while dragging).
-static void DropAway(int tabIdx, Pane* single, POINT screen) {
-  if (HWND to = JoinTargetAt(screen)) JoinWindow(to, tabIdx, single, screen);
-  else if (OutsideWindow(screen) && (single || g_win->tabs.size() > 1)) Detach(tabIdx, single, screen);
-}
-
-// A tab or pane dropped on this window by another one of this Warp (JoinWindow): it goes where JoinSpotAt says at the
-// drop point, its panes started as a restored session's are. false (nothing changes) if the text isn't one.
-static bool AcceptJoin(const std::string& text) {
-  std::istringstream in(text);
-  std::string magic, word;
-  POINT at{};
-  if (g_win->tabs.empty() || !(in >> magic >> at.x >> at.y >> word) || magic != "BWJOIN1" || word != "tab") return false;
-  std::vector<Pane*> created;
-  Tab t;
-  if (!LoadTab(in, created, &t)) {
-    for (Pane* p : created) DestroyPane(p);
-    return false;
-  }
+// Puts a tab or pane taken out of another window (TakeOut) where JoinSpotAt says for that point of this window's
+// client area: a new tab, or a split of one of its panes. Its panes are this window's from now on, at their size here.
+static void PutIn(Tab t, POINT at) {
   JoinHintClear();
   if (g_win->renameTab >= 0) EndRename(true);  // the tab indexes are about to change
   if (g_win->sw.open) CloseSwitcher();
-  ScreenToClient(g_win->hwnd, &at);
+  std::vector<Pane*> moved;
+  Leaves(t.root, moved);
+  for (Pane* p : moved) p->win = g_win;
   JoinSpot s = JoinSpotAt(at);
   int ti = s.tab;
   if (s.pane) {  // its place now holds both: the one that was there and, on that side, the one dropped
@@ -4949,9 +5016,31 @@ static bool AcceptJoin(const std::string& text) {
     g_win->tabs.insert(g_win->tabs.begin() + ti, Tab{t.root, t.active, t.name, false});
   }
   ActivateTab(ti);
-  for (Pane* p : created) SpawnPane(p);
-  SaveSession();
+}
+
+// Moves a tab (or a single pane) to that window, dropped at that point of the screen; it comes to front. A window left
+// without tabs closes as when its last tab is closed (the main one keeps its place; another one is discarded).
+static bool JoinWindow(Window* to, int tabIdx, Pane* single, POINT screen) {
+  if (tabIdx < 0 || tabIdx >= (int)g_win->tabs.size()) return false;
+  Tab t = TakeOut(tabIdx, single);
+  {
+    InWindow in(to);
+    POINT at = screen;
+    ScreenToClient(to->hwnd, &at);
+    PutIn(t, at);
+    SaveSession();
+  }
+  BringToFront(to->hwnd);  // this window is in front: it may hand that over
+  if (!CloseIfEmpty()) SaveSession();
   return true;
+}
+
+// A tab or pane let go of at that point of the screen: over another window of this Warp in view there, it joins it;
+// outside this window, anywhere else, it opens in a new window there (never the only tab: that would just be this
+// window again); over this window, nothing (moving tabs and swapping panes within it is done while dragging).
+static void DropAway(int tabIdx, Pane* single, POINT screen) {
+  if (Window* to = JoinTargetAt(screen)) JoinWindow(to, tabIdx, single, screen);
+  else if (OutsideWindow(screen) && (single || g_win->tabs.size() > 1)) Detach(tabIdx, single, screen);
 }
 
 static void MouseToApp(Pane* p, int x, int y, int button, bool pressed) {
@@ -5390,6 +5479,14 @@ static void DwEmojiSetup() {
 // DirectWrite faces of the GDI fonts just made: CreateFontFaceFromHdc also sees the embedded and private
 // fonts, which DirectWrite's system collection doesn't. If one fails, the text stays on GDI.
 static void DwMakeFaces(int em, int ascent) {
+  g_win->dwEm = (float)em, g_win->dwAscent = ascent;
+  // A face is the same at every size: the windows share them, made again only for another font.
+  static std::wstring made;
+  wchar_t face[LF_FACESIZE] = L"";
+  SelectObject(g_measureDC, g_win->fonts[0]);
+  GetTextFaceW(g_measureDC, LF_FACESIZE, face);
+  if (g_dw.on && made == face) return;
+  made.clear();
   for (auto& f : g_dw.faces)
     if (f) f->Release(), f = nullptr;
   for (auto& f : g_dw.fallback)
@@ -5403,8 +5500,8 @@ static void DwMakeFaces(int em, int ascent) {
   };
   for (int i = 0; i < 4; i++) make(g_win->fonts[i], &g_dw.faces[i]);
   for (int i = 0; i < kFallbackCount; i++) make(g_win->fallback[i], &g_dw.fallback[i]);
-  g_win->dwEm = (float)em, g_win->dwAscent = ascent;
   g_dw.on = ok;
+  if (ok) made = face;
   DwEmojiSetup();
 }
 
@@ -5989,7 +6086,7 @@ static void UpdateRunning() {
     exes[pe.th32ProcessID] = pe.szExeFile;
   }
   CloseHandle(snap);
-  bool changed = false;
+  std::set<Window*> changed;  // windows to draw again
   for (Pane* p : g_live) {
     if (!p->pid) continue;
     const std::wstring* exe = nullptr;
@@ -5997,7 +6094,7 @@ static void UpdateRunning() {
       if (c.first == p->pid) exe = &c.second;
     std::wstring want;
     if (exe) want = p->runningCmd.empty() ? (p->submittedCmd.empty() ? *exe : ToWide(p->submittedCmd)) : p->runningCmd;
-    if (want != p->runningCmd) p->runningCmd = want, changed = true;
+    if (want != p->runningCmd) p->runningCmd = want, changed.insert(p->win);
   }
   // Claude Code o Codex, por el nombre de la orden o, si es un atajo (clauded.cmd, una función de
   // PowerShell…), por el proceso: Claude apunta el suyo en sessions\<pid>.json y Codex es codex.exe.
@@ -6024,9 +6121,10 @@ static void UpdateRunning() {
       if (named == AGENT_NONE && agent != AGENT_NONE && LaunchesExe(p->lastCmd)) agent = AGENT_NONE, name.clear();
     }
     p->agent = agent;
-    if (name != p->agentName) p->agentName = name, changed = true;
+    if (name != p->agentName) p->agentName = name, changed.insert(p->win);
   }
-  if (changed) InvalidateRect(g_win->hwnd, nullptr, FALSE);
+  for (Window* w : changed)
+    if (w) InvalidateRect(w->hwnd, nullptr, FALSE);
 }
 
 static void Text(HDC dc, const std::wstring& s, RECT r, COLORREF c, UINT flags) {
@@ -6549,7 +6647,7 @@ static void DrawCompletion(HDC dc) {
 static const ULONG_PTR kCopyRemote = 0x57524d00, kCopyRemoteTicket = 0x57525400;
 
 // Key, allow-list and log of this Warp's warp-remote (a test's next to its session, never the real one).
-static std::wstring RemoteDir() { return g_windowDir.empty() ? g_win->sessionPath + L".remote" : g_windowDir + L"\\remote"; }
+static std::wstring RemoteDir() { return g_windowDir.empty() ? g_sessionFile + L".remote" : g_windowDir + L"\\remote"; }
 
 struct PairedDevice {
   std::wstring id, name;
@@ -6595,14 +6693,14 @@ static bool RemoteCommand(const std::wstring& cmd) {
   if (!h) return false;
   COPYDATASTRUCT cd{kCopyRemote, (DWORD)(cmd.size() * sizeof(wchar_t)), (void*)cmd.data()};
   DWORD_PTR r = 0;
-  return SendMessageTimeoutW(h, WM_COPYDATA, (WPARAM)g_win->hwnd, (LPARAM)&cd, SMTO_ABORTIFHUNG, 2000, &r) && r;
+  return SendMessageTimeoutW(h, WM_COPYDATA, (WPARAM)(g_win ? g_win->hwnd : g_host), (LPARAM)&cd, SMTO_ABORTIFHUNG, 2000, &r) && r;
 }
 
 // Starts this Warp's warp-remote if it isn't running. pair: and asks it for a pairing code for this window
 // (the answer comes as WM_COPYDATA kCopyRemoteTicket).
 static bool StartRemote(bool pair) {
   wchar_t hwnd[40];
-  swprintf(hwnd, 40, L"%llx", (unsigned long long)(ULONG_PTR)g_win->hwnd);
+  swprintf(hwnd, 40, L"%llx", (unsigned long long)(ULONG_PTR)(g_win ? g_win->hwnd : g_host));
   if (RemoteWindow()) return !pair || RemoteCommand(L"pair " + std::wstring(hwnd));
   wchar_t self[MAX_PATH];
   GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -6878,10 +6976,10 @@ static BOOL OnRemotePane(HWND from, const std::wstring& t) {
   return TRUE;
 }
 
-// At start (once, a moment after the window shows): the main window starts warp-remote when a phone is
-// paired; every window asks it how many phones are connected. Nothing at all when none is paired.
+// At start (once, a moment after the first window shows): warp-remote starts when a phone is paired, and says how
+// many phones are connected. Nothing at all when none is paired.
 static void RemoteAtStart() {
-  if (g_win->isMain && !PairedDevices().empty()) StartRemote(false);
+  if (!PairedDevices().empty()) StartRemote(false);
   if (HWND r = RemoteWindow()) {
     DWORD_PTR n = 0;
     if (SendMessageTimeoutW(r, g_msgRemoteState, 0, 0, SMTO_ABORTIFHUNG, 1000, &n)) g_remotePhones = (int)n;
@@ -7069,12 +7167,12 @@ static void PaintDirty() {
   Leaves(CurTab().root, ls);
   bool overlay = g_win->find.open || g_win->pick.open || g_win->sw.open || g_win->comp.open || (g_upd.stage != UPD_NONE && !g_upd.hidden) || g_win->dragPane || g_win->link.p || g_win->renameTab >= 0 || g_win->pair.open || g_win->joinHint.from ||
                  std::any_of(ls.begin(), ls.end(), [](Pane* p) { return p->recon.state != RC_OFF; });
-  if (overlay || (g_titleDirty && now - g_win->lastFull >= 250)) {  // títulos: como mucho 4 veces por segundo
-    g_titleDirty = false;
+  if (overlay || (g_win->titleDirty && now - g_win->lastFull >= 250)) {  // títulos: como mucho 4 veces por segundo
+    g_win->titleDirty = false;
     InvalidateRect(g_win->hwnd, nullptr, FALSE);
     return;
   }
-  if (g_titleDirty && !g_win->frameTimer) SetTimer(g_win->hwnd, TIMER_FRAME, 250, nullptr), g_win->frameTimer = true;
+  if (g_win->titleDirty && !g_win->frameTimer) SetTimer(g_win->hwnd, TIMER_FRAME, 250, nullptr), g_win->frameTimer = true;
   HDC wdc = GetDC(g_win->hwnd);
   for (Pane* p : ls) {
     RECT u = DrawPane(g_win->backDC, p, p == CurTab().active, g_win->focused, true);
@@ -7094,12 +7192,7 @@ static const UINT kPulseFrameMs = 33;
 
 static void SyncPulse() {
   bool want = false;
-  for (Pane* p : g_live)
-    if (p->attention) {
-      want = true;
-      break;
-    }
-  if (want) {
+  if (!g_win->tabs.empty()) {
     std::vector<Pane*> ls;
     Leaves(CurTab().root, ls);
     want = !IsIconic(g_win->hwnd) && Motion() && std::any_of(ls.begin(), ls.end(), [](Pane* p) { return p->attention; });
@@ -7279,9 +7372,9 @@ static bool SaveScreenshot(const std::wstring& path) {
 static const wchar_t* kAppId = L"justdiego.Warp";  // the same in setup.cpp
 static const wchar_t* kToastScheme = L"warp-lite";  // the same in setup.cpp
 
-// notify.txt: «toasts 1». Read each time: every window is its own process, and a toggle in one is for all.
+// notify.txt: «toasts 1». Read each time: a toggle is for every window, and for a Warp that starts later.
 static std::wstring NotifySettingsPath() {
-  return g_windowDir.empty() ? g_win->sessionPath + L".notify" : g_windowDir + L"\\notify.txt";
+  return g_windowDir.empty() ? g_sessionFile + L".notify" : g_windowDir + L"\\notify.txt";
 }
 
 static bool ToastsOn() {
@@ -7519,22 +7612,28 @@ static void ToastClicked(const std::wstring& uri) {
   }
   if (i < uri.size() && uri[i] == L'/') i++;  // a trailing slash, if Windows adds one
   if (i != uri.size()) return;
-  std::vector<HWND> mine = SiblingWindows();  // no window here: all of this Warp's
-  HWND w = (HWND)(ULONG_PTR)v[0];
-  DWORD owner = 0;
-  if (std::find(mine.begin(), mine.end(), w) != mine.end() && GetWindowThreadProcessId(w, &owner) && owner == v[1]) {
-    AllowSetForegroundWindow(owner);
-    DWORD_PTR r;
-    SendMessageTimeoutW(w, g_msgFocusToast, (WPARAM)v[2], 0, SMTO_ABORTIFHUNG, 2000, &r);
-    BringToFront(w);
-  } else if (!mine.empty()) {
-    BringToFront(mine[0]);
-  }
+  // The pane by its id, in whichever window it is now (it may have moved since); a toast of another run of Warp, or
+  // of a pane gone, only brings the window in front forward.
+  for (Window* w : v[1] == GetCurrentProcessId() ? g_windows : std::vector<Window*>{})
+    for (int t = 0; t < (int)w->tabs.size(); t++) {
+      std::vector<Pane*> ls;
+      Leaves(w->tabs[t].root, ls);
+      for (int j = 0; j < (int)ls.size(); j++)
+        if (ls[j]->id == v[2]) {
+          InWindow in(w);
+          FocusPane(t, j);  // it keeps pulsing until clicked or typed in
+          BringToFront(w->hwnd);  // allowed by the process the click started
+          return;
+        }
+    }
+  if (Window* w = FrontWindow()) BringToFront(w->hwnd);
 }
 
 // A closing window takes its toasts out of the action center: nothing would answer their click.
 static void ToastsForget() {
-  if (g_toaster.state > 0 && g_toaster.history) g_toaster.history->RemoveGroupWithId(HStr(ToastGroup()), HStr(kAppId));
+  if (g_toaster.state <= 0 || !g_toaster.history) return;
+  for (Pane* p : WindowPanes())
+    if (p->toasted) ToastRemove(p);
 }
 
 // --script and its steps (edit:, submit...) run only in a test's Warp, with its own session (WARPLITE_SESSION or
@@ -7557,8 +7656,10 @@ static bool TestInstance() {
 //   where toasts toast-probe toast-click-done (the last five write to <session>.bench) back-sample (too) backshot:<file.bmp>
 //   remote-pair remote-wait remote-close remote-remove:<n> wait-file:<path> remote-ticket remote-state (these two
 //   write to <session>.bench)
-//   drag-start:tab:<i>|pane:<j> drag-to:<pid|self|0>,<x>,<y> drag-drop drop-tab:<i>,<pid>,<x>,<y> drop-pane:<j>,<pid>,<x>,<y>
-//   join-hint windows (drag-to, drop-*, join-hint and windows write to <session>.bench)
+//   drag-start:tab:<i>|pane:<j> drag-to:<window>,<x>,<y> drag-drop drop-tab:<i>,<window>,<x>,<y> drop-pane:<j>,<window>,<x>,<y>
+//   (<window>: self, 0 for the screen, the label of a window of this Warp or the pid of another Warp) join-hint windows
+//   label:<name> window-count pids grep:<text> desk-shot:<x>,<y>,<w>,<h>,<file.bmp> (drag-to, drop-*, join-hint, windows,
+//   window-count, pids and grep write to <session>.bench)
 
 static void SetStartWithWindows(bool on);
 
@@ -7617,12 +7718,12 @@ static std::wstring InstalledExe() {
 
 
 static std::wstring UpdateSettingsPath() {
-  return g_windowDir.empty() ? g_win->sessionPath + L".update" : g_windowDir + L"\\update.txt";
+  return g_windowDir.empty() ? g_sessionFile + L".update" : g_windowDir + L"\\update.txt";
 }
 
 // update.log: una línea por intento (para saber por qué falló, si falla).
 static void UpdateLog(const std::wstring& line) {
-  std::wstring path = g_windowDir.empty() ? g_win->sessionPath + L".updlog" : g_windowDir + L"\\update.log";
+  std::wstring path = g_windowDir.empty() ? g_sessionFile + L".updlog" : g_windowDir + L"\\update.log";
   if (FILE* f = _wfopen(path.c_str(), L"a")) {
     SYSTEMTIME t;
     GetLocalTime(&t);
@@ -7777,7 +7878,10 @@ static DWORD WINAPI UpdateCheckThread(LPVOID arg) {
   return 0;
 }
 
+static HWND g_updAsker;  // the window where «Check for updates» was chosen: it says what came of it
+
 static void CheckForUpdates(bool manual) {
+  if (manual && g_win) g_updAsker = g_win->hwnd;
   if (g_upd.checking || g_upd.stage == UPD_INSTALLING) return;
   g_upd.checking = true;
   auto* r = new UpdateReply;
@@ -7785,7 +7889,7 @@ static void CheckForUpdates(bool manual) {
   HANDLE t = CreateThread(nullptr, 0, UpdateCheckThread, r, 0, nullptr);
   if (t) CloseHandle(t);
   else delete r, g_upd.checking = false;
-  if (manual) Toast(T(S_UPD_CHECKING), 3000);
+  if (manual && g_win) Toast(T(S_UPD_CHECKING), 3000);
 }
 
 struct InstallJob {
@@ -7857,18 +7961,22 @@ static void InstallUpdate() {
   g_upd.stage = UPD_INSTALLING;
   g_upd.hidden = false;
   g_updPhase = 0, g_updPct = -1;
-  SetTimer(g_win->hwnd, TIMER_UPDANIM, 50, nullptr);
+  SetTimer(g_host, TIMER_UPDANIM, 50, nullptr);
   UpdateLog(L"instalando " + g_upd.latest + L" desde " + g_upd.running);
   auto* job = new InstallJob{g_upd.latest, g_upd.url, g_upd.sha};
   HANDLE t = CreateThread(nullptr, 0, InstallThread, job, 0, nullptr);
   if (t) CloseHandle(t);
   else delete job, g_upd.stage = UPD_FAILED;
-  InvalidateRect(g_win->hwnd, nullptr, FALSE);
+  InvalidateAll();
 }
 
+// Other Warps (another instance, or one of a version before) learn that an update is installed; this one's windows
+// share g_upd.
 static BOOL CALLBACK SendUpdated(HWND h, LPARAM) {
   wchar_t cls[32];
-  if (h != g_win->hwnd && GetClassNameW(h, cls, 32) && !wcscmp(cls, L"WarpLite")) PostMessageW(h, g_msgUpdated, 0, 0);
+  DWORD pid = 0;
+  if (GetWindowThreadProcessId(h, &pid) && pid != GetCurrentProcessId() && GetClassNameW(h, cls, 32) && !wcscmp(cls, L"WarpLite"))
+    PostMessageW(h, g_msgUpdated, 0, 0);
   return TRUE;
 }
 
@@ -7880,13 +7988,15 @@ static bool UpdateReadyOnDisk() {
 
 static void OnUpdateReply(UpdateReply* r) {
   g_upd.checking = false;
+  Window* asker = r->manual ? LiveWindow(g_updAsker) : nullptr;
+  InWindow in(asker);
   if (!r->ok) {
-    if (r->manual) Toast(T(S_UPD_OFFLINE), 3000);
+    if (asker) Toast(T(S_UPD_OFFLINE), 3000);
     UpdateLog(L"no se pudo comprobar" + std::wstring(r->manual ? L" (a mano)" : L""));
     return;
   }
   if (ParseVersion(r->latest) <= ParseVersion(g_upd.running)) {
-    if (r->manual) Toast(std::wstring(T(S_UPD_LATEST)) + L" (" + g_upd.running + L")", 3000);
+    if (asker) Toast(std::wstring(T(S_UPD_LATEST)) + L" (" + g_upd.running + L")", 3000);
     return;
   }
   bool newer = r->latest != g_upd.latest;
@@ -7895,11 +8005,11 @@ static void OnUpdateReply(UpdateReply* r) {
   if (ParseVersion(ExeVersion(InstalledExe())) >= ParseVersion(r->latest)) g_upd.stage = UPD_READY;
   else if (g_upd.autoUpdate || (r->manual && g_upd.stage == UPD_AVAILABLE)) InstallUpdate();
   else g_upd.stage = UPD_AVAILABLE;
-  InvalidateRect(g_win->hwnd, nullptr, FALSE);
+  InvalidateAll();
 }
 
 static void OnUpdateInstalled(InstallJob* job) {
-  KillTimer(g_win->hwnd, TIMER_UPDANIM);
+  KillTimer(g_host, TIMER_UPDANIM);
   UpdateLog(job->ok ? L"instalada " + job->latest : L"error al instalar " + job->latest + L": " + job->error);
   if (job->ok) {
     g_upd.stage = UPD_READY;
@@ -7910,7 +8020,7 @@ static void OnUpdateInstalled(InstallJob* job) {
     g_upd.stage = ParseVersion(ExeVersion(InstalledExe())) >= ParseVersion(job->latest) ? UPD_READY : UPD_FAILED;
   }
   g_upd.hidden = false;
-  InvalidateRect(g_win->hwnd, nullptr, FALSE);
+  InvalidateAll();
 }
 
 // Reiniciar: se abre el Warp instalado (espera a que se cierren todas) y se cierran todas
@@ -7967,14 +8077,14 @@ static std::set<std::wstring> g_fontFilesLoaded;  // cached files already added 
 // Tests (WARPLITE_SESSION / WARPLITE_DIR) keep their downloads next to their session.
 static std::wstring FontCacheDir() {
   wchar_t buf[MAX_PATH];
-  if (g_windowDir.empty()) return g_win->sessionPath + L".fonts";
+  if (g_windowDir.empty()) return g_sessionFile + L".fonts";
   if (GetEnvironmentVariableW(L"WARPLITE_DIR", buf, MAX_PATH) || !GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH))
     return g_windowDir + L"\\fonts";
   return std::wstring(buf) + L"\\warp-lite\\fonts";
 }
 
 static std::wstring FontSettingsPath() {
-  return g_windowDir.empty() ? g_win->sessionPath + L".font" : g_windowDir + L"\\font.txt";
+  return g_windowDir.empty() ? g_sessionFile + L".font" : g_windowDir + L"\\font.txt";
 }
 
 static std::wstring ReadFontSetting() {
@@ -8078,6 +8188,8 @@ static DWORD WINAPI FontDownloadThread(LPVOID arg) {
   return 0;
 }
 
+static HWND g_fontAsker;  // the window where the font being downloaded was chosen: it says if it fails
+
 static void FontFailed(const std::wstring& face) {
   wchar_t b[160];
   swprintf(b, 160, T(S_FONT_FAILED), face.c_str());
@@ -8109,10 +8221,11 @@ static void StartFontDownload(const FontChoice& c) {
   g_fontError.clear();
   g_fontFiles = std::max(1, (int)job->urls.size());
   g_fontFile = 0, g_fontPct = -1;
+  g_fontAsker = g_win->hwnd;
   HANDLE t = CreateThread(nullptr, 0, FontDownloadThread, job, 0, nullptr);
   if (t) CloseHandle(t);
   else delete job, g_fontLoading.clear(), FontFailed(c.face);
-  InvalidateRect(g_win->hwnd, nullptr, FALSE);
+  InvalidateAll();  // the download's progress is in every window's title bar
 }
 
 // Switches this window to face: new fonts and cell size, and every terminal resized to it.
@@ -8123,25 +8236,29 @@ static void ApplyTerminalFont(const std::wstring& face) {
   Relayout();
 }
 
-// Chosen in this window: applied, saved and announced to the other windows of this Warp.
+// Chosen in a window (g_win, or none): every window of this Warp switches to it, and it is saved. The one where it was
+// chosen says so.
 static void UseFont(const std::wstring& face) {
-  ApplyTerminalFont(face);
+  for (Window* w : g_windows) {
+    InWindow in(w);
+    ApplyTerminalFont(face);
+  }
   SaveFontSetting();
-  for (HWND h : SiblingWindows()) PostMessageW(h, g_msgFont, 0, 0);
-  Toast(face);
+  if (g_win) Toast(face);
 }
 
 static void OnFontDownloaded(FontJob* job) {
   g_fontLoading.clear();
   bool wanted = job->face == g_fontWanted;
   g_fontWanted.clear();
+  InWindow in(LiveWindow(g_fontAsker));
   if (job->ok && LoadFontFiles(job->face)) {
     if (wanted && _wcsicmp(job->face.c_str(), g_fontFace.c_str())) UseFont(job->face);
   } else {
     g_fontError = job->ok ? L"load" : job->error;
-    FontFailed(job->face);  // the current font stays
+    if (g_win) FontFailed(job->face);  // the current font stays
   }
-  InvalidateRect(g_win->hwnd, nullptr, FALSE);
+  InvalidateAll();
 }
 
 // Title-bar menu: an available font applies at once; one from the list is downloaded first.
@@ -8165,7 +8282,7 @@ static void LoadFontSetting() {
 
 // Text brightness, the default terminal foreground: shared by the windows of this Warp like the font, as RRGGBB.
 static std::wstring TextSettingsPath() {
-  return g_windowDir.empty() ? g_win->sessionPath + L".brightness" : g_windowDir + L"\\brightness.txt";
+  return g_windowDir.empty() ? g_sessionFile + L".brightness" : g_windowDir + L"\\brightness.txt";
 }
 
 static bool ReadTextSetting(COLORREF* c) {
@@ -8193,17 +8310,16 @@ static void ApplyTextColor(COLORREF c) {
     p->fullDirty = true;
     LeaveCriticalSection(&p->cs);
   }
-  InvalidateRect(g_win->hwnd, nullptr, FALSE);
+  InvalidateAll();
 }
 
-// Chosen in this window: applied, saved and announced to the other windows of this Warp.
+// Chosen in this window: every window of this Warp takes it, and it is saved.
 static void SetTextBrightness(COLORREF c) {
   ApplyTextColor(c);
   if (FILE* f = _wfopen(TextSettingsPath().c_str(), L"wb")) {
     fprintf(f, "%02X%02X%02X\n", GetRValue(c), GetGValue(c), GetBValue(c));
     fclose(f);
   }
-  for (HWND h : SiblingWindows()) PostMessageW(h, g_msgText, 0, 0);
   wchar_t t[16];
   swprintf(t, 16, L"#%02X%02X%02X", GetRValue(c), GetGValue(c), GetBValue(c));
   Toast(t);
@@ -8335,7 +8451,7 @@ static void ScriptLog(const std::wstring& r) {
 // Tests: a mouse drag made of this window's own mouse messages (drag-start:, drag-to:, drag-drop), so a drop on another
 // window goes through the same code as one by hand. Where the mouse is (client coordinates; outside it while captured).
 
-// The Warp window of that process (of this Warp or not).
+// The Warp window of another process (another Warp).
 static HWND WarpWindowOf(DWORD pid) {
   struct Ctx {
     DWORD pid;
@@ -8352,6 +8468,20 @@ static HWND WarpWindowOf(DWORD pid) {
       },
       (LPARAM)&c);
   return c.h;
+}
+
+// A window of this Warp by its label (label: step; w<n> otherwise).
+static Window* WindowLabeled(const std::wstring& label) {
+  for (Window* w : g_windows)
+    if (w->label == label) return w;
+  return nullptr;
+}
+
+// What a test calls a window: the label of one of this Warp's, the pid of another Warp's, or none.
+static std::wstring WindowName(HWND h) {
+  if (Window* w = LiveWindow(h)) return w->label;
+  DWORD pid = 0;
+  return h && GetWindowThreadProcessId(h, &pid) ? std::to_wstring(pid) : L"none";
 }
 
 // Presses the mouse on that tab (pane: on the header of that pane of the tab in view, which a split tab has).
@@ -8372,17 +8502,12 @@ static bool ScriptDragStart(bool pane, int i) {
   return true;
 }
 
-// Moves the pressed mouse to (x, y) in the client area of the Warp window of process pid (0: of the screen) and logs
-// what is under it there: the window it would join (its pid, or none), the window found there at all, and whether it
-// is outside this one.
-static void ScriptDragTo(DWORD pid, int x, int y) {
+// Moves the pressed mouse to (x, y) in the client area of window `to` (none: of the screen) and logs what is under it
+// there: the window it would join, the window found there at all (labels of this Warp's, pids of others'), and whether
+// it is outside this one.
+static void ScriptDragTo(HWND to, int x, int y) {
   POINT sb{x, y};
-  HWND w = pid ? WarpWindowOf(pid) : nullptr;
-  if (pid && !w) {
-    ScriptLog(L"drag-to: no window of " + std::to_wstring(pid));
-    return;
-  }
-  if (w) ClientToScreen(w, &sb);
+  if (to) ClientToScreen(to, &sb);
   POINT b = sb, a = g_win->scriptDrag;
   ScreenToClient(g_win->hwnd, &b);
   for (int k = 1; k <= 8; k++) {
@@ -8390,68 +8515,128 @@ static void ScriptDragTo(DWORD pid, int x, int y) {
     SendMessageW(g_win->hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(q.x, q.y));
   }
   g_win->scriptDrag = b;
-  HWND to = JoinTargetAt(sb), under = TopWindowAt(sb);
-  DWORD toPid = 0, underPid = 0;
-  if (to) GetWindowThreadProcessId(to, &toPid);
-  if (under) GetWindowThreadProcessId(under, &underPid);
-  ScriptLog(L"drag-to: " + std::to_wstring(sb.x) + L"," + std::to_wstring(sb.y) + L" join=" + (to ? std::to_wstring(toPid) : L"none") +
-            L" under=" + std::to_wstring(underPid) + L" outside=" + (OutsideWindow(sb) ? L"1" : L"0"));
+  Window* join = JoinTargetAt(sb);
+  ScriptLog(L"drag-to: " + std::to_wstring(sb.x) + L"," + std::to_wstring(sb.y) + L" join=" + (join ? join->label : L"none") +
+            L" under=" + WindowName(TopWindowAt(sb)) + L" outside=" + (OutsideWindow(sb) ? L"1" : L"0"));
 }
 
-// «<pid>,<x>,<y>» of a drag step: pid a number, «self» (this window) or 0 (x, y on the screen).
+// «<window>,<x>,<y>» of a drag step: «self» (this window), 0 (x, y on the screen), a number (the pid of another Warp) or
+// the label of one of this Warp's windows.
 static void ScriptDragToText(const wchar_t* s) {
-  DWORD pid = !wcsncmp(s, L"self", 4) ? GetCurrentProcessId() : wcstoul(s, nullptr, 10);
   const wchar_t* c = wcschr(s, L',');
+  std::wstring who(s, c ? c - s : wcslen(s));
   int x = 0, y = 0;
   if (c) swscanf(c + 1, L"%d,%d", &x, &y);
-  ScriptDragTo(pid, x, y);
+  HWND to = nullptr;
+  if (who == L"self") to = g_win->hwnd;
+  else if (who != L"0" && who.find_first_not_of(L"0123456789") == std::wstring::npos) to = WarpWindowOf(wcstoul(who.c_str(), nullptr, 10));
+  else if (Window* w = WindowLabeled(who)) to = w->hwnd;
+  if (who != L"0" && !to) return ScriptLog(L"drag-to: no window " + who);
+  ScriptDragTo(to, x, y);
 }
 
-// Step «windows»: the pane lists of this window and of the others of this Warp (WM_COPYDATA kCopyPaneList).
-static std::vector<std::pair<HWND, std::wstring>>* g_paneLists;
-
-// Every window of this Warp by process, in pid order: «<pid>=[<tab>:<panes>] …», with «:<running>,…» in a tab whose panes
+// The windows of this Warp by label, in order: «<label>=[<tab>:<panes>] …», with «:<running>,…» in a tab whose panes
 // run something.
 static std::wstring WindowsText() {
-  std::vector<std::pair<HWND, std::wstring>> lists{{g_win->hwnd, PaneListText()}};
-  g_paneLists = &lists;
-  for (HWND h : SiblingWindows()) {
-    DWORD_PTR r;
-    SendMessageTimeoutW(h, g_msgListPanes, (WPARAM)g_win->hwnd, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 500, &r);
-  }
-  g_paneLists = nullptr;
-  std::map<DWORD, std::wstring> out;
-  for (auto& [h, text] : lists) {
-    std::vector<std::pair<std::wstring, std::vector<std::wstring>>> tabs;  // name, running of each pane
-    for (size_t a = 0; a < text.size();) {
-      size_t e = text.find(L'\n', a);
-      if (e == std::wstring::npos) e = text.size();
-      std::vector<std::wstring> f;
-      for (size_t b = a; b <= e;) {
-        size_t t = std::min(text.find(L'\t', b), e);
-        f.push_back(text.substr(b, t - b));
-        b = t + 1;
-      }
-      if (f.size() >= 6) {
-        if (f[1] == L"0") tabs.push_back({f[5], {}});
-        if (!tabs.empty()) tabs.back().second.push_back(f[4]);
-      }
-      a = e + 1;
-    }
-    std::wstring w;
-    for (auto& [name, runs] : tabs) {
+  std::map<std::wstring, std::wstring> out;
+  for (Window* w : g_windows) {
+    InWindow in(w);
+    std::wstring t;
+    for (auto& tab : w->tabs) {
+      std::vector<Pane*> ls;
+      Leaves(tab.root, ls);
       std::wstring r;
-      for (auto& x : runs)
-        if (!x.empty()) r += (r.empty() ? L":" : L",") + x;
-      w += L" [" + name + L":" + std::to_wstring(runs.size()) + r + L"]";
+      for (Pane* q : ls)
+        if (!q->runningCmd.empty()) r += (r.empty() ? L":" : L",") + q->runningCmd;
+      t += L" [" + (tab.name.empty() ? ShortTitle(tab.active) : tab.name) + L":" + std::to_wstring(ls.size()) + r + L"]";
     }
-    DWORD pid = 0;
-    GetWindowThreadProcessId(h, &pid);
-    out[pid] = std::to_wstring(pid) + L"=" + (w.empty() ? w : w.substr(1));
+    out[w->label] = w->label + L"=" + (t.empty() ? t : t.substr(1));
   }
   std::wstring r;
-  for (auto& [pid, w] : out) r += (r.empty() ? L"" : L" | ") + w;
+  for (auto& [label, w] : out) r += (r.empty() ? L"" : L" | ") + w;
   return r;
+}
+
+// Every pane of this Warp as «<window label>/<tab name>/<pane>», in order, with f's text for it.
+static std::wstring EachPane(const std::function<std::wstring(Pane*)>& f) {
+  std::map<std::wstring, std::wstring> out;
+  for (Window* w : g_windows) {
+    InWindow in(w);
+    for (auto& tab : w->tabs) {
+      std::vector<Pane*> ls;
+      Leaves(tab.root, ls);
+      for (size_t j = 0; j < ls.size(); j++) {
+        std::wstring v = f(ls[j]);
+        if (!v.empty())
+          out[w->label + L"/" + (tab.name.empty() ? ShortTitle(tab.active) : tab.name) + L"/" + std::to_wstring(j)] = v;
+      }
+    }
+  }
+  std::wstring r;
+  for (auto& [k, v] : out) r += L" " + k + L"=" + v;
+  return r.empty() ? L" (none)" : r;
+}
+
+// The lines of a pane's scrollback and screen that have that text: how many, the first and the last.
+static std::wstring PaneGrep(Pane* p, const std::wstring& text) {
+  EnterCriticalSection(&p->cs);
+  int n = 0;
+  std::wstring first, last;
+  for (int l = 0, total = (int)p->sb.size() + p->rows; l < total; l++) {
+    std::wstring t = AbsLineText(p, l);
+    if (t.find(text) == std::wstring::npos) continue;
+    while (!t.empty() && t.back() == L' ') t.pop_back();
+    if (!n++) first = t;
+    last = t;
+  }
+  LeaveCriticalSection(&p->cs);
+  return n ? std::to_wstring(n) + L"[" + first + L"][" + last + L"]" : L"";
+}
+
+// Tests (desk-shot): this Warp's windows as they are on the screen, the one behind first, over a dark desk, with the
+// mouse where a drag left it: what someone in front of it would see (a test's desktop shows nothing).
+static bool SaveDeskShot(const std::wstring& path, RECT area) {
+  int w = area.right - area.left, h = area.bottom - area.top;
+  if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return false;
+  BITMAPINFO bi{};
+  bi.bmiHeader = {sizeof bi.bmiHeader, w, -h, 1, 32, BI_RGB};
+  void* bits = nullptr;
+  HDC dc = CreateCompatibleDC(nullptr);
+  HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+  if (!bmp) return DeleteDC(dc), false;
+  HGDIOBJ old = SelectObject(dc, bmp);
+  Fill(dc, RECT{0, 0, w, h}, RGB(0x1b, 0x23, 0x2e));
+  std::vector<Window*> order;  // back to front
+  for (HWND x = GetTopWindow(nullptr); x; x = GetWindow(x, GW_HWNDNEXT))
+    if (Window* win = LiveWindow(x)) order.insert(order.begin(), win);
+  for (Window* win : order) {
+    if (IsIconic(win->hwnd) || !(GetWindowLongW(win->hwnd, GWL_STYLE) & WS_VISIBLE)) continue;
+    InWindow in(win);
+    RECT c;
+    GetClientRect(win->hwnd, &c);
+    POINT o{0, 0};
+    ClientToScreen(win->hwnd, &o);
+    int saved = SaveDC(dc);
+    SetViewportOrgEx(dc, o.x - area.left, o.y - area.top, nullptr);
+    IntersectClipRect(dc, 0, 0, c.right, c.bottom);
+    Render(dc, c.right, c.bottom);
+    RestoreDC(dc, saved);
+    HBRUSH b = CreateSolidBrush(RGB(0x3a, 0x3a, 0x3a));
+    RECT fr{o.x - area.left - 1, o.y - area.top - 1, o.x - area.left + c.right + 1, o.y - area.top + c.bottom + 1};
+    FrameRect(dc, &fr, b);
+    DeleteObject(b);
+  }
+  if (g_win && GetCapture() == g_win->hwnd) {  // the mouse of a drag in progress
+    POINT m = g_win->scriptDrag;
+    ClientToScreen(g_win->hwnd, &m);
+    DrawIconEx(dc, m.x - area.left, m.y - area.top, LoadCursor(nullptr, IDC_SIZEALL), 0, 0, 0, nullptr, DI_NORMAL);
+  }
+  GdiFlush();
+  bool ok = WriteBmp(path, bits, w, h);
+  SelectObject(dc, old);
+  DeleteObject(bmp);
+  DeleteDC(dc);
+  return ok;
 }
 
 static void RunScriptStep() {
@@ -8681,6 +8866,23 @@ static void RunScriptStep() {
     ScriptLog(L"join-hint: " + r);
   } else if (s == L"windows") {  // every window of this Warp: see WindowsText
     ScriptLog(L"windows: " + WindowsText());
+  } else if (s.rfind(L"label:", 0) == 0) {  // this window's name in the steps and results of the tests
+    g_win->label = s.substr(6);
+  } else if (s == L"window-count") {  // windows of this Warp open
+    ScriptLog(L"window-count: " + std::to_wstring(g_windows.size()));
+  } else if (s == L"pids") {  // the shell of every pane of this Warp: <window>/<tab>/<pane>=<pid>
+    ScriptLog(L"pids:" + EachPane([](Pane* q) { return std::to_wstring(q->pid); }));
+  } else if (s.rfind(L"grep:", 0) == 0) {  // grep:<text> — the panes with lines that have it: how many, the first and the last
+    std::wstring text = s.substr(5);
+    ScriptLog(L"grep " + text + L":" + EachPane([&](Pane* q) { return PaneGrep(q, text); }));
+  } else if (s.rfind(L"desk-shot:", 0) == 0) {  // desk-shot:<x>,<y>,<w>,<h>,<file.bmp> — that part of the screen (SaveDeskShot)
+    RECT a{};
+    int w = 0, h = 0;
+    swscanf(s.c_str() + 10, L"%ld,%ld,%d,%d", &a.left, &a.top, &w, &h);
+    a.right = a.left + w, a.bottom = a.top + h;
+    size_t c = s.find(L',', s.find(L',', s.find(L',', s.find(L',', 10) + 1) + 1) + 1);
+    if (c != std::wstring::npos) SaveDeskShot(s.substr(c + 1), a);
+    delay = 100;
   } else if (s.rfind(L"key:", 0) == 0) {  // key:tab|down|up|enter|shift|esc — por el bucle de mensajes, como una tecla
     std::wstring k = s.substr(4);
     WPARAM vk = k == L"tab" ? VK_TAB : k == L"down" ? VK_DOWN : k == L"up" ? VK_UP : k == L"enter" ? VK_RETURN
@@ -8812,7 +9014,7 @@ static void RunScriptStep() {
       vterm_screen_flush_damage(q->scr);
       LeaveCriticalSection(&q->cs);
       FlushOut(q);
-      RequestRepaint();
+      RequestRepaint(q);
     }
     delay = 600;
   } else if (s == L"badges") {  // unread per tab ([per pane] when split), window total, in hidden tabs, window in front
@@ -8956,7 +9158,7 @@ static void RunScriptStep() {
       for (wchar_t* v = block; *v; v += wcslen(v) + 1)
         if (_wcsnicmp(v, L"WARPLITE_", 9) && _wcsnicmp(v, L"APPDATA=", 8) && _wcsnicmp(v, L"LOCALAPPDATA=", 13)) env.append(v), env.push_back(0);
       FreeEnvironmentStringsW(block);
-      for (const wchar_t* k : {L"APPDATA=", L"LOCALAPPDATA="}) env += k + g_win->sessionPath + L".appdata", env.push_back(0);
+      for (const wchar_t* k : {L"APPDATA=", L"LOCALAPPDATA="}) env += k + g_sessionFile + L".appdata", env.push_back(0);
       env.push_back(0);
     }
     if (g_win->toastProc) CloseHandle(g_win->toastProc), g_win->toastProc = nullptr;
@@ -9347,10 +9549,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           SaveSession();
         }
         if (cmd == 7) SetToasts(!ToastsOn());  // every window reads it when it has something to say
-        if (cmd >= 100 && cmd < 100 + kLangCount) {
+        if (cmd >= 100 && cmd < 100 + kLangCount) {  // every window
           g_lang = cmd - 100;
-          SaveSession();
-          InvalidateRect(hwnd, nullptr, FALSE);
+          for (Window* w : g_windows) {
+            InWindow in(w);
+            SaveSession();
+          }
+          InvalidateAll();
         }
         if (cmd >= 200 && cmd < 200 + kFontCount) SetTerminalFont(kFonts[cmd - 200].face);
         if (cmd >= 1000 && cmd < 1000 + (int)mono.size()) SetTerminalFont(mono[cmd - 1000]);
@@ -9365,16 +9570,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       break;
     case WM_CREATE: {
       g_win->hwnd = hwnd;
-      if (!g_host) g_host = hwnd;
       ApplyDpi(WindowDpi(hwnd));
       SetPropW(hwnd, kInstanceProp, InstanceKey());
-      if (!LoadSession() && g_win->openDir.empty()) NewTab();
+      if (g_win->adopt.root) {  // a tab moved here (Detach): it goes on running as it was
+        g_win->tabs.push_back(g_win->adopt);
+        g_win->adopt = Tab{};
+        for (Pane* p : WindowPanes()) p->win = g_win;
+      } else if (!LoadSession() && g_win->openDir.empty()) {
+        NewTab();
+      }
       MakeFonts();  // the session may have restored zoom and font size
       if (!g_win->openDir.empty()) NewTab(g_win->tabs.empty() ? -1 : g_win->activeTab + 1, g_win->openDir);
-      SetTimer(hwnd, TIMER_RESTORE, 250, nullptr);
       if (!g_win->script.empty()) SetTimer(hwnd, TIMER_SCRIPT, 3000, nullptr);
-      if (!GetEnvironmentVariableW(L"WARPLITE_NO_UPDATE", nullptr, 0)) SetTimer(hwnd, TIMER_UPDATE, 20000, nullptr);
-      SetTimer(hwnd, TIMER_REMOTE, 1500, nullptr);  // once: warp-remote, if a phone is paired
       return 0;
     }
     case WM_SIZE: Relayout(); return 0;
@@ -9387,73 +9594,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       Relayout();
       return 0;
     }
-    case WM_APP_UPDPROG: InvalidateRect(hwnd, nullptr, FALSE); return 0;
-    case WM_APP_UPDATE: OnUpdateReply(std::unique_ptr<UpdateReply>((UpdateReply*)lp).get()); return 0;
-    case WM_APP_UPDATED: OnUpdateInstalled(std::unique_ptr<InstallJob>((InstallJob*)lp).get()); return 0;
-    case WM_APP_FONT: OnFontDownloaded(std::unique_ptr<FontJob>((FontJob*)lp).get()); return 0;
-    case WM_APP_PATHS: OnPathChecks(std::unique_ptr<PathChecks>((PathChecks*)lp).get()); return 0;
-    case WM_APP_PARAMS: {  // parámetros de una orden, de ParamsThread
-      std::unique_ptr<ParamsReply> r((ParamsReply*)lp);
-      std::wstring low = Lower(r->cmd);
-      g_paramsPending.erase(low);
-      g_params[low] = r->names;
-      if (g_win->comp.open && g_win->comp.loading == low) CompRefresh();
-      return 0;
-    }
-    case WM_APP_CLIP: {  // OSC 52: texto copiado en tmux → portapapeles de Windows (con \r\n)
-      std::unique_ptr<std::wstring> t((std::wstring*)lp);
-      std::wstring w;
-      for (wchar_t c : *t) {
-        if (c == L'\n' && (w.empty() || w.back() != L'\r')) w += L'\r';
-        w += c;
-      }
-      if (g_appMouseUp && GetTickCount() - g_appMouseUp < 2000) g_clipPending = w;  // drag in tmux: until Ctrl+C
-      else SetClipboardText(w);
-      return 0;
-    }
-    case WM_APP_LAYOUT: {
-      Pane* p = (Pane*)lp;
-      if (!g_live.count(p)) return 0;
-      if (wp && !p->restoreCmd.empty()) {  // primer prompt: la última orden queda en la caja
-        p->edit = ToWide(p->restoreCmd);
-        p->caret = p->edit.size();
-        p->restoreCmd.clear();
-        if (p->resumeRun) {  // estaba en marcha al cerrar: se relanza (tmux new -A reengancha)
-          p->resumeRun = false;
-          SubmitEditor(p);
-          p->recon.byWarp = true;  // if the network isn't up yet (Warp starting with Windows), it reconnects
-        } else {
-          p->history.push_back(p->edit);
-        }
-      }
-      Relayout();
-      return 0;
-    }
-    case WM_APP_DIRTY:
-      g_dirtyPosted = false;
-      PathsMaybeChanged();
-      if (GetTickCount() - g_win->lastFrame < 16) {  // como mucho 60 fotogramas por segundo
-        if (!g_win->frameTimer) SetTimer(hwnd, TIMER_FRAME, 16, nullptr), g_win->frameTimer = true;
-      } else {
-        PaintDirty();
-      }
-      return 0;
-    case WM_APP_EXITED: {
-      Pane* p = (Pane*)lp;
-      if (g_live.count(p)) ClosePane(p);
-      return 0;
-    }
-    case WM_APP_PROMPT: {  // a command sent from the box has finished (wp: its exit code)
-      Pane* p = (Pane*)lp;
-      if (g_live.count(p)) CommandEnded(p, (int)(INT_PTR)wp);
-      return 0;
-    }
-    case WM_APP_NOTE: {  // a program has finished or wants an answer (wp: NOTE_*), from the reader thread
-      Pane* p = (Pane*)lp;
-      if (g_live.count(p)) OnNote(p, (int)wp);
-      return 0;
-    }
-    case WM_APP_NETCHANGE: OnNetworkChange(); return 0;
     case WM_TIMER:
       if (wp == TIMER_FRAME) {
         KillTimer(hwnd, TIMER_FRAME);
@@ -9467,14 +9607,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, TIMER_PATHS);
         g_win->pathTimer = false;
         ScanPaths();
-      } else if (wp == TIMER_UPDANIM) {  // barra de «Instalando…» en movimiento
-        if (g_upd.stage == UPD_INSTALLING && !g_upd.hidden) InvalidateRect(hwnd, &g_win->updRc, FALSE);
-      } else if (wp == TIMER_UPDATE) {
-        SetTimer(hwnd, TIMER_UPDATE, 6 * 3600 * 1000, nullptr);
-        CheckForUpdates(false);
-      } else if (wp == TIMER_REMOTE) {
-        KillTimer(hwnd, TIMER_REMOTE);
-        RemoteAtStart();
       } else if (wp == TIMER_PHONE) {  // «Phone typing» goes away
         KillTimer(hwnd, TIMER_PHONE);
         g_win->phoneTyping = false;
@@ -9490,27 +9622,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       } else if (wp == TIMER_SCRIPT) {
         KillTimer(hwnd, TIMER_SCRIPT);
         RunScriptStep();
-      } else if (wp == TIMER_RESTORE) {
-        static int ticks = 0;
-        if (++ticks % 4 == 0) {  // cada segundo
-          UpdateRunning();
-          for (Pane* p : g_live) LoadShellCommands(p);
-        }
-        ReconnectTick();
-        // Escribe la última orden en el prompt cuando la shell ha terminado de arrancar.
-        DWORD now = GetTickCount();
-        for (Pane* p : g_live) {
-          // Shells sin integración (WARPLITE_SHELL): se escribe en su prompt tras arrancar.
-          if (p->restoreCmd.empty() || !p->proc || p->integrated) continue;
-          bool settled = p->firstOut && now - p->lastOut > 400;
-          if (now - p->spawnTick < (settled ? 6000u : 10000u)) continue;
-          EnterCriticalSection(&p->cs);
-          MarkLineStart(p);
-          p->outBuf += p->restoreCmd;  // sin Enter: solo queda escrita
-          p->restoreCmd.clear();
-          LeaveCriticalSection(&p->cs);
-          FlushOut(p);
-        }
       }
       return 0;
     case WM_PAINT: {
@@ -9523,7 +9634,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       BitBlt(dc, 0, 0, rc.right, rc.bottom, g_win->backDC, 0, 0, SRCCOPY);
       EndPaint(hwnd, &ps);
       g_win->lastFrame = g_win->lastFull = GetTickCount();
-      g_titleDirty = false;
+      g_win->titleDirty = false;
       return 0;
     }
     case WM_ERASEBKGND: return 1;
@@ -9783,7 +9894,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_win->tabDrag >= 0) {  // arrastrando una pestaña: sobre otra se cambian de sitio; fuera, a otra ventana
         POINT sp{x, y};
         ClientToScreen(hwnd, &sp);
-        HWND over = JoinHover(sp);  // another window of this Warp in view there: it shows where the tab would go
+        Window* over = JoinHover(sp);  // another window of this Warp in view there: it shows where the tab would go
         int j;
         bool moved = abs(x - g_win->tabDragStart.x) > Px(6) || abs(y - g_win->tabDragStart.y) > Px(6);
         int hit = moved && !over && !OutsideWindow(sp) ? TitleHit(x, y, &j) : HIT_NONE;
@@ -9922,14 +10033,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       DestroyWindow(hwnd);
       return 0;
     case WM_QUERYENDSESSION:
-      g_win->keepSession = true;
-      SaveSession();
+      // Windows shutting down or logging off: every window of this process at once, whichever is asked first (the
+      // process may be ended before the others are).
+      for (Window* w : g_windows) {
+        InWindow in(w);
+        w->keepSession = true;
+        SaveSession();
+      }
       return TRUE;
     case WM_ENDSESSION:
-      // Windows shutting down or logging off, like Ctrl+Shift+Q (the process may end without WM_DESTROY).
-      if (!wp) g_win->keepSession = false;  // cancelled
-      else if (ReopensAtStart()) SaveSession();
-      else if (!g_windowDir.empty() && !g_win->sessionPath.empty()) DeleteFileW(g_win->sessionPath.c_str());
+      // Like Ctrl+Shift+Q (the process may end without WM_DESTROY).
+      for (Window* w : g_windows) {
+        InWindow in(w);
+        if (!wp) w->keepSession = false;  // cancelled
+        else if (ReopensAtStart()) SaveSession();
+        else if (!g_windowDir.empty() && !w->sessionPath.empty()) DeleteFileW(w->sessionPath.c_str());
+      }
       return 0;
     case WM_DESTROY: {
       // Se cerraron todas sus pestañas: la ventana se descarta (the main one keeps an empty session,
@@ -9937,10 +10056,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       bool keep = g_win->isMain || (ReopensAtStart() && (!g_win->tabs.empty() || g_win->keepSession));
       ToastsForget();
       if (!keep && !g_windowDir.empty() && !g_win->sessionPath.empty()) DeleteFileW(g_win->sessionPath.c_str());
-      std::vector<Pane*> all(g_live.begin(), g_live.end());
-      for (Pane* p : all) DestroyPane(p);
-      g_win->tabs.clear();
-      PostQuitMessage(0);
+      CloseWindowState();
       return 0;
     }
   }
@@ -9979,14 +10095,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     FocusPane((int)wp, (int)lp);
     return 0;
   }
-  if (msg == g_msgJoinHover && g_msgJoinHover) {  // a tab or pane dragged from that window is over this one, at that point
-    if (OfThisWarp((HWND)wp) && !IsIconic(hwnd) && !g_win->tabs.empty()) JoinHintAt((HWND)wp, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
-    return 0;
-  }
-  if (msg == g_msgJoinLeave && g_msgJoinLeave) {  // it left, or was dropped
-    if ((HWND)wp == g_win->joinHint.from) JoinHintClear();
-    return 0;
-  }
   if (msg == g_msgFocusToast && g_msgFocusToast) {  // one of this window's toasts was clicked (ToastClicked)
     for (int i = 0; i < (int)g_win->tabs.size(); i++) {
       std::vector<Pane*> ls;
@@ -10011,24 +10119,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   if (msg == WM_COPYDATA) {
     auto* cd = (COPYDATASTRUCT*)lp;
     std::wstring t(cd->lpData ? (const wchar_t*)cd->lpData : L"", cd->cbData / sizeof(wchar_t));
-    if (cd->dwData == kCopyOpenDir) {  // «Abrir Warp aquí» desde el Explorador, con Warp ya abierto
-      DWORD a = GetFileAttributesW(t.c_str());
-      if (!IsLocalDir(t) || a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) return FALSE;
-      OpenDirTab(t);
-      return TRUE;
-    }
-    if (cd->dwData == kCopyJoin) {  // a tab or pane dropped here from another window of this Warp (JoinWindow)
-      if (!OfThisWarp((HWND)wp) || IsIconic(hwnd) || !cd->lpData) return FALSE;
-      return AcceptJoin(std::string((const char*)cd->lpData, cd->cbData)) ? TRUE : FALSE;
-    }
-    if (cd->dwData == kCopyPaneList && g_paneLists) {  // tests: step «windows»
-      g_paneLists->push_back({(HWND)wp, t});
-      return TRUE;
-    }
-    if (cd->dwData == kCopyPaneList && g_win->sw.open) {
-      AddPaneList((HWND)wp, t);
-      return TRUE;
-    }
     if (cd->dwData == kCopyRemoteTicket && (HWND)wp == RemoteWindow()) {  // the pairing code asked for
       OnPairTicket(t);
       return TRUE;
@@ -10066,8 +10156,9 @@ static bool WindowFileOpen(const std::wstring& file, DWORD wait) {
   return false;
 }
 
-// Cada ventana «posee» su fichero mientras está abierta (mutex con el nombre del fichero).
-static bool ClaimWindowFile(const std::wstring& file) {
+// Each window «owns» its file while it is open (a mutex named after the file): an older Warp, one process per window,
+// starting meanwhile leaves it alone, and so does this one with theirs.
+static bool ClaimWindowFile(Window* w, const std::wstring& file) {
   if (HANDLE old = OpenMutexW(SYNCHRONIZE, FALSE, (L"Local\\warp-lite-" + FileName(file)).c_str())) {
     CloseHandle(old);  // open in a window of the version before
     return false;
@@ -10078,7 +10169,7 @@ static bool ClaimWindowFile(const std::wstring& file) {
     CloseHandle(m);
     return false;
   }
-  g_win->fileMutex = m;
+  w->fileMutex = m;
   return true;
 }
 
@@ -10097,18 +10188,21 @@ static bool ReopensFile(const std::wstring& file) {
                                        data.find("\nrestart 1\n") != std::string::npos);
 }
 
-// Sesión de esta ventana. Sin --window: la ventana principal (window-main.txt) y las guardadas que
-// vuelven («Reopen on restart», or all of them after an update restart): this one takes the main one
-// if it's free (otherwise the first free one) and opens the others; the rest are discarded. With all
-// of them open, a new window. relaunch: after an update, the old windows may still be exiting.
-static std::wstring SessionPath(const std::wstring& windowArg, bool relaunch) {
+// Where this Warp keeps its windows: %APPDATA%\warp-lite (WARPLITE_DIR in the tests), or a single session file
+// (WARPLITE_SESSION in the tests, or no %APPDATA%).
+static void FindWindowDir() {
   wchar_t buf[MAX_PATH];
-  g_win->isMain = true;  // a single session file (tests, or no %APPDATA%) is the only window
-  if (GetEnvironmentVariableW(L"WARPLITE_SESSION", buf, MAX_PATH)) return buf;  // pruebas: un fichero fijo
+  if (GetEnvironmentVariableW(L"WARPLITE_SESSION", buf, MAX_PATH)) {
+    g_sessionFile = buf;
+    return;
+  }
   if (GetEnvironmentVariableW(L"WARPLITE_DIR", buf, MAX_PATH)) {
     g_windowDir = buf;
   } else {
-    if (!GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) return L"warp-lite-session.txt";
+    if (!GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) {
+      g_sessionFile = L"warp-lite-session.txt";
+      return;
+    }
     g_windowDir = std::wstring(buf) + L"\\warp-lite";
     // Se llamaba better-warp, y antes había una sola sesión: se convierten en la primera ventana
     // (only into a folder without windows: copied on every start, it came back whenever window-1.txt was gone).
@@ -10124,16 +10218,16 @@ static std::wstring SessionPath(const std::wstring& windowArg, bool relaunch) {
         MoveFileExW(single.c_str(), (g_windowDir + L"\\window-1.txt").c_str(), 0);
     }
   }
-  g_win->isMain = false;
   CreateDirectoryW(g_windowDir.c_str(), nullptr);
-  std::wstring mainFile = g_windowDir + kMainFile;
-  if (!windowArg.empty()) {
-    // Opened by another window (restoring it, or a tab moved out): if a window has it already, nothing to do.
-    if (!ClaimWindowFile(windowArg)) return L"";
-    g_win->isMain = !_wcsicmp(windowArg.c_str(), mainFile.c_str());
-    return windowArg;
-  }
-  // One start at a time (e.g. the shortcut clicked twice): only one of them becomes the main window.
+}
+
+// The saved windows a start opens, the first one being the one the start itself asked for: the main window
+// (window-main.txt) and the others that come back («Reopen on restart», or all of them after an update restart); the
+// rest are discarded. None: a new window (""). relaunch: after an update, the windows of a Warp before this one may
+// still be exiting.
+static std::vector<std::wstring> StartFiles(bool relaunch) {
+  if (g_windowDir.empty()) return {g_sessionFile};
+  // One start at a time (an older Warp may be starting too): only one of them takes the main window.
   HANDLE lock = CreateMutexW(nullptr, FALSE, InstanceMutex(L"start").c_str());
   if (lock) WaitForSingleObject(lock, 15000);
   DWORD until = GetTickCount() + (relaunch ? 5000 : 0);
@@ -10141,7 +10235,8 @@ static std::wstring SessionPath(const std::wstring& windowArg, bool relaunch) {
     DWORD left = until - GetTickCount();
     return WindowFileOpen(f, (int)left > 0 ? left : 0);
   };
-  std::vector<std::wstring> files;
+  std::wstring mainFile = g_windowDir + kMainFile;
+  std::vector<std::wstring> files, out;
   WIN32_FIND_DATAW fd;
   HANDLE h = FindFirstFileW((g_windowDir + L"\\window-*.txt").c_str(), &fd);
   if (h != INVALID_HANDLE_VALUE) {
@@ -10159,28 +10254,362 @@ static std::wstring SessionPath(const std::wstring& windowArg, bool relaunch) {
         files.erase(it);
         break;
       }
-  std::wstring mine;
-  if (!isOpen(mainFile) && ClaimWindowFile(mainFile)) mine = mainFile, g_win->isMain = true;
+  if (!isOpen(mainFile)) out.push_back(mainFile);
   for (auto& file : files) {
-    if (isOpen(file)) continue;  // ya abierta
+    if (isOpen(file)) continue;  // open in an older Warp
     if (!ReopensFile(file)) {
       DeleteFileW(file.c_str());  // still open when Warp quit (or Windows shut down): discarded
       continue;
     }
-    if (mine.empty() && ClaimWindowFile(file)) mine = file;
-    else LaunchWindow(file);
+    out.push_back(file);
   }
-  if (mine.empty()) {
-    mine = NewWindowFile();
-    ClaimWindowFile(mine);
-  }
+  if (out.empty()) out.push_back(L"");
   if (lock) ReleaseMutex(lock), CloseHandle(lock);
-  return mine;
+  return out;
+}
+
+static std::vector<std::wstring> SplitScript(std::wstring s) {
+  std::vector<std::wstring> out;
+  size_t pos;
+  while ((pos = s.find(L'|')) != std::wstring::npos) out.push_back(s.substr(0, pos)), s.erase(0, pos + 1);
+  if (!s.empty()) out.push_back(s);
+  return out;
+}
+
+static Window* OpenWindow(const WindowInit& in) {
+  Window* w = new Window;
+  w->sessionPath = in.file.empty() ? NewWindowFile() : in.file;
+  if (g_windowDir.empty()) {
+    w->isMain = w->sessionPath == g_sessionFile;
+  } else if (!ClaimWindowFile(w, w->sessionPath)) {  // already open (in an older Warp)
+    delete w;
+    return nullptr;
+  } else {
+    w->isMain = !_wcsicmp(w->sessionPath.c_str(), (g_windowDir + kMainFile).c_str());
+  }
+  static unsigned serial = 0;
+  w->label = L"w" + std::to_wstring(++serial);
+  w->openDir = in.openDir;
+  w->adopt = in.adopt;
+  if (in.like) {
+    w->zoom = in.like->zoom, w->fontPx = in.like->fontPx, w->vertTabs = in.like->vertTabs;
+    w->hasWinPos = true, w->winRect = in.place;
+  }
+  if (TestInstance()) w->script = SplitScript(in.script), w->childScript = in.childScript;
+  g_windows.push_back(w);
+  InWindow iw(w);
+  HWND h = CreateWindowExW(0, L"WarpLite", L"Warp", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1280, 760, nullptr,
+                           nullptr, GetModuleHandleW(nullptr), w);
+  if (!h) {
+    g_windows.erase(std::remove(g_windows.begin(), g_windows.end(), w), g_windows.end());
+    if (w->fileMutex) ReleaseMutex(w->fileMutex), CloseHandle(w->fileMutex);
+    delete w;
+    return nullptr;
+  }
+  SetWindowPos(h, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
+  DragAcceptFiles(h, TRUE);  // soltar archivos: se escribe su ruta
+  // Mismo tamaño y estado (maximizada o en ventana) que la última vez, si ese sitio sigue en pantalla.
+  if (w->hasWinPos && MonitorFromRect(&w->winRect, MONITOR_DEFAULTTONULL)) {
+    WINDOWPLACEMENT wp{sizeof wp};
+    wp.rcNormalPosition = w->winRect;
+    wp.showCmd = w->winMax ? SW_SHOWMAXIMIZED : in.show == SW_SHOWNOACTIVATE ? SW_SHOWNOACTIVATE : SW_SHOWNORMAL;
+    if (in.show == SW_SHOWMINNOACTIVE || in.show == SW_SHOWMINIMIZED || in.show == SW_MINIMIZE) wp.showCmd = in.show;
+    SetWindowPlacement(h, &wp);
+  } else {
+    ShowWindow(h, in.show);
+  }
+  UpdateWindow(h);
+  return w;
+}
+
+// The window of this Warp in front (z-order), or none.
+static Window* FrontWindow() {
+  for (HWND h = GetTopWindow(nullptr); h; h = GetWindow(h, GW_HWNDNEXT))
+    for (Window* w : g_windows)
+      if (w->hwnd == h && !w->dead) return w;
+  return g_windows.empty() ? nullptr : g_windows.front();
+}
+
+static void InvalidateAll() {
+  for (Window* w : g_windows) InvalidateRect(w->hwnd, nullptr, FALSE);
+}
+
+// The end of a window (WM_DESTROY): its panes end, their consoles closed together first. It leaves g_windows and is
+// freed by the message loop (FreeDeadWindows): whatever destroyed it may still be using it. The last one ends the
+// process.
+static void CloseWindowState() {
+  std::vector<Pane*> all = WindowPanes();
+  for (Pane* p : all) StopPane(p);
+  for (Pane* p : all) DestroyPane(p);
+  g_win->tabs.clear();
+  if (g_win->fileMutex) ReleaseMutex(g_win->fileMutex), CloseHandle(g_win->fileMutex), g_win->fileMutex = nullptr;
+  g_win->dead = true;
+  g_windows.erase(std::remove(g_windows.begin(), g_windows.end(), g_win), g_windows.end());
+  g_dead.push_back(g_win);
+  if (g_windows.empty()) PostQuitMessage(0);
+}
+
+static void FreeDeadWindows() {
+  if (g_dead.empty()) return;
+  if (g_measureDC) SelectObject(g_measureDC, GetStockObject(SYSTEM_FONT));  // none of their fonts stays selected
+  for (Window* w : g_dead) {
+    for (HFONT f : w->fonts) if (f) DeleteObject(f);
+    for (HFONT f : w->fallback) if (f) DeleteObject(f);
+    for (HFONT f : {w->uiFont, w->badgeFont, w->iconFont}) if (f) DeleteObject(f);
+    if (w->backDC) DeleteDC(w->backDC);
+    if (w->backBmp) DeleteObject(w->backBmp);
+    if (w->toastProc) CloseHandle(w->toastProc);
+    delete w;
+  }
+  g_dead.clear();
+}
+
+// ---------------------------------------------------------------------------
+// One Warp, many windows: every window of a Warp (an instance: %APPDATA%\warp-lite, or a test's own folder or session
+// file) lives in one process, so a tab or pane moves between windows with its shell, its scrollback and what runs in it.
+// The first start takes the instance (a mutex named after it); any later start (the Start menu, «Open Warp here», a
+// notification's click, a test's next window) hands its request to that process's hidden window, g_host, and ends.
+// g_host is also where the reader threads and the workers post (see HostProc).
+
+static const ULONG_PTR kCopyLaunch = 0x574c4e00;  // a start's request: lines «<what>\t<value>» (see OnLaunch)
+static std::wstring g_childEnv;  // tests: this process's WARPLITE_CHILD_SCRIPT
+
+static HWND FindHost() {
+  for (HWND h = nullptr; (h = FindWindowExW(HWND_MESSAGE, h, L"WarpLiteHost", nullptr));)
+    if (GetPropW(h, kInstanceProp) == InstanceKey()) return h;
+  return nullptr;
+}
+
+// A request from another start of this Warp: «toast <URI>» (a notification's click), «cd <folder>» (a new tab in the
+// window in front), «window <file>» (a saved window of this Warp), otherwise a new window; in a test's Warp, «script»
+// and «child» give it its script.
+static BOOL OnLaunch(const std::wstring& req) {
+  std::map<std::wstring, std::wstring> kv;
+  for (size_t a = 0; a < req.size();) {
+    size_t e = req.find(L'\n', a), t = req.find(L'\t', a);
+    if (e == std::wstring::npos) e = req.size();
+    if (t < e) kv[req.substr(a, t - a)] = req.substr(t + 1, e - t - 1);
+    a = e + 1;
+  }
+  if (kv.count(L"toast")) return ToastClicked(kv[L"toast"]), TRUE;
+  WindowInit in;
+  in.script = kv[L"script"], in.childScript = kv[L"child"];
+  std::wstring dir = kv[L"cd"];
+  DWORD a = dir.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(dir.c_str());
+  if (!IsLocalDir(dir) || a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) dir.clear();
+  if (!dir.empty())
+    if (Window* w = FrontWindow()) {  // «Open Warp here» with Warp open: a new tab in its window in front
+      InWindow iw(w);
+      OpenDirTab(dir);
+      return TRUE;
+    }
+  in.openDir = dir;
+  std::wstring file = kv[L"window"];  // only one of this Warp's window files
+  if (!file.empty() && (g_windowDir.empty() || _wcsnicmp(file.c_str(), (g_windowDir + L"\\window-").c_str(), g_windowDir.size() + 8) ||
+                        file.find(L"..") != std::wstring::npos))
+    return FALSE;
+  if (file.empty() && !g_windowDir.empty()) {  // Warp opened again with its main window closed: it comes back, as at a start
+    std::wstring mainFile = g_windowDir + kMainFile;
+    bool open = WindowFileOpen(mainFile, 0);
+    for (Window* w : g_windows) open = open || !_wcsicmp(w->sessionPath.c_str(), mainFile.c_str());
+    if (!open) file = mainFile;
+  } else {
+    for (Window* w : g_windows)
+      if (!_wcsicmp(w->sessionPath.c_str(), file.c_str())) return TRUE;  // open already
+  }
+  in.file = file;
+  return OpenWindow(in) ? TRUE : FALSE;
+}
+
+// Paints the panes whose program wrote something (WM_APP_DIRTY): in each window, at most 60 frames a second.
+static void OnDirty() {
+  g_dirtyPosted = false;
+  for (Window* w : g_windows) {
+    InWindow in(w);
+    bool any = false;
+    for (Pane* p : WindowPanes()) {
+      any = p->repaint.exchange(false) || any;
+      if (p->titleChanged.exchange(false)) w->titleDirty = any = true;
+    }
+    if (!any) continue;
+    PathsMaybeChanged();
+    if (GetTickCount() - w->lastFrame < 16) {  // como mucho 60 fotogramas por segundo
+      if (!w->frameTimer) SetTimer(w->hwnd, TIMER_FRAME, 16, nullptr), w->frameTimer = true;
+    } else {
+      PaintDirty();
+    }
+  }
+}
+
+// Every 250 ms: what each pane runs (every second), the reconnect loops, and the last command written at the prompt of
+// a shell without integration once it has started.
+static void OnRestoreTick() {
+  static int ticks = 0;
+  if (++ticks % 4 == 0) {  // cada segundo
+    UpdateRunning();
+    for (Pane* p : g_live) LoadShellCommands(p);
+  }
+  ReconnectTick();
+  // Escribe la última orden en el prompt cuando la shell ha terminado de arrancar.
+  DWORD now = GetTickCount();
+  for (Pane* p : g_live) {
+    // Shells sin integración (WARPLITE_SHELL): se escribe en su prompt tras arrancar.
+    if (p->restoreCmd.empty() || !p->proc || p->integrated) continue;
+    bool settled = p->firstOut && now - p->lastOut > 400;
+    if (now - p->spawnTick < (settled ? 6000u : 10000u)) continue;
+    EnterCriticalSection(&p->cs);
+    MarkLineStart(p);
+    p->outBuf += p->restoreCmd;  // sin Enter: solo queda escrita
+    p->restoreCmd.clear();
+    LeaveCriticalSection(&p->cs);
+    FlushOut(p);
+  }
+}
+
+// The window a pane is in, if it is still open (for what the reader threads post about it).
+static Window* PaneWindow(LPARAM lp) {
+  Pane* p = (Pane*)lp;
+  return g_live.count(p) && p->win && !p->win->dead ? p->win : nullptr;
+}
+
+static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  InWindow none(nullptr);  // no window until a handler picks one (a menu's modal loop may have one set)
+  switch (msg) {
+    case WM_APP_DIRTY: OnDirty(); return 0;
+    case WM_APP_UPDPROG:
+      for (Window* w : g_windows) InvalidateRect(w->hwnd, &w->updRc, FALSE);
+      return 0;
+    case WM_APP_UPDATE: OnUpdateReply(std::unique_ptr<UpdateReply>((UpdateReply*)lp).get()); return 0;
+    case WM_APP_UPDATED: OnUpdateInstalled(std::unique_ptr<InstallJob>((InstallJob*)lp).get()); return 0;
+    case WM_APP_FONT: OnFontDownloaded(std::unique_ptr<FontJob>((FontJob*)lp).get()); return 0;
+    case WM_APP_PATHS: OnPathChecks(std::unique_ptr<PathChecks>((PathChecks*)lp).get()); return 0;
+    case WM_APP_PARAMS: {  // parámetros de una orden, de ParamsThread
+      std::unique_ptr<ParamsReply> r((ParamsReply*)lp);
+      std::wstring low = Lower(r->cmd);
+      g_paramsPending.erase(low);
+      g_params[low] = r->names;
+      for (Window* w : g_windows)
+        if (w->comp.open && w->comp.loading == low) {
+          InWindow in(w);
+          CompRefresh();
+        }
+      return 0;
+    }
+    case WM_APP_CLIP: {  // OSC 52: texto copiado en tmux → portapapeles de Windows (con \r\n)
+      std::unique_ptr<std::wstring> t((std::wstring*)lp);
+      std::wstring w;
+      for (wchar_t c : *t) {
+        if (c == L'\n' && (w.empty() || w.back() != L'\r')) w += L'\r';
+        w += c;
+      }
+      if (g_appMouseUp && GetTickCount() - g_appMouseUp < 2000) g_clipPending = w;  // drag in tmux: until Ctrl+C
+      else SetClipboardText(w);
+      return 0;
+    }
+    case WM_APP_LAYOUT:
+      if (Window* w = PaneWindow(lp)) {
+        InWindow in(w);
+        Pane* p = (Pane*)lp;
+        if (wp && !p->restoreCmd.empty()) {  // primer prompt: la última orden queda en la caja
+          p->edit = ToWide(p->restoreCmd);
+          p->caret = p->edit.size();
+          p->restoreCmd.clear();
+          if (p->resumeRun) {  // estaba en marcha al cerrar: se relanza (tmux new -A reengancha)
+            p->resumeRun = false;
+            SubmitEditor(p);
+            p->recon.byWarp = true;  // if the network isn't up yet (Warp starting with Windows), it reconnects
+          } else {
+            p->history.push_back(p->edit);
+          }
+        }
+        Relayout();
+      }
+      return 0;
+    case WM_APP_EXITED:  // its shell ended
+      if (Window* w = PaneWindow(lp)) {
+        InWindow in(w);
+        ClosePane((Pane*)lp);
+      }
+      return 0;
+    case WM_APP_PROMPT:  // a command sent from the box has finished (wp: its exit code)
+      if (Window* w = PaneWindow(lp)) {
+        InWindow in(w);
+        CommandEnded((Pane*)lp, (int)(INT_PTR)wp);
+      }
+      return 0;
+    case WM_APP_NOTE:  // a program has finished or wants an answer (wp: NOTE_*), from the reader thread
+      if (Window* w = PaneWindow(lp)) {
+        InWindow in(w);
+        OnNote((Pane*)lp, (int)wp);
+      }
+      return 0;
+    case WM_APP_NETCHANGE: OnNetworkChange(); return 0;
+    case WM_APP_OPEN: {  // the other windows of this start (posted: the first one is on screen first)
+      std::unique_ptr<std::vector<WindowInit>> list((std::vector<WindowInit>*)lp);
+      for (auto& in : *list) OpenWindow(in);
+      return 0;
+    }
+    case WM_TIMER:
+      if (wp == TIMER_RESTORE) {
+        OnRestoreTick();
+      } else if (wp == TIMER_UPDANIM) {  // barra de «Instalando…» en movimiento
+        if (g_upd.stage == UPD_INSTALLING && !g_upd.hidden)
+          for (Window* w : g_windows) InvalidateRect(w->hwnd, &w->updRc, FALSE);
+      } else if (wp == TIMER_UPDATE) {
+        SetTimer(hwnd, TIMER_UPDATE, 6 * 3600 * 1000, nullptr);
+        CheckForUpdates(false);
+      } else if (wp == TIMER_REMOTE) {
+        KillTimer(hwnd, TIMER_REMOTE);
+        RemoteAtStart();
+      }
+      return 0;
+    case WM_COPYDATA: {
+      auto* cd = (COPYDATASTRUCT*)lp;
+      if (cd->dwData != kCopyLaunch || !cd->lpData) return FALSE;
+      return OnLaunch(std::wstring((const wchar_t*)cd->lpData, cd->cbData / sizeof(wchar_t)));
+    }
+  }
+  return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Before the window handles them: the keys of what is open over its panes, and Warp's shortcuts.
+static bool PreTranslate(Window* w, MSG& m) {
+  InWindow in(w);
+  bool keyDown = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN;
+  if (g_win->pair.open && m.message == WM_KEYDOWN) {  // pairing card: Esc closes, Enter or Ctrl+C is its button; nothing reaches the terminal
+    bool ctrl = GetKeyState(VK_CONTROL) & 0x8000;
+    if (m.wParam == VK_ESCAPE) ClosePairCard();
+    else if (m.wParam == VK_RETURN || (ctrl && m.wParam == 'C')) PairAction();
+    return true;
+  }
+  if (g_win->sw.open && keyDown) {
+    if (!SwKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
+    return true;
+  }
+  if (g_win->pick.open && keyDown) {
+    if (!PickKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
+    return true;
+  }
+  if (g_win->comp.open && keyDown) {
+    if (g_win->tabs.empty() || g_win->comp.p != CurTab().active || !EditorActive(g_win->comp.p)) CompClose();
+    else if (CompKey(m.wParam)) return true;
+  }
+  if (g_win->find.open && keyDown && g_win->renameTab < 0) {
+    if (!FindKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
+    return true;
+  }
+  if (g_win->renameTab >= 0 && keyDown) {
+    if (!RenameKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
+    return true;
+  }
+  if (keyDown && m.hwnd == g_win->hwnd && HandleKeyDown(m.wParam, m.lParam)) {
+    InvalidateRect(g_win->hwnd, nullptr, FALSE);
+    return true;
+  }
+  return false;
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
-  g_win = new Window;
-  g_windows.push_back(g_win);
   HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
   pCreatePseudoConsole = (PFN_CreatePseudoConsole)GetProcAddress(k32, "CreatePseudoConsole");
   pResizePseudoConsole = (PFN_ResizePseudoConsole)GetProcAddress(k32, "ResizePseudoConsole");
@@ -10194,69 +10623,93 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     fn((HANDLE)-4);  // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 
   int argc = 0;
-  std::wstring windowArg;
+  std::wstring windowArg, openDir, script;
   wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   // A click on one of Warp's toasts (setup.cpp registers its protocol as «Warp.exe --toast "%1"»): exactly that, and
-  // only the URI is read. A line with anything more (a crafted link breaking out of the quotes) does nothing; this
-  // process never opens a window, a session or a script.
+  // only the URI is read, then handed to the running Warp (ToastClicked). A line with anything more (a crafted link
+  // breaking out of the quotes) does nothing; this process never opens a window, a session or a script.
   if (argc >= 2 && !wcscmp(argv[1], L"--toast")) {
     std::wstring uri = argc == 3 ? argv[2] : L"";
     LocalFree(argv);
-    g_msgFocusToast = RegisterWindowMessageW(L"warp-lite-focus-toast");
-    ToastClicked(uri);
+    HWND host = uri.empty() || uri.size() > 96 ? nullptr : FindHost();
+    if (host) {
+      DWORD pid = 0;
+      GetWindowThreadProcessId(host, &pid);
+      AllowSetForegroundWindow(pid);
+      std::wstring req = L"toast\t" + uri;
+      COPYDATASTRUCT cd{kCopyLaunch, (DWORD)(req.size() * sizeof(wchar_t)), (void*)req.data()};
+      DWORD_PTR r = 0;
+      SendMessageTimeoutW(host, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 5000, &r);
+    }
     return 0;
   }
   bool relaunch = false;
   for (int i = 1; i < argc; i++)
-    if (!wcscmp(argv[i], L"--relaunch")) {  // tras actualizar: esperar a que se cierren las ventanas viejas (of this Warp)
-      relaunch = true;
-      for (int t = 0; t < 200 && !SiblingWindows().empty(); t++) Sleep(100);
-    }
+    if (!wcscmp(argv[i], L"--relaunch")) relaunch = true;  // after an update: the Warp before this one is closing
   for (int i = 1; i + 1 < argc; i++) {
     if (!wcscmp(argv[i], L"--window")) windowArg = argv[++i];
-    else if (!wcscmp(argv[i], L"--cd")) g_win->openDir = argv[++i];
-    else if (!wcscmp(argv[i], L"--script")) {
-      std::wstring s = argv[++i];
-      if (!TestInstance()) continue;
-      size_t pos;
-      while ((pos = s.find(L'|')) != std::wstring::npos) g_win->script.push_back(s.substr(0, pos)), s.erase(0, pos + 1);
-      if (!s.empty()) g_win->script.push_back(s);
-    }
+    else if (!wcscmp(argv[i], L"--cd")) openDir = argv[++i];
+    else if (!wcscmp(argv[i], L"--script")) script = argv[++i];
   }
   LocalFree(argv);
+  if (!TestInstance()) script.clear();  // --script runs only in a test's Warp
+  if (!openDir.empty()) {
+    // El Explorador pasa "C:\" y Windows lo lee como «C:"»: se arregla la barra del final.
+    while (!openDir.empty() && (openDir.back() == L' ' || openDir.back() == L'\t')) openDir.pop_back();
+    if (!openDir.empty() && openDir.back() == L'"') openDir.back() = L'\\';
+    if (openDir.size() > 3 && openDir.back() == L'\\') openDir.pop_back();
+    if (openDir.size() == 2 && openDir[1] == L':') openDir += L'\\';
+    DWORD a = GetFileAttributesW(openDir.c_str());
+    if (!IsLocalDir(openDir) || a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) openDir.clear();
+  }
+  if (TestInstance()) {
+    wchar_t sc[2048];
+    if (GetEnvironmentVariableW(L"WARPLITE_CHILD_SCRIPT", sc, 2048)) g_childEnv = sc;
+  }
+
+  // This Warp running already: it takes the request and this process ends. After an update (--relaunch) the one
+  // running is closing: this one waits for it and takes over.
+  HANDLE instance = CreateMutexW(nullptr, FALSE, InstanceMutex(L"instance").c_str());
+  DWORD got = instance ? WaitForSingleObject(instance, relaunch ? 30000 : 0) : WAIT_FAILED;
+  if (instance && got != WAIT_OBJECT_0 && got != WAIT_ABANDONED) {
+    std::wstring req = L"new\t1\n";
+    if (!openDir.empty()) req += L"cd\t" + openDir + L"\n";
+    if (!windowArg.empty()) req += L"window\t" + windowArg + L"\n";
+    if (!script.empty()) req += L"script\t" + script + L"\nchild\t" + g_childEnv + L"\n";
+    for (DWORD until = GetTickCount() + 15000;;) {
+      if (HWND host = FindHost()) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(host, &pid);
+        AllowSetForegroundWindow(pid);
+        COPYDATASTRUCT cd{kCopyLaunch, (DWORD)(req.size() * sizeof(wchar_t)), (void*)req.data()};
+        DWORD_PTR r = 0;
+        if (SendMessageTimeoutW(host, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 10000, &r)) return r ? 0 : 1;
+      }
+      got = WaitForSingleObject(instance, 200);  // the one running may be exiting: then this one takes over
+      if (got == WAIT_OBJECT_0 || got == WAIT_ABANDONED) break;
+      if ((int)(GetTickCount() - until) > 0) return 1;
+    }
+  }
+
   g_msgQuitAll = RegisterWindowMessageW(L"warp-lite-quit-all");
   g_msgUpdated = RegisterWindowMessageW(L"warp-lite-updated");
   g_msgListPanes = RegisterWindowMessageW(L"warp-lite-list-panes");
   g_msgFocusPane = RegisterWindowMessageW(L"warp-lite-focus-pane");
-  g_msgJoinHover = RegisterWindowMessageW(L"warp-lite-join-hover");
-  g_msgJoinLeave = RegisterWindowMessageW(L"warp-lite-join-leave");
   g_msgFont = RegisterWindowMessageW(L"warp-lite-font");
   g_msgText = RegisterWindowMessageW(L"warp-lite-brightness");
   g_msgTaskbar = RegisterWindowMessageW(L"TaskbarButtonCreated");
   g_msgFocusToast = RegisterWindowMessageW(L"warp-lite-focus-toast");
   g_msgRemote = RegisterWindowMessageW(L"warp-lite-remote");
   g_msgRemoteState = RegisterWindowMessageW(L"warp-lite-remote-state");
-  if (!g_win->openDir.empty()) {
-    // El Explorador pasa "C:\" y Windows lo lee como «C:"»: se arregla la barra del final.
-    while (!g_win->openDir.empty() && (g_win->openDir.back() == L' ' || g_win->openDir.back() == L'\t')) g_win->openDir.pop_back();
-    if (!g_win->openDir.empty() && g_win->openDir.back() == L'"') g_win->openDir.back() = L'\\';
-    if (g_win->openDir.size() > 3 && g_win->openDir.back() == L'\\') g_win->openDir.pop_back();
-    if (g_win->openDir.size() == 2 && g_win->openDir[1] == L':') g_win->openDir += L'\\';
-    DWORD a = GetFileAttributesW(g_win->openDir.c_str());
-    if (!IsLocalDir(g_win->openDir) || a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) g_win->openDir.clear();
-  }
-  if (!g_win->openDir.empty() && windowArg.empty()) {
-    // Warp ya abierto: la pestaña se abre en su ventana de delante y este proceso termina.
-    std::vector<HWND> open = SiblingWindows();
-    if (!open.empty()) {
-      DWORD pid = 0;
-      GetWindowThreadProcessId(open[0], &pid);
-      AllowSetForegroundWindow(pid);
-      COPYDATASTRUCT cd{kCopyOpenDir, (DWORD)(g_win->openDir.size() * sizeof(wchar_t)), (void*)g_win->openDir.data()};
-      DWORD_PTR r = 0;
-      if (SendMessageTimeoutW(open[0], WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 5000, &r) && r) return 0;
-    }
-  }
+  // The hidden window first: a start right after this one finds it at once.
+  WNDCLASSEXW hc{sizeof hc};
+  hc.lpfnWndProc = HostProc;
+  hc.hInstance = inst;
+  hc.lpszClassName = L"WarpLiteHost";
+  RegisterClassExW(&hc);
+  g_host = CreateWindowExW(0, L"WarpLiteHost", nullptr, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, inst, nullptr);
+  if (!g_host) return 1;
+  SetPropW(g_host, kInstanceProp, InstanceKey());
   {
     wchar_t self[MAX_PATH], buf[64];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -10264,18 +10717,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g_upd.testUrl = GetEnvironmentVariableW(L"WARPLITE_UPDATE_URL", nullptr, 0) > 0;
   }
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);  // WIC (pegar imágenes)
-  g_win->sessionPath = SessionPath(windowArg, relaunch);
-  if (g_win->sessionPath.empty()) return 0;  // that window is open already
+  // After an update from a Warp of one process per window: its windows may still be closing.
+  if (relaunch)
+    for (int t = 0; t < 200 && !SiblingWindows().empty(); t++) Sleep(100);
+  FindWindowDir();
   LoadUpdateSettings();
-  if (g_win->script.empty() && !windowArg.empty() && TestInstance()) {  // pruebas: guion para las ventanas que se abren
-    wchar_t sc[2048];
-    if (GetEnvironmentVariableW(L"WARPLITE_CHILD_SCRIPT", sc, 2048)) {
-      std::wstring s = sc;
-      size_t pos;
-      while ((pos = s.find(L'|')) != std::wstring::npos) g_win->script.push_back(s.substr(0, pos)), s.erase(0, pos + 1);
-      if (!s.empty()) g_win->script.push_back(s);
-    }
-  }
   struct { const unsigned char *a, *b; } fonts[] = {{hack_regular, hack_regular_end},
                                                      {hack_bold, hack_bold_end},
                                                      {hack_italic, hack_italic_end},
@@ -10301,58 +10747,38 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   // Before the window: the taskbar groups it with the Start menu shortcut, which has the same ID (see «Windows
   // notifications»).
   SetCurrentProcessExplicitAppUserModelID(kAppId);
-  HWND hwnd = CreateWindowExW(0, L"WarpLite", L"Warp", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                              1280, 760, nullptr, nullptr, inst, g_win);
-  if (!hwnd) return 1;
-  SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
-  DragAcceptFiles(hwnd, TRUE);  // soltar archivos: se escribe su ruta
-  // Mismo tamaño y estado (maximizada o en ventana) que la última vez, si ese sitio sigue en pantalla.
-  if (g_win->hasWinPos && MonitorFromRect(&g_win->winRect, MONITOR_DEFAULTTONULL)) {
-    WINDOWPLACEMENT wp{sizeof wp};
-    wp.rcNormalPosition = g_win->winRect;
-    wp.showCmd = g_win->winMax ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
-    if (show == SW_SHOWMINNOACTIVE || show == SW_SHOWMINIMIZED || show == SW_MINIMIZE) wp.showCmd = show;
-    SetWindowPlacement(hwnd, &wp);
-  } else {
-    ShowWindow(hwnd, show);
+  // This start's own window first (the script and --cd are its), on screen before the others open.
+  std::vector<std::wstring> files = windowArg.empty() ? StartFiles(relaunch) : std::vector<std::wstring>{windowArg};
+  WindowInit first;
+  first.file = files[0], first.openDir = openDir, first.script = script, first.childScript = g_childEnv, first.show = show;
+  if (!OpenWindow(first)) return 1;
+  if (files.size() > 1) {
+    auto* rest = new std::vector<WindowInit>;
+    for (size_t i = 1; i < files.size(); i++) {
+      WindowInit in;
+      in.file = files[i], in.script = in.childScript = g_childEnv, in.show = SW_SHOWNOACTIVATE;
+      rest->push_back(in);
+    }
+    PostMessageW(g_host, WM_APP_OPEN, 0, (LPARAM)rest);
   }
-  UpdateWindow(hwnd);
+  SetTimer(g_host, TIMER_RESTORE, 250, nullptr);
+  if (!GetEnvironmentVariableW(L"WARPLITE_NO_UPDATE", nullptr, 0)) SetTimer(g_host, TIMER_UPDATE, 20000, nullptr);
+  SetTimer(g_host, TIMER_REMOTE, 1500, nullptr);  // once: warp-remote, if a phone is paired
 
   MSG m;
   while (GetMessageW(&m, nullptr, 0, 0)) {
-    SyncUnread();  // the previous message may have changed the pane or tab in view (there are many ways to)
-    bool keyDown = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN;
-    if (g_win->pair.open && m.message == WM_KEYDOWN) {  // pairing card: Esc closes, Enter or Ctrl+C is its button; nothing reaches the terminal
-      bool ctrl = GetKeyState(VK_CONTROL) & 0x8000;
-      if (m.wParam == VK_ESCAPE) ClosePairCard();
-      else if (m.wParam == VK_RETURN || (ctrl && m.wParam == 'C')) PairAction();
-      continue;
+    FreeDeadWindows();
+    g_win = nullptr;
+    // The previous message may have changed the pane or tab in view (there are many ways to).
+    for (Window* w : g_windows) {
+      InWindow in(w);
+      SyncUnread();
     }
-    if (g_win->sw.open && keyDown) {
-      if (!SwKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
-      continue;
-    }
-    if (g_win->pick.open && keyDown) {
-      if (!PickKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
-      continue;
-    }
-    if (g_win->comp.open && keyDown) {
-      if (g_win->tabs.empty() || g_win->comp.p != CurTab().active || !EditorActive(g_win->comp.p)) CompClose();
-      else if (CompKey(m.wParam)) continue;
-    }
-    if (g_win->find.open && keyDown && g_win->renameTab < 0) {
-      if (!FindKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
-      continue;
-    }
-    if (g_win->renameTab >= 0 && (m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN)) {
-      if (!RenameKey(m.wParam)) TranslateMessage(&m), DispatchMessageW(&m);
-      continue;
-    }
-    if ((m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN) && m.hwnd == g_win->hwnd &&
-        HandleKeyDown(m.wParam, m.lParam)) {
-      InvalidateRect(g_win->hwnd, nullptr, FALSE);
-      continue;
-    }
+    Window* w = nullptr;
+    if (HWND root = m.hwnd ? GetAncestor(m.hwnd, GA_ROOT) : nullptr)
+      for (Window* x : g_windows)
+        if (x->hwnd == root) w = x;
+    if (w && PreTranslate(w, m)) continue;
     TranslateMessage(&m);
     DispatchMessageW(&m);
   }
