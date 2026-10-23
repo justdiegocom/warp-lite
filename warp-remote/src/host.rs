@@ -24,15 +24,40 @@ use tokio::time::timeout;
 
 use crate::{
     ALPN, Result, err,
-    proto::{self, Request, Response, Session, code},
-    store,
+    proto::{self, KEYS, MAX_TEXT, Request, Response, Session, code},
+    screen, store,
     ticket::Ticket,
+    watch::{PaneInfo, PaneInput, PaneScreen, Watch},
 };
 
-/// Where the session list comes from: Warp's windows on Windows, a fixed list in tests.
+/// Where the session list comes from: Warp's windows on Windows, a fixed list in tests. Panes (v2) are optional.
 pub trait SessionSource: Send + Sync + 'static {
     fn sessions(&self) -> impl Future<Output = Result<Vec<Session>>> + Send;
+
+    /// The text of that pane (by window and pane id).
+    fn screen(&self, _window: u64, _pane_id: u32) -> impl Future<Output = Result<PaneScreen>> + Send {
+        async { Err(err("no panes here")) }
+    }
+
+    /// What runs in that pane.
+    fn info(&self, _window: u64, _pane_id: u32) -> impl Future<Output = Result<PaneInfo>> + Send {
+        async { Err(err("no panes here")) }
+    }
+
+    /// Types into that pane, for the paired device `device` (its endpoint id, hex).
+    fn input(&self, _window: u64, _pane_id: u32, _device: &str, _what: &PaneInput) -> impl Future<Output = Result<()>> + Send {
+        async { Err(err("no panes here")) }
+    }
 }
+
+/// A phone that stopped asking about a pane for this long stops watching it.
+const WATCH_IDLE: Duration = Duration::from_secs(60);
+/// Panes one connection may watch at once.
+const MAX_WATCHES: usize = 8;
+/// Between pasted text and the keys after it, and between keys that move through a menu: a program reads each one
+/// separately (an Enter right behind a paste could be taken as part of it).
+const AFTER_TEXT: Duration = Duration::from_millis(150);
+const BETWEEN_KEYS: Duration = Duration::from_millis(90);
 
 /// What the host tells its owner (Warp's windows, or the log).
 #[derive(Debug, Clone, PartialEq)]
@@ -291,7 +316,7 @@ impl<S: SessionSource> Host<S> {
         }
         store::log(&self.inner.dir, &format!("connected {short} ({name})"));
         self.set_live(id, &conn, true);
-        let r = self.requests(&mut send, &mut recv).await;
+        let r = self.requests(id, &mut send, &mut recv).await;
         self.set_live(id, &conn, false);
         store::log(&self.inner.dir, &format!("disconnected {short}"));
         if r.is_err() && conn.close_reason().is_some() {
@@ -300,7 +325,10 @@ impl<S: SessionSource> Host<S> {
         r
     }
 
-    async fn requests(&self, send: &mut SendStream, recv: &mut RecvStream) -> Result<()> {
+    async fn requests(&self, device: PublicKey, send: &mut SendStream, recv: &mut RecvStream) -> Result<()> {
+        // The panes this connection watches: they end with it (and so does any ssh following a transcript).
+        let mut watches: HashMap<(u64, u32), Watch> = HashMap::new();
+        let mut typed = false;
         // Read as plain JSON first: a request type from a newer app gets an error, not a disconnect.
         while let Some(v) = proto::read_frame::<serde_json::Value>(recv).await? {
             let resp = match serde_json::from_value::<Request>(v) {
@@ -312,11 +340,120 @@ impl<S: SessionSource> Host<S> {
                 Ok(Request::Hello { .. } | Request::Pair { .. }) => {
                     Response::Error { code: code::BAD_REQUEST.into(), message: "already connected".into() }
                 }
+                Ok(Request::Watch { window, pane_id, since, before }) => {
+                    self.watch(&device, &mut watches, window, pane_id, since, before).await
+                }
+                Ok(Request::Unwatch { window, pane_id }) => {
+                    watches.remove(&(window, pane_id));
+                    Response::Ok
+                }
+                Ok(Request::Input { window, pane_id, text, keys, option, prompt }) => {
+                    let r = self.input(&device, window, pane_id, text, keys, option, &prompt).await;
+                    if r == Response::Ok && !typed {
+                        typed = true;  // what was typed is never logged
+                        store::log(&self.inner.dir, &format!("{} typed into a pane", device.fmt_short()));
+                    }
+                    r
+                }
                 Err(e) => Response::Error { code: code::BAD_REQUEST.into(), message: e.to_string() },
             };
             proto::write_frame(send, &resp).await?;
         }
         Ok(())
+    }
+
+    async fn watch(
+        &self,
+        device: &PublicKey,
+        watches: &mut HashMap<(u64, u32), Watch>,
+        window: u64,
+        pane_id: u32,
+        since: u64,
+        before: Option<u64>,
+    ) -> Response {
+        let src = &self.inner.source;
+        watches.retain(|_, w| w.last_poll.elapsed() < WATCH_IDLE);
+        let key = (window, pane_id);
+        if !watches.contains_key(&key) && watches.len() >= MAX_WATCHES {
+            return Response::Error { code: code::BAD_REQUEST.into(), message: "watching too many panes".into() };
+        }
+        let screen = match src.screen(window, pane_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                watches.remove(&key);
+                return Response::Error { code: code::NO_PANE.into(), message: e.to_string() };
+            }
+        };
+        let w = match watches.entry(key) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let info = src.info(window, pane_id).await.unwrap_or_default();
+                v.insert(Watch::new(&self.inner.dir, window, pane_id, info, &screen))
+            }
+        };
+        if w.info_due()
+            && let Ok(info) = src.info(window, pane_id).await
+        {
+            w.set_info(info, &screen);
+        }
+        let typing = store::typing_allowed(&self.inner.dir, device);
+        Response::Pane(Box::new(w.poll(&screen, since, before, typing)))
+    }
+
+    /// Typing from a phone: only a device allowed to type (checked again here on every request), only the keys of
+    /// [`KEYS`], text as one line; an option of a question only while that same question is on the screen.
+    #[allow(clippy::too_many_arguments)]
+    async fn input(
+        &self,
+        device: &PublicKey,
+        window: u64,
+        pane_id: u32,
+        text: String,
+        mut keys: Vec<String>,
+        option: Option<u32>,
+        prompt: &str,
+    ) -> Response {
+        let fail = |c: &str, m: &str| Response::Error { code: c.into(), message: m.into() };
+        if !store::typing_allowed(&self.inner.dir, device) {
+            return fail(code::TYPING_OFF, "Typing from this device is off. Allow it in Warp: title-bar menu → Paired devices → this device → Allow typing.");
+        }
+        if text.chars().count() > MAX_TEXT || keys.len() > 32 || keys.iter().any(|k| !KEYS.contains(&k.as_str())) {
+            return fail(code::BAD_REQUEST, "too much text, or an unknown key");
+        }
+        let src = &self.inner.source;
+        if let Some(n) = option {
+            let screen = match src.screen(window, pane_id).await {
+                Ok(s) => s,
+                Err(e) => return fail(code::NO_PANE, &e.to_string()),
+            };
+            let Some(p) = screen::prompt(screen.visible()).filter(|p| p.id == prompt) else {
+                return fail(code::PROMPT_GONE, "That question isn't on the screen any more.");
+            };
+            if n as usize >= p.options.len() {
+                return fail(code::BAD_REQUEST, "no such option");
+            }
+            keys = screen::keys_for(p.selected, n).into_iter().map(String::from).collect();
+        }
+        // One line: newlines and other control characters become spaces (only an explicit Enter submits).
+        let text: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        let dev = device.to_string();
+        if !text.trim().is_empty() {
+            if let Err(e) = src.input(window, pane_id, &dev, &PaneInput::Text(text)).await {
+                return fail(code::NO_PANE, &e.to_string());
+            }
+            if !keys.is_empty() {
+                tokio::time::sleep(AFTER_TEXT).await;
+            }
+        }
+        for (i, k) in keys.into_iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(BETWEEN_KEYS).await;
+            }
+            if let Err(e) = src.input(window, pane_id, &dev, &PaneInput::Key(k)).await {
+                return fail(code::NO_PANE, &e.to_string());
+            }
+        }
+        Response::Ok
     }
 }
 

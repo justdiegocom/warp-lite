@@ -4,6 +4,8 @@
 //! - `key`: this host's secret key (hex). Its public half is the id phones remember.
 //! - `devices.txt`: the allow-list, one paired device per line: `<endpoint id hex>\t<unix seconds>\t<name>`.
 //!   Warp's «Paired devices» menu removes lines from it to revoke a device.
+//! - `typing.txt`: the paired devices that may type into the terminals, one endpoint id per line. Only Warp writes
+//!   it (Paired devices → the device → Allow typing); none may type until it is chosen there.
 //! - `remote.log`: what happened (start, pairing, connections, errors).
 //!
 //! Client (the phone, `warp-remote-cli`):
@@ -128,6 +130,24 @@ pub fn remove_device(dir: &Path, id: &PublicKey) -> Result<bool> {
     Ok(true)
 }
 
+/// May that device type into the terminals? Paired and in `typing.txt` (read each time: Warp changes it).
+pub fn typing_allowed(dir: &Path, id: &PublicKey) -> bool {
+    let text = fs::read_to_string(dir.join("typing.txt")).unwrap_or_default();
+    let listed = text.lines().any(|l| l.trim().parse::<PublicKey>().is_ok_and(|k| &k == id));
+    listed && devices(dir).iter().any(|d| &d.id == id)
+}
+
+/// Lets that device type, or not (what Warp's menu does; for tests).
+pub fn set_typing(dir: &Path, id: &PublicKey, on: bool) -> Result<()> {
+    let text = fs::read_to_string(dir.join("typing.txt")).unwrap_or_default();
+    let mut ids: Vec<String> = text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && *l != id.to_string()).collect();
+    if on {
+        ids.push(id.to_string());
+    }
+    create_private_dir(dir)?;
+    write_secret(&dir.join("typing.txt"), (ids.join("\n") + "\n").as_bytes())
+}
+
 /// The host a client is paired with.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostRecord {
@@ -195,8 +215,13 @@ mod tests {
         assert_eq!(d.len(), 2);
         assert_eq!((d[0].id, d[0].name.as_str()), (b, "iPad"));
         assert_eq!((d[1].id, d[1].name.as_str()), (a, "iPhone"));
+        assert!(!typing_allowed(&dir, &b), "typing is off until allowed");
+        set_typing(&dir, &b, true).unwrap();
+        assert!(typing_allowed(&dir, &b) && !typing_allowed(&dir, &a));
         assert!(remove_device(&dir, &b).unwrap());
         assert!(!remove_device(&dir, &b).unwrap());
+        assert!(!typing_allowed(&dir, &b), "a removed device can't type even if still listed");
+        set_typing(&dir, &b, false).unwrap();
         assert_eq!(devices(&dir).len(), 1);
 
         let host = HostRecord {

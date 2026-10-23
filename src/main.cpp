@@ -111,7 +111,7 @@ static const size_t kScrollback = 5000;
 
 enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS, WM_APP_PROMPT, WM_APP_NETCHANGE, WM_APP_NOTE };
 enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6, TIMER_PATHS = 7,
-       TIMER_REMOTE = 8, TIMER_PAIR = 9, TIMER_PULSE = 10 };
+       TIMER_REMOTE = 8, TIMER_PAIR = 9, TIMER_PULSE = 10, TIMER_PHONE = 11 };
 
 // ---------------------------------------------------------------------------
 // Modelo: pestañas -> árbol de paneles
@@ -281,7 +281,7 @@ enum Str { S_TYPE_COMMAND, S_RUNNING, S_ZOOM, S_FONT, S_NEED_WIN10, S_LANGUAGE, 
            S_FONT_SIZE, S_TEXT_BRIGHTNESS, S_DEFAULT, S_RECONNECTING, S_RECONNECT_WAIT, S_REOPEN, S_OPEN, S_COPY_PATH, S_COPY_LINK,
            S_OPEN_LOCATION, S_UNREAD, S_PAIR_PHONE, S_PAIRED_DEVICES, S_NO_DEVICES, S_REMOVE_DEVICE, S_PAIR_TITLE, S_PAIR_HINT,
            S_PAIR_STARTING, S_PAIR_EXPIRES, S_PAIR_EXPIRED, S_PAIR_NEW, S_COPY, S_COPIED, S_PAIR_FAILED, S_PHONE_PAIRED,
-           S_PHONE_CONNECTED, S_WIN_NOTIFY, S_COUNT };
+           S_PHONE_CONNECTED, S_WIN_NOTIFY, S_ALLOW_TYPING, S_PHONE_TYPING, S_COUNT };
 static const wchar_t* const kStrings[][S_COUNT] = {
     {L"Type a command", L"Running… keys go to the program", L"Zoom %d%%", L"Font %d px",
      L"Windows 10 1809 or later is required (ConPTY).", L"Language", L"Find", L"No results",
@@ -297,7 +297,7 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Scan it with the Warp app on your phone, or paste the text there.", L"Getting a pairing code…",
      L"Expires in %d:%02d", L"This code has expired.", L"New code", L"Copy", L"Copied",
      L"Couldn't start pairing: %ls", L"Phone paired", L"Phone connected",
-     L"Windows notifications"},
+     L"Windows notifications", L"Allow typing", L"Phone typing"},
     {L"Escribe una orden", L"Ejecutando… las teclas van al programa", L"Escala %d %%", L"Letra %d px",
      L"Hace falta Windows 10 1809 o posterior (ConPTY).", L"Idioma", L"Buscar", L"Sin resultados",
      L"Buscar carpetas…", L".. (Carpeta superior)", L"Renombrar", L"Ocultar pestaña", L"Cerrar pestaña",
@@ -313,7 +313,7 @@ static const wchar_t* const kStrings[][S_COUNT] = {
      L"Vincular móvil", L"Escanéalo con la app Warp del móvil, o pega allí el texto.", L"Preparando el código…",
      L"Caduca en %d:%02d", L"Este código ha caducado.", L"Código nuevo", L"Copiar", L"Copiado",
      L"No se pudo empezar a vincular: %ls", L"Móvil vinculado", L"Móvil conectado",
-     L"Notificaciones de Windows"},
+     L"Notificaciones de Windows", L"Permitir escribir", L"Móvil escribiendo"},
 };
 static const wchar_t* const kLangNames[] = {L"English", L"Español"};
 static const char* const kLangCodes[] = {"en", "es"};
@@ -342,6 +342,7 @@ static UINT g_msgListPanes, g_msgFocusPane;  // selector de terminales entre ven
 static UINT g_msgFocusToast;  // one of this window's Windows notifications was clicked (wParam: the pane's id)
 static UINT g_msgRemote, g_msgRemoteState;   // warp-remote → windows: phones / events; windows → it: how many phones
 static int g_remotePhones = 0;               // phones connected now (title-bar indicator, see «Phone»)
+static bool g_phoneTyping = false;           // a phone typed into a pane of this window in the last seconds (title bar)
 static std::wstring g_openDir;      // --cd <carpeta> («Abrir Warp aquí»): pestaña nueva ya en ella
 // Las ventanas de un mismo Warp (mismo %APPDATA%\warp-lite, o la misma carpeta en las pruebas) se
 // reconocen por esta marca: así las pruebas nunca tocan las ventanas de verdad.
@@ -2725,11 +2726,12 @@ static std::wstring PaneListText() {
     Leaves(g_tabs[i].root, ls);
     for (int j = 0; j < (int)ls.size(); j++) {
       Pane* p = ls[j];
-      // Then the tab's name and the agent (Claude Code / Codex), for warp-remote (older windows read the first 5).
+      // Then the tab's name, the agent (Claude Code / Codex) and the pane's id, for warp-remote (older windows read the
+      // first 5).
       std::wstring tab = g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name;
       const wchar_t* agent = p->agent == AGENT_CLAUDE ? L"claude" : p->agent == AGENT_CODEX ? L"codex" : L"";
       out += std::to_wstring(i) + L"\t" + std::to_wstring(j) + L"\t" + clean(PaneLabel(p)) + L"\t" + clean(p->cwd) + L"\t" +
-             clean(p->runningCmd) + L"\t" + clean(tab) + L"\t" + agent + L"\n";
+             clean(p->runningCmd) + L"\t" + clean(tab) + L"\t" + agent + L"\t" + std::to_wstring(p->id) + L"\n";
     }
   }
   return out;
@@ -5953,12 +5955,19 @@ static void DrawTitleBar(HDC dc, int w, int h) {
     toast = b;
   }
   int right = w - 3 * WinBtnW() - Px(12);
-  if (g_remotePhones > 0) {  // a phone is connected (warp-remote)
+  if (g_remotePhones > 0 || g_phoneTyping) {  // a phone is connected (warp-remote)
     RECT pr{right - Px(22), 0, right, th};
     SelectObject(dc, g_iconFont);
     Text(dc, L"\uE8EA", pr, kAccent, DT_CENTER);  // CellPhone
     SelectObject(dc, g_uiFont);
     right = pr.left - Px(6);
+    if (g_phoneTyping) {  // and it typed into a pane of this window a moment ago
+      SIZE sz{};
+      GetTextExtentPoint32W(dc, T(S_PHONE_TYPING), (int)wcslen(T(S_PHONE_TYPING)), &sz);
+      RECT tr{right - sz.cx, 0, right, th};
+      Text(dc, T(S_PHONE_TYPING), tr, kAccent, DT_RIGHT);
+      right = tr.left - Px(10);
+    }
   }
   if (!toast.empty()) {
     RECT tr{L.end + Px(10), 0, right, th};
@@ -6435,8 +6444,47 @@ static void OnPairTicket(const std::wstring& t) {
   InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
+// typing.txt: the paired devices that may type into the terminals, one id per line (only Warp writes it; none may
+// until chosen in Paired devices → the device → Allow typing). warp-remote checks it, and so does OnRemotePane.
+static std::set<std::wstring> TypingDevices() {
+  std::set<std::wstring> out;
+  HANDLE f = CreateFileW((RemoteDir() + L"\\typing.txt").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return out;
+  std::string data(std::min<DWORD>(GetFileSize(f, nullptr), 1 << 16), 0);
+  DWORD r = 0;
+  ReadFile(f, data.data(), (DWORD)data.size(), &r, nullptr);
+  CloseHandle(f);
+  data.resize(r);
+  std::istringstream in(data);
+  std::string line;
+  while (std::getline(in, line)) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+    if (line.size() == 64) out.insert(ToWide(line));
+  }
+  return out;
+}
+
+static void SetTyping(const std::wstring& id, bool on) {
+  std::set<std::wstring> ids = TypingDevices();
+  if (on == (ids.count(id) > 0)) return;
+  if (on) ids.insert(id);
+  else ids.erase(id);
+  std::string out;
+  for (auto& d : ids) out += ToUtf8(d) + "\n";
+  CreateDirectoryW(RemoteDir().c_str(), nullptr);
+  std::wstring path = RemoteDir() + L"\\typing.txt", tmp = path + L".warp";
+  HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return;
+  DWORD w = 0;
+  bool ok = WriteFile(f, out.data(), (DWORD)out.size(), &w, nullptr) && w == out.size();
+  CloseHandle(f);
+  if (!ok || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileW(tmp.c_str());
+}
+
 // Removes a paired device: it is disconnected now and turned away from then on.
 static void RemoveDevice(const std::wstring& id) {
+  SetTyping(id, false);
   std::wstring path = RemoteDir() + L"\\devices.txt", tmp = path + L".warp";
   std::string out;
   for (auto& d : PairedDevices())
@@ -6451,6 +6499,147 @@ static void RemoveDevice(const std::wstring& id) {
     return;
   }
   RemoteCommand(L"reload");
+}
+
+// A phone watching a pane (see warp-remote/src/win.rs): warp-remote asks this window for the pane's text and what runs
+// in it, about once a second while the phone shows it, and types into it for a device allowed to.
+static const ULONG_PTR kCopyRemotePane = 0x57525000, kCopyRemoteAnswer = 0x57524100;
+
+static Pane* PaneById(unsigned id) {
+  for (auto& t : g_tabs) {
+    std::vector<Pane*> ls;
+    Leaves(t.root, ls);
+    for (Pane* p : ls)
+      if (p->id == id) return p;
+  }
+  return nullptr;
+}
+
+// The pane's text for a phone: its last `back` scrollback rows, then its screen, one line per row without the spaces
+// at its end; wide characters once. «screen\t<rows>\t<cols>» first.
+static std::wstring RemoteScreenText(Pane* p, int back) {
+  auto row = [](std::wstring& out, const VTermScreenCell* cells, int n) {
+    size_t start = out.size();
+    for (int c = 0; c < n; c++) {
+      const VTermScreenCell& cell = cells[c];
+      if (cell.chars[0] == (uint32_t)-1) continue;
+      if (!cell.chars[0]) out += L' ';
+      for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i]; i++) AppendUtf16(out, cell.chars[i]);
+    }
+    while (out.size() > start && out.back() == L' ') out.pop_back();
+    out += L'\n';
+  };
+  wchar_t head[64];
+  EnterCriticalSection(&p->cs);
+  swprintf(head, 64, L"screen\t%d\t%d\n", p->rows, p->cols);
+  std::wstring out = head;
+  int n = p->altScreen ? 0 : std::min(std::max(back, 0), (int)p->sb.size());
+  for (int i = (int)p->sb.size() - n; i < (int)p->sb.size(); i++) row(out, p->sb[i].data(), (int)p->sb[i].size());
+  std::vector<VTermScreenCell> cells(p->cols);
+  for (int r = 0; r < p->rows; r++) {
+    for (int c = 0; c < p->cols; c++)
+      if (!vterm_screen_get_cell(p->scr, VTermPos{r, c}, &cells[c])) BlankCell(&cells[c]);
+    row(out, cells.data(), p->cols);
+  }
+  LeaveCriticalSection(&p->cs);
+  out.pop_back();
+  return out;
+}
+
+// The transcript of the Claude Code or Codex running in that pane on this computer, for a phone to read: Claude Code's
+// session of the pane's own process (see ClaudeSessionJson), or Codex's newest conversation in its folder. Empty when
+// there is none (yet) or it runs elsewhere (over ssh, warp-remote looks for it there).
+static std::wstring LocalTranscript(Pane* p) {
+  if (p->agent == AGENT_CLAUDE && p->pid) {
+    std::wstring root = EnvDir(L"CLAUDE_CONFIG_DIR", L"\\.claude");
+    if (root.empty()) return L"";
+    for (DWORD pid : Descendants(ChildrenByParent(), p->pid)) {
+      std::string j = ClaudeSessionJson(pid), id = JsonStr(j, "sessionId", 0), cwd = JsonStr(j, "cwd", 0);
+      if (id.size() != 36 || cwd.empty() || id.find_first_not_of("0123456789abcdefABCDEF-") != std::string::npos) continue;
+      for (size_t k = 0; (k = cwd.find("\\\\", k)) != std::string::npos; k++) cwd.erase(k, 1);
+      std::wstring name = ToWide(cwd);
+      for (wchar_t& c : name)
+        if (!iswascii(c) || !iswalnum(c)) c = L'-';
+      return root + L"\\projects\\" + name + L"\\" + ToWide(id) + L".jsonl";
+    }
+  } else if (p->agent == AGENT_CODEX) {
+    std::vector<AgentSession> s = CodexSessions(p->cwd);
+    if (!s.empty()) return s[0].path;
+  }
+  return L"";
+}
+
+// Typing from a phone, as if on this keyboard: text as a paste (one line already), keys by name. The title bar says
+// «Phone typing» for a few seconds.
+static bool RemoteInput(Pane* p, const std::wstring& kind, const std::wstring& arg) {
+  if (kind == L"text") {
+    PasteText(p, arg);
+  } else if (kind != L"key") {
+    return false;
+  } else if (EditorActive(p)) {  // the input box: what these keys do there
+    StopReconnect(p);
+    if (arg == L"enter") SubmitEditor(p);
+    else if (arg == L"esc") p->edit.clear(), p->caret = 0, p->histPos = -1;
+    else if (arg == L"up") EditorKey(p, VK_UP);
+    else if (arg == L"down") EditorKey(p, VK_DOWN);
+    else if (arg == L"left") p->caret = p->caret ? p->caret - 1 : 0;
+    else if (arg == L"right") p->caret = std::min(p->caret + 1, p->edit.size());
+    else if (arg == L"backspace" && p->caret > 0) p->edit.erase(--p->caret, 1);
+    else if (arg == L"ctrl_c" && !p->edit.empty()) p->edit.clear(), p->caret = 0;
+    else if (arg == L"ctrl_c") SendChar(p, 3, VTERM_MOD_NONE);
+    else if (arg != L"tab" && arg != L"backspace") return false;
+  } else {
+    StopReconnect(p);
+    VTermKey key = arg == L"enter" ? VTERM_KEY_ENTER : arg == L"esc" ? VTERM_KEY_ESCAPE : arg == L"up" ? VTERM_KEY_UP
+                 : arg == L"down" ? VTERM_KEY_DOWN : arg == L"left" ? VTERM_KEY_LEFT : arg == L"right" ? VTERM_KEY_RIGHT
+                 : arg == L"tab" ? VTERM_KEY_TAB : arg == L"backspace" ? VTERM_KEY_BACKSPACE : VTERM_KEY_NONE;
+    if (arg == L"ctrl_c") SendChar(p, 3, VTERM_MOD_NONE);
+    else if (key != VTERM_KEY_NONE) SendKey(p, key, VTERM_MOD_NONE);
+    else return false;
+  }
+  g_phoneTyping = true;
+  SetTimer(g_hwnd, TIMER_PHONE, 4000, nullptr);  // once: the mark goes away 4 s after the last key
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+  return true;
+}
+
+// warp-remote about one of this window's panes (only from this Warp's warp-remote: see the caller): «screen <id>
+// <rows>» and «info <id>» are answered with kCopyRemoteAnswer; «input <id> <device> text|key\t<what>» types, only for a
+// device that is paired and allowed to type (checked here too).
+static BOOL OnRemotePane(HWND from, const std::wstring& t) {
+  size_t tab = t.find(L'\t');
+  std::wistringstream in(t.substr(0, tab));
+  std::wstring cmd, dev, kind;
+  unsigned id = 0;
+  in >> cmd >> id;
+  Pane* p = PaneById(id);
+  if (!p) return FALSE;
+  std::wstring answer;
+  if (cmd == L"screen") {
+    int back = 0;
+    in >> back;
+    answer = RemoteScreenText(p, std::min(back, 1000));
+  } else if (cmd == L"info") {
+    auto clean = [](std::wstring s) {
+      for (wchar_t& c : s)
+        if (c == L'\t' || c == L'\n' || c == L'\r') c = L' ';
+      return s;
+    };
+    const wchar_t* agent = p->agent == AGENT_CLAUDE ? L"claude" : p->agent == AGENT_CODEX ? L"codex" : L"";
+    answer = L"info\t" + std::wstring(agent) + L"\t" + clean(p->runningCmd) + L"\t" + clean(p->cwd) + L"\t" + clean(LocalTranscript(p));
+  } else if (cmd == L"input") {
+    in >> dev >> kind;
+    if (tab == std::wstring::npos || !TypingDevices().count(dev)) return FALSE;
+    std::vector<PairedDevice> devs = PairedDevices();
+    if (std::none_of(devs.begin(), devs.end(), [&](const PairedDevice& d) { return d.id == dev; })) return FALSE;
+    return RemoteInput(p, kind, t.substr(tab + 1));
+  } else {
+    return FALSE;
+  }
+  COPYDATASTRUCT cd{kCopyRemoteAnswer, (DWORD)(answer.size() * sizeof(wchar_t)), (void*)answer.data()};
+  DWORD_PTR r = 0;
+  SendMessageTimeoutW(from, WM_COPYDATA, (WPARAM)g_hwnd, (LPARAM)&cd, SMTO_ABORTIFHUNG, 2000, &r);
+  return TRUE;
 }
 
 // At start (once, a moment after the window shows): the main window starts warp-remote when a phone is
@@ -8153,6 +8342,17 @@ static void RunScriptStep() {
     std::vector<PairedDevice> devs = PairedDevices();
     size_t i = (size_t)_wtoi(s.c_str() + 14);
     if (i < devs.size()) RemoveDevice(devs[i].id);
+  } else if (s.rfind(L"remote-typing:", 0) == 0) {  // remote-typing:<n>:on|off — as if toggled in Paired devices
+    std::vector<PairedDevice> devs = PairedDevices();
+    size_t i = (size_t)_wtoi(s.c_str() + 14);
+    if (i < devs.size()) SetTyping(devs[i].id, s.find(L":on") != std::wstring::npos);
+  } else if (s == L"remote-typing-state") {  // devices allowed to type, and whether «Phone typing» is shown
+    ScriptLog(L"remote-typing: allowed=" + std::to_wstring(TypingDevices().size()) + L" shown=" + (g_phoneTyping ? L"1" : L"0"));
+  } else if (s.rfind(L"remote-wait-device", 0) == 0) {  // remote-wait-device[:<n>] — until n devices are paired (5 min at most)
+    static int waited = 0;
+    size_t want = s.size() > 19 ? (size_t)_wtoi(s.c_str() + 19) : 1;
+    if (PairedDevices().size() < want && ++waited < 1200) g_scriptPos--, delay = 250;
+    else waited = 0, delay = 300;
   } else if (s.rfind(L"wait-file:", 0) == 0) {  // until that file exists (the other side of a test is done; 5 min at most)
     static int waited = 0;
     if (GetFileAttributesW(s.c_str() + 10) == INVALID_FILE_ATTRIBUTES && ++waited < 1200) g_scriptPos--, delay = 250;
@@ -8673,15 +8873,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         AppendMenuW(menu, MF_STRING | (StartsWithWindows() ? MF_CHECKED : 0), 1, T(S_STARTUP));
         AppendMenuW(menu, MF_STRING | (ToastsOn() ? MF_CHECKED : 0), 7, T(S_WIN_NOTIFY));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        // Phone: pair one; the paired ones, each item removes that one.
+        // Phone: pair one; each paired one has a menu: may it type into the terminals (off until chosen), remove it.
         std::vector<PairedDevice> devs = PairedDevices();
         if (devs.size() > 50) devs.resize(50);
+        std::set<std::wstring> typing = TypingDevices();
         HMENU phones = CreatePopupMenu();
         if (devs.empty()) AppendMenuW(phones, MF_STRING | MF_GRAYED, 0, T(S_NO_DEVICES));
         for (size_t i = 0; i < devs.size(); i++) {
+          HMENU dev = CreatePopupMenu();
+          AppendMenuW(dev, MF_STRING | (typing.count(devs[i].id) ? MF_CHECKED : 0), 3000 + i, T(S_ALLOW_TYPING));
           wchar_t b[200];
           swprintf(b, 200, T(S_REMOVE_DEVICE), devs[i].name.c_str());
-          AppendMenuW(phones, MF_STRING, 2000 + i, b);
+          AppendMenuW(dev, MF_STRING, 2000 + i, b);
+          AppendMenuW(phones, MF_POPUP, (UINT_PTR)dev, devs[i].name.c_str());
         }
         AppendMenuW(menu, MF_STRING, 6, T(S_PAIR_PHONE));
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)phones, T(S_PAIRED_DEVICES));
@@ -8705,6 +8909,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (cmd == 4) UpdateAction();
         if (cmd == 6) OpenPairCard();
         if (cmd >= 2000 && cmd < 2000 + (int)devs.size()) RemoveDevice(devs[cmd - 2000].id);
+        if (cmd >= 3000 && cmd < 3000 + (int)devs.size()) SetTyping(devs[cmd - 3000].id, !typing.count(devs[cmd - 3000].id));
         if (cmd == 5 && !g_isMain) {
           g_reopen = !g_reopen;
           SaveSession();
@@ -8835,6 +9040,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       } else if (wp == TIMER_REMOTE) {
         KillTimer(hwnd, TIMER_REMOTE);
         RemoteAtStart();
+      } else if (wp == TIMER_PHONE) {  // «Phone typing» goes away
+        KillTimer(hwnd, TIMER_PHONE);
+        g_phoneTyping = false;
+        InvalidateRect(hwnd, nullptr, FALSE);
       } else if (wp == TIMER_PAIR) {  // pairing card: countdown; no answer from warp-remote in 20 s is an error
         if (!g_pair.open) KillTimer(hwnd, TIMER_PAIR);
         else if (g_pair.ticket.empty() && g_pair.error.empty() && GetTickCount() - g_pair.shown > 20000) g_pair.error = L"no answer";
@@ -9359,6 +9568,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       OnPairTicket(t);
       return TRUE;
     }
+    if (cd->dwData == kCopyRemotePane && (HWND)wp && (HWND)wp == RemoteWindow()) return OnRemotePane((HWND)wp, t);  // a phone
     return FALSE;
   }
   return DefWindowProcW(hwnd, msg, wp, lp);
