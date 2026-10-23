@@ -29,7 +29,7 @@ targets:
     settings:
       base:
         PRODUCT_NAME: WarpRemote
-        PRODUCT_BUNDLE_IDENTIFIER: com.justdiego.warpremote
+        PRODUCT_BUNDLE_IDENTIFIER: com.justdiego.warpapp
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Automatic
         SWIFT_OBJC_BRIDGING_HEADER: WarpRemote/WarpRemote-Bridging-Header.h
@@ -38,3 +38,26 @@ targets:
         OTHER_LDFLAGS: -lwarp_remote_core -lresolv -framework Security -framework SystemConfiguration
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         DEAD_CODE_STRIPPING: YES
+  # The app driven end to end against a real Warp (build.sh demo): real taps, screenshots.
+  WarpRemoteUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - WarpRemoteUITests
+    dependencies:
+      - target: WarpRemote
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.justdiego.warpapp.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+schemes:
+  WarpRemote:
+    build:
+      targets:
+        WarpRemote: all
+        WarpRemoteUITests: [test]
+    test:
+      targets:
+        - WarpRemoteUITests

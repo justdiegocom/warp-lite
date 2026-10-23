@@ -9,6 +9,9 @@ struct ContentView: View {
                 if model.paired { HostView() } else { PairView() }
             }
             .background(Color(white: 0.02).ignoresSafeArea())
+            .navigationDestination(for: Session.self) { s in
+                PaneView(session: s, core: model.core)
+            }
         }
         .task { await model.start() }
     }
@@ -86,7 +89,14 @@ struct HostView: View {
             }
             ForEach(Array(windows.enumerated()), id: \.element.0) { index, group in
                 Section(windows.count > 1 ? "Window \(index + 1)" : "Terminals") {
-                    ForEach(group.1) { s in SessionRow(session: s) }
+                    ForEach(group.1) { s in
+                        if (s.pane_id ?? 0) != 0 {
+                            NavigationLink(value: s) { SessionRow(session: s) }
+                                .accessibilityIdentifier("session-\(s.id)")
+                        } else {
+                            SessionRow(session: s)  // an older Warp: the list only
+                        }
+                    }
                 }
             }
             if model.sessions.isEmpty && model.error == nil {
@@ -172,11 +182,16 @@ struct SessionRow: View {
                             .background(Capsule().fill(Color.accentColor.opacity(0.25)))
                     }
                 }
-                Text(session.tab_name == session.title ? folder : "\(session.tab_name) · \(folder)")
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
         }
         .padding(.vertical, 2)
+    }
+
+    /// Where it is: the folder, or for a pane running ssh, the command (the folder is this computer's, not the host's).
+    private var subtitle: String {
+        let place = (session.running ?? "").hasPrefix("ssh ") ? session.running ?? "" : folder
+        return session.tab_name == session.title ? place : "\(session.tab_name) · \(place)"
     }
 
     private var folder: String {

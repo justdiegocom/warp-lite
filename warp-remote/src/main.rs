@@ -19,6 +19,7 @@ use warp_remote::{
     host::{Event, Host, HostConfig, Net, SessionSource, computer_name},
     proto::Session,
     store,
+    watch::{PaneInfo, PaneInput, PaneScreen},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +84,18 @@ impl SessionSource for WarpSource {
     async fn sessions(&self) -> Result<Vec<Session>> {
         self.0.sessions().await
     }
+
+    async fn screen(&self, window: u64, pane_id: u32) -> Result<PaneScreen> {
+        self.0.screen(window, pane_id).await
+    }
+
+    async fn info(&self, window: u64, pane_id: u32) -> Result<PaneInfo> {
+        self.0.info(window, pane_id).await
+    }
+
+    async fn input(&self, window: u64, pane_id: u32, device: &str, what: &PaneInput) -> Result<()> {
+        self.0.input(window, pane_id, device, what).await
+    }
 }
 
 enum Source {
@@ -97,6 +110,30 @@ impl SessionSource for Source {
             Source::Mock(m) => m.sessions().await,
             #[cfg(windows)]
             Source::Warp(w) => w.sessions().await,
+        }
+    }
+
+    async fn screen(&self, window: u64, pane_id: u32) -> Result<PaneScreen> {
+        match self {
+            Source::Mock(m) => m.screen(window, pane_id).await,
+            #[cfg(windows)]
+            Source::Warp(w) => w.screen(window, pane_id).await,
+        }
+    }
+
+    async fn info(&self, window: u64, pane_id: u32) -> Result<PaneInfo> {
+        match self {
+            Source::Mock(m) => m.info(window, pane_id).await,
+            #[cfg(windows)]
+            Source::Warp(w) => w.info(window, pane_id).await,
+        }
+    }
+
+    async fn input(&self, window: u64, pane_id: u32, device: &str, what: &PaneInput) -> Result<()> {
+        match self {
+            Source::Mock(m) => m.input(window, pane_id, device, what).await,
+            #[cfg(windows)]
+            Source::Warp(w) => w.input(window, pane_id, device, what).await,
         }
     }
 }
@@ -130,6 +167,9 @@ async fn run(a: Args, dir: PathBuf) -> Result<()> {
         store::log(&dir, "another warp-remote is running for this Warp");
         return Ok(());
     }
+    #[cfg(windows)]
+    warp_remote::win::end_children_with_me();
+    warp_remote::watch::clean_up(&dir);
     let (tx, mut rx) = mpsc::unbounded_channel::<Cmd>();
 
     #[cfg(windows)]

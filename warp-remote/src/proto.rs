@@ -22,6 +22,23 @@
 //!
 //! Errors come back as `{"type":"error","code":...,"message":...}`; codes are in [`code`].
 //! Fields added later are optional, so older apps and hosts keep understanding each other within v1.
+//!
+//! Version 2 (same ALPN; `hello` answers the lower of both versions, and a v2 app only sends these to a v2 host)
+//! adds a pane's content and typing into it. Panes are addressed by `window` and `pane_id` (see [`Session`]):
+//!
+//! ```text
+//! {"type":"watch","window":..,"pane_id":3,"since":0}
+//!                                           {"type":"pane","rev":41,"kind":"chat","items":[...],"prompt":{...},...}
+//! {"type":"watch","window":..,"pane_id":3,"since":41}     (about once a second while it's on screen: only what changed)
+//! {"type":"input","window":..,"pane_id":3,"text":"go on","keys":["enter"]}
+//!                                           {"type":"ok"}
+//! {"type":"unwatch","window":..,"pane_id":3}
+//! ```
+//!
+//! The first `watch` of a pane subscribes to it: only then does the host read its screen and follow its Claude Code or
+//! Codex conversation (a file on this computer, or over the user's own `ssh` for a pane running `ssh host`), and it
+//! stops on `unwatch`, when the connection ends or when nobody asked for a minute. `input` needs the device to be
+//! allowed to type (Warp: Paired devices → the device → Allow typing; error `typing_off` otherwise).
 
 use iroh::endpoint::{ReadExactError, RecvStream, SendStream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -29,7 +46,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{Result, err};
 
 /// Protocol version this build speaks.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// Largest frame accepted (the host is reachable from the internet: never trust a length).
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -44,7 +61,39 @@ pub enum Request {
     Sessions,
     /// Answered at once with `pong` and the same id (round-trip time).
     Ping { id: u64 },
+    /// v2. What that pane shows (a [`PaneView`]); subscribes to it. `since`: the `rev` of the last answer (0: all of
+    /// it). `before`: instead, the chat items older than that item id (pulling for older ones).
+    Watch {
+        window: u64,
+        pane_id: u32,
+        #[serde(default)]
+        since: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<u64>,
+    },
+    /// v2. Stop following that pane.
+    Unwatch { window: u64, pane_id: u32 },
+    /// v2. Typing into that pane, as if on the computer: `text` is pasted (one line), then `keys` are pressed (see
+    /// [`KEYS`]). `option`: choose that option (0-based) of the question the pane shows, if it is still the one
+    /// with that `prompt` id.
+    Input {
+        window: u64,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keys: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option: Option<u32>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        prompt: String,
+    },
 }
+
+/// Keys a phone may press in a pane.
+pub const KEYS: [&str; 9] = ["enter", "esc", "up", "down", "left", "right", "tab", "backspace", "ctrl_c"];
+/// Longest text a phone may type at once (characters).
+pub const MAX_TEXT: usize = 4000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -54,6 +103,93 @@ pub enum Response {
     Sessions { sessions: Vec<Session> },
     Pong { id: u64 },
     Error { code: String, message: String },
+    /// v2: the answer to `watch`.
+    Pane(Box<PaneView>),
+    /// v2: done (`unwatch`, `input`).
+    Ok,
+}
+
+/// What a pane shows, for the phone. A pane running Claude Code or Codex whose conversation was found is a chat
+/// (`kind` "chat", from its transcript); any other is its screen as text (`kind` "screen").
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaneView {
+    pub window: u64,
+    pub pane_id: u32,
+    /// Ask again with `since` = this to get only what changed.
+    pub rev: u64,
+    pub kind: String,
+    /// "claude", "codex" or "".
+    #[serde(default)]
+    pub agent: String,
+    /// "working", "waiting" (a question is waiting for an answer), "finished" (the agent is done, your turn),
+    /// "running" (some other program), "idle" (at the shell's prompt).
+    #[serde(default)]
+    pub status: String,
+    /// The conversation's title, when the agent gave it one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// Chat items new or changed since `since` (oldest first); all the recent ones when `reset`.
+    #[serde(default)]
+    pub items: Vec<ChatItem>,
+    /// Drop what you had for this pane (first answer, another conversation, or the kind changed).
+    #[serde(default)]
+    pub reset: bool,
+    /// Older items exist (ask with `before`).
+    #[serde(default)]
+    pub more: bool,
+    /// The screen's text, one line per row (scrollback first), when it changed since `since`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<Vec<String>>,
+    /// The question the pane is asking now, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<Prompt>,
+    /// This device may type here.
+    #[serde(default)]
+    pub typing: bool,
+    /// Where the conversation comes from ("this computer", "ssh fr"), or why there is no chat.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+/// One message of a conversation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ChatItem {
+    /// Stable for this item while the pane is watched (an item that changes comes again with the same id).
+    pub id: u64,
+    /// "user", "assistant" (markdown), "tool" (one line, e.g. "Edited main.cpp", with `detail`) or "note".
+    pub role: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    /// A tool call that failed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
+    /// A tool call still running (or waiting for permission).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+}
+
+/// A question with options on the pane's screen (Claude Code's permission prompts and menus, Codex's approvals).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Prompt {
+    /// Changes when the question or its options change; `input` with `option` must carry it.
+    pub id: String,
+    pub question: String,
+    /// What it is about (the command, the file), a few lines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<String>,
+    pub options: Vec<PromptOption>,
+    /// The option selected now (0-based).
+    #[serde(default)]
+    pub selected: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PromptOption {
+    pub label: String,
+    /// More text under the label (its description, or the rest of a long label).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hint: String,
 }
 
 /// One terminal pane of a Warp window.
@@ -76,6 +212,13 @@ pub struct Session {
     /// "claude" or "codex" when one of them runs there.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub agent: String,
+    /// The pane's id in its window, for `watch` and `input` (stable while it is open; 0 from an older Warp).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pane_id: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Error codes of [`Response::Error`] (and QUIC close reasons).
@@ -87,6 +230,12 @@ pub mod code {
     pub const BAD_REQUEST: &str = "bad_request";
     pub const UNAVAILABLE: &str = "unavailable";
     pub const REVOKED: &str = "revoked";
+    /// v2: this device may not type here (Warp: Paired devices → the device → Allow typing).
+    pub const TYPING_OFF: &str = "typing_off";
+    /// v2: the pane isn't there any more.
+    pub const NO_PANE: &str = "no_pane";
+    /// v2: the question answered is no longer on the screen.
+    pub const PROMPT_GONE: &str = "prompt_gone";
 }
 
 /// QUIC close codes used by the host.
@@ -145,5 +294,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.agent, "");
+        assert_eq!(s.pane_id, 0);
+    }
+
+    #[test]
+    fn v2_messages() {
+        // A v1 session list (no pane_id) still reads, and pane_id 0 is left out.
+        let s = Session { window: 1, tab: 0, pane: 0, ..Default::default() };
+        assert!(!serde_json::to_string(&s).unwrap().contains("pane_id"));
+        let w: Request = serde_json::from_str(r#"{"type":"watch","window":5,"pane_id":3}"#).unwrap();
+        assert_eq!(w, Request::Watch { window: 5, pane_id: 3, since: 0, before: None });
+        let i: Request = serde_json::from_str(r#"{"type":"input","window":5,"pane_id":3,"keys":["enter"]}"#).unwrap();
+        assert!(matches!(i, Request::Input { ref text, ref keys, option: None, .. } if text.is_empty() && keys == &["enter"]));
+        let ok = encode(&Response::Ok).unwrap();
+        assert_eq!(&ok[4..], br#"{"type":"ok"}"#);
+        let p: Response = serde_json::from_str(r#"{"type":"pane","window":5,"pane_id":3,"rev":2,"kind":"screen"}"#).unwrap();
+        assert!(matches!(p, Response::Pane(ref v) if v.rev == 2 && v.items.is_empty() && v.prompt.is_none()));
     }
 }
