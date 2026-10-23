@@ -1,7 +1,7 @@
 import Foundation
 import UIKit
 
-/// The Rust core (mobile/core): synchronous JSON calls, made here on one background queue.
+/// The Rust core (mobile/core): synchronous JSON calls, made here on one background queue (Forget on its own).
 final class Core {
     private let handle: OpaquePointer?
     private let queue = DispatchQueue(label: "warp.core")
@@ -14,6 +14,16 @@ final class Core {
     }
 
     func call(_ request: [String: Any]) async -> Answer {
+        await call(request, on: queue)
+    }
+
+    /// Forgets the paired computer at once: not behind the queue, where a call may be waiting up to 30 s for a computer
+    /// that is gone (the core cancels it).
+    func forget() async -> Answer {
+        await call(["op": "forget"], on: .global(qos: .userInitiated))
+    }
+
+    private func call(_ request: [String: Any], on queue: DispatchQueue) async -> Answer {
         await withCheckedContinuation { cont in
             queue.async {
                 guard let handle = self.handle,

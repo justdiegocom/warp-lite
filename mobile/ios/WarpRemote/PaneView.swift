@@ -122,6 +122,14 @@ struct PaneView: View {
     }
 
     var body: some View {
+        if m.session.pane_id == nil {
+            UpdateWarpView(title: m.session.title)
+        } else {
+            pane
+        }
+    }
+
+    private var pane: some View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
@@ -186,6 +194,26 @@ struct PaneView: View {
         }
         .task { await m.run() }
         .onDisappear { Task { await m.stop() } }
+    }
+}
+
+/// A pane of a Warp older than the phone's (it lists its terminals but can't show one): what to do.
+struct UpdateWarpView: View {
+    var title: String
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "arrow.down.circle").font(.system(size: 44)).foregroundStyle(accent)
+            Text("Update Warp on your computer").font(.headline)
+            Text("This Warp lists its terminals but can't show them on the phone. It updates itself; to update now, right-click its title bar and choose **Check for updates**.")
+                .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(white: 0.02).ignoresSafeArea())
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+        .accessibilityIdentifier("update-warp")
     }
 }
 
