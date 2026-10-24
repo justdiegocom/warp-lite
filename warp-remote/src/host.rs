@@ -39,6 +39,11 @@ pub trait SessionSource: Send + Sync + 'static {
         async { Err(err("no panes here")) }
     }
 
+    /// Only what that pane shows now, no scrollback (for the list: whether an agent there works or asks something).
+    fn visible(&self, window: u64, pane_id: u32) -> impl Future<Output = Result<PaneScreen>> + Send {
+        self.screen(window, pane_id)
+    }
+
     /// What runs in that pane.
     fn info(&self, _window: u64, _pane_id: u32) -> impl Future<Output = Result<PaneInfo>> + Send {
         async { Err(err("no panes here")) }
@@ -52,8 +57,10 @@ pub trait SessionSource: Send + Sync + 'static {
 
 /// A phone that stopped asking about a pane for this long stops watching it.
 const WATCH_IDLE: Duration = Duration::from_secs(60);
-/// Panes one connection may watch at once.
+/// Panes (and subagents) one connection may watch at once.
 const MAX_WATCHES: usize = 8;
+/// Panes whose screen the session list looks at, at most (busy ones, for their agent's status).
+const MAX_LOOKS: usize = 24;
 /// Between pasted text and the keys after it, and between keys that move through a menu: a program reads each one
 /// separately (an Enter right behind a paste could be taken as part of it).
 const AFTER_TEXT: Duration = Duration::from_millis(150);
@@ -326,25 +333,32 @@ impl<S: SessionSource> Host<S> {
     }
 
     async fn requests(&self, device: PublicKey, send: &mut SendStream, recv: &mut RecvStream) -> Result<()> {
-        // The panes this connection watches: they end with it (and so does any ssh following a transcript).
-        let mut watches: HashMap<(u64, u32), Watch> = HashMap::new();
+        // The panes (and subagents: the pane's key with the subagent's id) this connection watches: they end with it
+        // (and so does any ssh following a transcript).
+        let mut watches: HashMap<(u64, u32, String), Watch> = HashMap::new();
         let mut typed = false;
         // Read as plain JSON first: a request type from a newer app gets an error, not a disconnect.
         while let Some(v) = proto::read_frame::<serde_json::Value>(recv).await? {
             let resp = match serde_json::from_value::<Request>(v) {
                 Ok(Request::Sessions) => match self.inner.source.sessions().await {
-                    Ok(sessions) => Response::Sessions { sessions },
+                    Ok(mut sessions) => {
+                        self.look_at(&mut sessions).await;
+                        Response::Sessions { sessions }
+                    }
                     Err(e) => Response::Error { code: code::UNAVAILABLE.into(), message: e.to_string() },
                 },
                 Ok(Request::Ping { id }) => Response::Pong { id },
                 Ok(Request::Hello { .. } | Request::Pair { .. }) => {
                     Response::Error { code: code::BAD_REQUEST.into(), message: "already connected".into() }
                 }
-                Ok(Request::Watch { window, pane_id, since, before }) => {
+                Ok(Request::Watch { window, pane_id, since, before, agent }) if !agent.is_empty() => {
+                    self.watch_subagent(&mut watches, window, pane_id, agent, since, before)
+                }
+                Ok(Request::Watch { window, pane_id, since, before, .. }) => {
                     self.watch(&device, &mut watches, window, pane_id, since, before).await
                 }
-                Ok(Request::Unwatch { window, pane_id }) => {
-                    watches.remove(&(window, pane_id));
+                Ok(Request::Unwatch { window, pane_id, agent }) => {
+                    watches.remove(&(window, pane_id, agent));
                     Response::Ok
                 }
                 Ok(Request::Input { window, pane_id, text, keys, option, prompt }) => {
@@ -362,10 +376,62 @@ impl<S: SessionSource> Host<S> {
         Ok(())
     }
 
+    /// An agent's pane in the list: its status (working, waiting for an answer, finished) from its screen, and the
+    /// agent itself for a pane running ssh, which Warp can't tell (only busy panes, and only while the list is asked).
+    async fn look_at(&self, sessions: &mut [Session]) {
+        for s in sessions.iter_mut().filter(|s| s.busy && s.pane_id != 0).take(MAX_LOOKS) {
+            let Ok(screen) = self.inner.source.visible(s.window, s.pane_id).await else { continue };
+            let rows = screen.visible();
+            if s.agent.is_empty() {
+                s.agent = screen::agent(rows).to_string();
+            }
+            if !s.agent.is_empty() {
+                let prompt = screen::prompt(rows).is_some();
+                s.status = screen::status(rows, &s.agent, prompt, true).to_string();
+            }
+        }
+    }
+
+    /// A subagent of a pane's Claude Code (v3): its conversation from its own file, read-only. The pane's watch must
+    /// be open (the phone opens the subagent from it); it is kept alive meanwhile.
+    fn watch_subagent(
+        &self,
+        watches: &mut HashMap<(u64, u32, String), Watch>,
+        window: u64,
+        pane_id: u32,
+        agent: String,
+        since: u64,
+        before: Option<u64>,
+    ) -> Response {
+        watches.retain(|_, w| w.last_poll.elapsed() < WATCH_IDLE);
+        let parent = (window, pane_id, String::new());
+        let key = (window, pane_id, agent.clone());
+        let Some(p) = watches.get_mut(&parent) else {
+            watches.remove(&key);
+            return Response::Error { code: code::NO_PANE.into(), message: "open that terminal first".into() };
+        };
+        p.last_poll = Instant::now();
+        let info = p.agent_info(&agent);
+        if !watches.contains_key(&key) {
+            if watches.len() >= MAX_WATCHES {
+                return Response::Error { code: code::BAD_REQUEST.into(), message: "watching too many panes".into() };
+            }
+            match watches[&parent].subagent(&agent) {
+                Ok(w) => {
+                    watches.insert(key.clone(), w);
+                }
+                Err(e) => return Response::Error { code: code::NO_PANE.into(), message: e },
+            }
+        }
+        let w = watches.get_mut(&key).unwrap();
+        w.set_sub_info(info);
+        Response::Pane(Box::new(w.poll(&PaneScreen::default(), since, before, false)))
+    }
+
     async fn watch(
         &self,
         device: &PublicKey,
-        watches: &mut HashMap<(u64, u32), Watch>,
+        watches: &mut HashMap<(u64, u32, String), Watch>,
         window: u64,
         pane_id: u32,
         since: u64,
@@ -373,7 +439,7 @@ impl<S: SessionSource> Host<S> {
     ) -> Response {
         let src = &self.inner.source;
         watches.retain(|_, w| w.last_poll.elapsed() < WATCH_IDLE);
-        let key = (window, pane_id);
+        let key = (window, pane_id, String::new());
         if !watches.contains_key(&key) && watches.len() >= MAX_WATCHES {
             return Response::Error { code: code::BAD_REQUEST.into(), message: "watching too many panes".into() };
         }

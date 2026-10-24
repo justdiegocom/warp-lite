@@ -88,7 +88,7 @@ pub fn prompt(rows: &[String]) -> Option<Prompt> {
 /// Non-empty lines from `row` (excluded) to the bottom: a question sits at the bottom of the screen, under it only
 /// its footer, an input box or tmux's status line.
 fn below(lines: &[&str], row: usize) -> usize {
-    lines[row + 1..].iter().filter(|l| !l.trim().is_empty()).count()
+    lines[row + 1..].iter().filter(|l| !l.trim().is_empty() && !noise(l)).count()
 }
 
 fn numbered(lines: &[&str]) -> Option<Prompt> {
@@ -250,9 +250,34 @@ pub fn keys_for(from: u32, to: u32) -> Vec<&'static str> {
     k
 }
 
-/// The last few non-empty rows, where programs draw their status.
+/// Rows under a program's own footer that say nothing about it: tmux's status line, and Claude Code's list of
+/// background agents under its input box («● main», «◯ general-purpose 3h 25m 10s · ↓ 696.4k»).
+fn noise(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("● ") || t.starts_with("◯ ") || t == "●" || (line.starts_with('[') && tmux_session(&[line.to_string()]).is_some())
+}
+
+/// The last few non-empty rows, where programs draw their status (without [`noise`]).
 fn bottom(rows: &[String], n: usize) -> Vec<&str> {
-    rows.iter().rev().map(|l| l.trim()).filter(|l| !l.is_empty()).take(n).collect()
+    rows.iter().rev().filter(|l| !noise(l)).map(|l| l.trim()).filter(|l| !l.is_empty()).take(n).collect()
+}
+
+/// What Claude Code says it is doing, on the line above its input box: «Baking… (3m 12s · ↓ 4.2k tokens)», «Waiting
+/// for 3 background agents to finish», or how long the last turn took. Empty when it doesn't show one.
+pub fn activity(rows: &[String]) -> String {
+    let n = rows.len();
+    let Some(input) = (n.saturating_sub(30)..n).rev().find(|&r| r > 0 && rows[r].trim_start().starts_with('❯') && rows[r - 1].trim_start().starts_with('─')) else {
+        return String::new();
+    };
+    let Some(line) = rows[..input - 1].iter().rev().take(4).map(|l| l.trim()).find(|l| !l.is_empty()) else { return String::new() };
+    let mut cs = line.chars();
+    let glyph = cs.next().unwrap_or(' ');
+    if !matches!(glyph, '✻' | '✶' | '✳' | '✢' | '✽' | '·' | '*') || cs.next() != Some(' ') {
+        return String::new();
+    }
+    let t = line[glyph.len_utf8() + 1..].trim();
+    let t = t.replace(" · esc to interrupt", "").replace("esc to interrupt · ", "").replace("(esc to interrupt)", "");
+    t.trim().trim_end_matches(" ()").chars().take(160).collect()
 }
 
 /// Whether the agent is working: Claude Code and Codex both say «esc to interrupt» while they do.
@@ -290,7 +315,8 @@ pub fn agent(rows: &[String]) -> &'static str {
 }
 
 /// The tmux session the screen shows: the default status line starts with «[name] ». tmux cuts it at 10 characters
-/// (status-left-length), so a longer name shows as its first 9 («[phone-dem0:zsh*»): then a pattern, «phone-dem*».
+/// (status-left-length): a name of 8 fills it with its brackets («[fnviewer]0:zsh*») and a longer one shows as its first
+/// 9 («[phone-dem0:zsh*»): then a pattern, «phone-dem*».
 pub fn tmux_session(rows: &[String]) -> Option<String> {
     let last = rows.iter().rev().find(|l| !l.trim().is_empty())?;
     let rest = last.strip_prefix('[')?;
@@ -298,14 +324,24 @@ pub fn tmux_session(rows: &[String]) -> Option<String> {
         let name = &rest[..end];
         return valid_name(name).then(|| name.to_string());
     }
+    if let Some(end) = rest.find(']').filter(|&e| e <= 8)
+        && valid_name(&rest[..end])
+    {
+        return Some(rest[..end].to_string());
+    }
     let start: String = rest.chars().take(9).collect();
     (start.chars().count() == 9 && valid_name(&start)).then(|| format!("{start}*"))
 }
 
-/// The tmux session to look in: the screen's, or the command's when the screen's is cut and the command's fits it.
-pub fn pick_tmux(screen: Option<String>, command: Option<String>) -> Option<String> {
+/// The tmux session to look in: the screen's; when the screen's is cut, the session the remote command opens
+/// (`tmux attach -t name`) or else a word of that command (a script given the session's name, `fr-session name`) that
+/// it is the start of; with nothing on the screen, the command's.
+pub fn pick_tmux(screen: Option<String>, command: Option<String>, words: &[String]) -> Option<String> {
     match (screen, command) {
-        (Some(s), Some(c)) if s.ends_with('*') && c.starts_with(s.trim_end_matches('*')) => Some(c),
+        (Some(s), c) if s.ends_with('*') => {
+            let prefix = s.trim_end_matches('*');
+            c.into_iter().chain(words.iter().cloned()).find(|w| w.starts_with(prefix) && valid_name(w)).or(Some(s))
+        }
         (Some(s), _) => Some(s),
         (None, c) => c,
     }
@@ -471,9 +507,56 @@ mod tests {
         // tmux's status line, whole and cut (as captured over ssh).
         let cut = rows("❯ \n[phone-dem0:zsh*                 agents: 4 blocked · 6 idle \"ubuntu@vnic-main:/tmp\" 20:05 23-Oct-26");
         assert_eq!(tmux_session(&cut).as_deref(), Some("phone-dem*"));
-        assert_eq!(pick_tmux(tmux_session(&cut), Some("phone-demo".into())).as_deref(), Some("phone-demo"));
-        assert_eq!(pick_tmux(tmux_session(&cut), Some("other".into())).as_deref(), Some("phone-dem*"));
-        assert_eq!(pick_tmux(None, Some("x".into())).as_deref(), Some("x"));
+        assert_eq!(pick_tmux(tmux_session(&cut), Some("phone-demo".into()), &[]).as_deref(), Some("phone-demo"));
+        assert_eq!(pick_tmux(tmux_session(&cut), Some("other".into()), &[]).as_deref(), Some("phone-dem*"));
+        assert_eq!(pick_tmux(None, Some("x".into()), &[]).as_deref(), Some("x"));
         assert_eq!(tmux_session(&rows("[a;b] 0:zsh*")), None);
+        // A name of 8 fills status-left with its brackets, with no space after them.
+        assert_eq!(tmux_session(&rows("[fnviewer]0:claude*                \"host\" 23:10 23-Oct-26")).as_deref(), Some("fnviewer"));
+        assert_eq!(tmux_session(&rows("[warp] 0:zsh*")).as_deref(), Some("warp"));
+        // A cut name, resolved by the script the remote command runs with the session's name (`ssh -t fr "~/bin/fr-session radarnite"`).
+        let words: Vec<String> = ["~/bin/fr-session", "radarnite"].map(String::from).to_vec();
+        let cut9 = rows("[radarnite0:claude*  \"host\" 23:10 23-Oct-26");
+        assert_eq!(tmux_session(&cut9).as_deref(), Some("radarnite*"));
+        assert_eq!(pick_tmux(tmux_session(&cut9), None, &words).as_deref(), Some("radarnite"));
+        let long: Vec<String> = ["~/bin/fr-session", "radarnite-launcher"].map(String::from).to_vec();
+        assert_eq!(pick_tmux(tmux_session(&cut9), None, &long).as_deref(), Some("radarnite-launcher"));
+        assert_eq!(pick_tmux(tmux_session(&cut9), None, &[]).as_deref(), Some("radarnite*"));
+    }
+
+    // Claude Code 2.1 with background agents listed under its input box, inside tmux (a name of 8: no space after «]»).
+    const AGENTS: &str = "\
+  and the rest is the same.
+
+✻ Waiting for 3 background agents to finish
+
+─────────────────── Long conversation name ─
+❯\u{20}
+─────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 2 shells · ← …
+
+  ● main
+  ◯ general-purpose 3h 31m 10s · ↓ 696.4k
+  ◯ general-purpose 34m 50s · ↓ 461.1k
+  ◯ executor           27m 24s · ↓ 227.9k
+  ◯ executor           2m 4s · ↓ 7.9k
+  ◯ general-purpose 1m 1s · ↓ 1.1k
+
+[fnviewer]0:claude*                                \"vnic-main\" 23:10 23-Oct-26";
+
+    #[test]
+    fn background_agents_footer() {
+        let r = rows(AGENTS);
+        assert_eq!(agent(&r), "claude");
+        assert_eq!(tmux_session(&r).as_deref(), Some("fnviewer"));
+        assert!(prompt(&r).is_none());
+        assert_eq!(status(&r, "claude", false, true), "finished");
+        assert_eq!(activity(&r), "Waiting for 3 background agents to finish");
+        let busy = AGENTS.replace("2 shells · ← …", "esc to interrupt · ← …").replace("Waiting for 3 background agents to finish", "Baking… (3m 12s · ↓ 4.2k tokens · esc to interrupt)");
+        let b = rows(&busy);
+        assert_eq!(status(&b, "claude", false, true), "working");
+        assert_eq!(activity(&b), "Baking… (3m 12s · ↓ 4.2k tokens)");
+        assert_eq!(activity(&rows(IDLE)), "Cogitated for 5s · done 6:51 PM");
+        assert_eq!(activity(&rows(PERMISSION)), "");
     }
 }

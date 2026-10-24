@@ -205,19 +205,25 @@ impl Client {
         }
     }
 
-    /// v2: what that pane shows; subscribes to it (see [`Request::Watch`]).
-    pub async fn watch(&mut self, window: u64, pane_id: u32, since: u64, before: Option<u64>) -> Result<PaneView> {
+    /// v2: what that pane shows; subscribes to it (see [`Request::Watch`]). v3: `agent`, that subagent of it instead.
+    pub async fn watch(&mut self, window: u64, pane_id: u32, since: u64, before: Option<u64>, agent: &str) -> Result<PaneView> {
         self.need_v2().await?;
-        match self.request(&Request::Watch { window, pane_id, since, before }).await? {
+        if !agent.is_empty() && self.version().await? < 3 {
+            return Err(remote(code::UNSUPPORTED_VERSION, "update Warp on the computer to see its subagents"));
+        }
+        match self.request(&Request::Watch { window, pane_id, since, before, agent: agent.into() }).await? {
             Response::Pane(v) => Ok(*v),
             Response::Error { code, message } => Err(remote(&code, message)),
             other => Err(remote(code::BAD_REQUEST, format!("unexpected answer {other:?}"))),
         }
     }
 
-    pub async fn unwatch(&mut self, window: u64, pane_id: u32) -> Result<()> {
+    pub async fn unwatch(&mut self, window: u64, pane_id: u32, agent: &str) -> Result<()> {
         self.need_v2().await?;
-        self.expect_ok(&Request::Unwatch { window, pane_id }).await
+        if !agent.is_empty() && self.version().await? < 3 {
+            return Ok(());
+        }
+        self.expect_ok(&Request::Unwatch { window, pane_id, agent: agent.into() }).await
     }
 
     /// v2: types into that pane: `text` (one line), then `keys`; or `option` of the question with id `prompt`.

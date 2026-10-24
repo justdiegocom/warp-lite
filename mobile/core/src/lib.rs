@@ -7,16 +7,16 @@
 //! - `status`: `paired`, `host`, `host_id`, `device_id`, `connected`, `path`
 //! - `pair` (`ticket`): pairs with the computer showing that code; `host`, `path`
 //! - `connect`: connects to the paired computer; `host`, `path`
-//! - `sessions`: `host`, `sessions` (see warp-remote's protocol), `path`
+//! - `sessions`: `host`, `sessions` (see warp-remote's protocol), `path`, `version` (the protocol both speak)
 //! - `ping`: `rtt_ms`, `path`
 //! - `disconnect`
 //! - `forget`: at once, also while another call waits for that computer (a connect to one that is gone waits up to
 //!   30 s): that call, and any made before the forget still waiting for its turn, ends with code `cancelled`. The
 //!   device keeps its own key.
 //! - `remember` (`ticket`, `name`): remembers the computer of that code without reaching it (tests: one that is gone)
-//! - `watch` (`window`, `pane_id`, `since`, optional `before`): `pane` (warp-remote's `PaneView`: a chat or the screen's
-//!   text, the question it shows, whether this phone may type)
-//! - `unwatch` (`window`, `pane_id`)
+//! - `watch` (`window`, `pane_id`, `since`, optional `before`, `agent`): `pane` (warp-remote's `PaneView`: a chat or the
+//!   screen's text, the question it shows, whether this phone may type; with `agent`, that subagent's conversation)
+//! - `unwatch` (`window`, `pane_id`, optional `agent`)
 //! - `input` (`window`, `pane_id`, optional `text`, `keys`, `option` + `prompt`): types into the pane
 //!
 //! `path` is `{"kind":"direct"|"relay"|"none","addr":...,"rtt_ms":...}`.
@@ -146,7 +146,8 @@ async fn run(c: &mut Client, dir: &Path, op: &str, req: &Value) -> Result<Value,
         }
         "sessions" => {
             let sessions = c.sessions().await?;
-            json!({"host": c.host_name(), "sessions": sessions, "path": c.path()})
+            let version = c.version().await?;
+            json!({"host": c.host_name(), "sessions": sessions, "path": c.path(), "version": version})
         }
         "ping" => {
             let rtt = c.ping().await?;
@@ -167,11 +168,12 @@ async fn run(c: &mut Client, dir: &Path, op: &str, req: &Value) -> Result<Value,
             let (w, p) = pane(req);
             let since = req.get("since").and_then(Value::as_u64).unwrap_or(0);
             let before = req.get("before").and_then(Value::as_u64);
-            json!({"pane": c.watch(w, p, since, before).await?})
+            let agent = req.get("agent").and_then(Value::as_str).unwrap_or("");
+            json!({"pane": c.watch(w, p, since, before, agent).await?})
         }
         "unwatch" => {
             let (w, p) = pane(req);
-            c.unwatch(w, p).await?;
+            c.unwatch(w, p, req.get("agent").and_then(Value::as_str).unwrap_or("")).await?;
             json!({})
         }
         "input" => {

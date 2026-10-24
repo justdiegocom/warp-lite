@@ -5,7 +5,7 @@
 //! with nothing to configure and no server of our own.
 //!
 //! - [`ticket`]: the pairing ticket shown as a QR code (endpoint address + one-time secret).
-//! - [`proto`]: the protocol (v2), length-prefixed JSON frames on one bidirectional stream.
+//! - [`proto`]: the protocol (v3), length-prefixed JSON frames on one bidirectional stream.
 //! - [`store`]: secret keys, the paired-device allow-list (and who may type) and the remembered host.
 //! - [`host`]: the side that runs next to Warp (`warp-remote.exe`).
 //! - [`client`]: the side the phone and `warp-remote-cli` use.

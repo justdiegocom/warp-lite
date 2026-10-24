@@ -2743,12 +2743,13 @@ static std::wstring PaneListText() {
     Leaves(g_tabs[i].root, ls);
     for (int j = 0; j < (int)ls.size(); j++) {
       Pane* p = ls[j];
-      // Then the tab's name, the agent (Claude Code / Codex) and the pane's id, for warp-remote (older windows read the
-      // first 5).
+      // Then the tab's name, the agent (Claude Code / Codex), the pane's id and its unread count, for warp-remote (older
+      // windows read the first 5).
       std::wstring tab = g_tabs[i].name.empty() ? ShortTitle(g_tabs[i].active) : g_tabs[i].name;
       const wchar_t* agent = p->agent == AGENT_CLAUDE ? L"claude" : p->agent == AGENT_CODEX ? L"codex" : L"";
       out += std::to_wstring(i) + L"\t" + std::to_wstring(j) + L"\t" + clean(PaneLabel(p)) + L"\t" + clean(p->cwd) + L"\t" +
-             clean(p->runningCmd) + L"\t" + clean(tab) + L"\t" + agent + L"\t" + std::to_wstring(p->id) + L"\n";
+             clean(p->runningCmd) + L"\t" + clean(tab) + L"\t" + agent + L"\t" + std::to_wstring(p->id) + L"\t" +
+             std::to_wstring(p->unread) + L"\n";
     }
   }
   return out;
@@ -6775,6 +6776,48 @@ static std::wstring LocalTranscript(Pane* p) {
   return L"";
 }
 
+// The command line of the ssh running under that pane, for warp-remote to read the conversation of the agent it
+// reaches over the user's own ssh: also when the pane starts it through a wrapper (a .bat, a PowerShell function such as
+// «fr fnviewer»), where the pane's command doesn't say so. The outermost ssh.exe (not one a ProxyJump starts); empty
+// when there is none. Windows keeps every process's command line (ProcessCommandLineInformation, 8.1 and later).
+static std::wstring SshCommandLine(Pane* p) {
+  if (!p->pid || p->runningCmd.empty()) return L"";
+  typedef LONG(WINAPI * QueryInfo)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+  static QueryInfo query = (QueryInfo)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+  if (!query) return L"";
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return L"";
+  std::map<DWORD, std::vector<DWORD>> kids;
+  std::map<DWORD, std::pair<DWORD, std::wstring>> procs;  // pid → (parent, exe)
+  PROCESSENTRY32W pe{sizeof pe};
+  for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+    if (pe.th32ProcessID != pe.th32ParentProcessID) kids[pe.th32ParentProcessID].push_back(pe.th32ProcessID);
+    procs[pe.th32ProcessID] = {pe.th32ParentProcessID, pe.szExeFile};
+  }
+  CloseHandle(snap);
+  auto exe = [&](DWORD pid) { auto it = procs.find(pid); return it == procs.end() ? std::wstring() : it->second.second; };
+  for (DWORD pid : Descendants(kids, p->pid)) {
+    if (_wcsicmp(exe(pid).c_str(), L"ssh.exe") != 0 || _wcsicmp(exe(procs[pid].first).c_str(), L"ssh.exe") == 0) continue;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) continue;
+    std::vector<BYTE> buf(4096);
+    ULONG need = 0;
+    LONG st = query(h, 60 /* ProcessCommandLineInformation */, buf.data(), (ULONG)buf.size(), &need);
+    if (st < 0 && need > buf.size() && need < (1u << 20)) {
+      buf.resize(need);
+      st = query(h, 60, buf.data(), (ULONG)buf.size(), &need);
+    }
+    CloseHandle(h);
+    struct Text {  // UNICODE_STRING
+      USHORT len, max;
+      PWSTR chars;
+    };
+    const Text* t = (const Text*)buf.data();
+    if (st >= 0 && t->chars && t->len) return std::wstring(t->chars, t->len / sizeof(wchar_t));
+  }
+  return L"";
+}
+
 // Typing from a phone, as if on this keyboard: text as a paste (one line already), keys by name. The title bar says
 // «Phone typing» for a few seconds.
 static bool RemoteInput(Pane* p, const std::wstring& kind, const std::wstring& arg) {
@@ -6810,8 +6853,8 @@ static bool RemoteInput(Pane* p, const std::wstring& kind, const std::wstring& a
 }
 
 // warp-remote about one of this window's panes (only from this Warp's warp-remote: see the caller): «screen <id>
-// <rows>» and «info <id>» are answered with kCopyRemoteAnswer; «input <id> <device> text|key\t<what>» types, only for a
-// device that is paired and allowed to type (checked here too).
+// <rows>» and «info <id>» (agent, command, folder, transcript, ssh command line) are answered with kCopyRemoteAnswer;
+// «input <id> <device> text|key\t<what>» types, only for a device that is paired and allowed to type (checked here too).
 static BOOL OnRemotePane(HWND from, const std::wstring& t) {
   size_t tab = t.find(L'\t');
   std::wistringstream in(t.substr(0, tab));
@@ -6832,7 +6875,8 @@ static BOOL OnRemotePane(HWND from, const std::wstring& t) {
       return s;
     };
     const wchar_t* agent = p->agent == AGENT_CLAUDE ? L"claude" : p->agent == AGENT_CODEX ? L"codex" : L"";
-    answer = L"info\t" + std::wstring(agent) + L"\t" + clean(p->runningCmd) + L"\t" + clean(p->cwd) + L"\t" + clean(LocalTranscript(p));
+    answer = L"info\t" + std::wstring(agent) + L"\t" + clean(p->runningCmd) + L"\t" + clean(p->cwd) + L"\t" + clean(LocalTranscript(p)) +
+             L"\t" + clean(SshCommandLine(p));
   } else if (cmd == L"input") {
     in >> dev >> kind;
     if (tab == std::wstring::npos || !TypingDevices().count(dev)) return FALSE;
