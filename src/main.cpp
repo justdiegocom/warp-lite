@@ -112,7 +112,7 @@ static const int kGap = 1;           // separación entre paneles (px)
 static const int kPad = 4;           // margen interior de cada panel (px)
 static const size_t kScrollback = 5000;
 
-enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS, WM_APP_PROMPT, WM_APP_NETCHANGE, WM_APP_NOTE, WM_APP_OPEN };
+enum { WM_APP_DIRTY = WM_APP + 1, WM_APP_EXITED, WM_APP_SCRIPT, WM_APP_LAYOUT, WM_APP_CLIP, WM_APP_PARAMS, WM_APP_UPDATE, WM_APP_UPDATED, WM_APP_UPDPROG, WM_APP_FONT, WM_APP_PATHS, WM_APP_PROMPT, WM_APP_NETCHANGE, WM_APP_NOTE, WM_APP_OPEN, WM_APP_RESUMES };
 enum { TIMER_RESTORE = 1, TIMER_SCRIPT = 2, TIMER_TOAST = 3, TIMER_FRAME = 4, TIMER_UPDATE = 5, TIMER_UPDANIM = 6, TIMER_PATHS = 7,
        TIMER_REMOTE = 8, TIMER_PAIR = 9, TIMER_PULSE = 10, TIMER_PHONE = 11, TIMER_JOIN = 12, TIMER_SAVE = 13 };
 
@@ -206,6 +206,7 @@ struct Pane {
   int lineRow = -1, lineCol = -1;
   // Restauración tras reiniciar.
   std::string restoreCmd;
+  bool plainShell = false;  // a shell without the prompt integration (WARPLITE_SHELL): the box isn't used
   DWORD spawnTick = 0;
   std::wstring agentName;  // nombre de la conversación de Claude Code que corre aquí (título de la pestaña)
   int agent = 0;           // AGENT_* que corre aquí, también si se lanzó con un atajo (ver UpdateRunning)
@@ -1019,6 +1020,7 @@ static bool SpawnPane(Pane* p) {
            g.Data4[1], g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
   p->token = tok;
   std::wstring cmd = ShellCommand(p->token);
+  p->plainShell = GetEnvironmentVariableW(L"WARPLITE_SHELL", nullptr, 0) > 0;
   std::wstring env = ShellEnvironment();
   wchar_t home[MAX_PATH] = L"";
   GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH);
@@ -1651,24 +1653,37 @@ static std::vector<DWORD> PidsWithFileOpen(const std::wstring& path) {
 // escribió hace menos se queda con la conversación tocada hace menos.
 static std::map<Pane*, std::string> g_resumeCmd;
 
-static void ComputeResumes() {
-  g_resumeCmd.clear();
-  std::map<std::pair<int, std::wstring>, std::vector<Pane*>> groups;
+// What that needs of a pane running Claude Code or Codex, copied on the UI thread, so that the lookups (processes,
+// conversation files, which process has a file open) can run on a worker (SaveChanged).
+struct ResumeIn {
+  Pane* p;  // only a key: never read off the UI thread
+  int agent;
+  std::wstring cwd;
+  std::string lastCmd;
+  DWORD pid, lastOut;
+};
+
+static std::vector<ResumeIn> ResumeInputs(const std::vector<Pane*>& panes) {
+  std::vector<ResumeIn> out;
+  for (Pane* p : panes)
+    if (!p->runningCmd.empty() && !ResumeCommand(p->lastCmd, "", p->agent).empty())
+      out.push_back({p, p->agent, p->cwd, p->lastCmd, p->pid, p->lastOut});
+  return out;
+}
+
+// Any thread: it only reads its input and the disk.
+static std::map<Pane*, std::string> ResumeCommands(const std::vector<ResumeIn>& in) {
+  std::map<Pane*, std::string> res;
+  std::map<std::pair<int, std::wstring>, std::vector<const ResumeIn*>> groups;
   std::map<DWORD, std::vector<DWORD>> kids;
-  bool haveKids = false;
-  for (auto& t : g_win->tabs) {
-    std::vector<Pane*> ls;
-    Leaves(t.root, ls);
-    for (Pane* p : ls)
-      if (!p->runningCmd.empty() && !ResumeCommand(p->lastCmd, "", p->agent).empty()) {
-        std::wstring key = p->cwd;
-        std::transform(key.begin(), key.end(), key.begin(), towlower);
-        groups[{p->agent, key}].push_back(p);
-        if (!haveKids) kids = ChildrenByParent(), haveKids = true;
-      }
+  if (!in.empty()) kids = ChildrenByParent();
+  for (const ResumeIn& r : in) {
+    std::wstring key = r.cwd;
+    std::transform(key.begin(), key.end(), key.begin(), towlower);
+    groups[{r.agent, key}].push_back(&r);
   }
   for (auto& [key, panes] : groups) {
-    std::sort(panes.begin(), panes.end(), [](Pane* x, Pane* y) { return (int)(x->lastOut - y->lastOut) > 0; });
+    std::sort(panes.begin(), panes.end(), [](const ResumeIn* x, const ResumeIn* y) { return (int)(x->lastOut - y->lastOut) > 0; });
     std::wstring cwd = panes[0]->cwd;
     std::vector<AgentSession> s = key.first == AGENT_CLAUDE ? ClaudeSessions(cwd) : CodexSessions(cwd);
     std::map<DWORD, std::string> codexByPid;
@@ -1676,8 +1691,8 @@ static void ComputeResumes() {
       for (size_t k = 0; k < s.size() && k < 30; k++)
         for (DWORD pid : PidsWithFileOpen(s[k].path)) codexByPid[pid] = s[k].id;
     std::set<std::string> taken;
-    std::vector<Pane*> rest;
-    for (Pane* p : panes) {
+    std::vector<const ResumeIn*> rest;
+    for (const ResumeIn* p : panes) {
       std::string id;
       for (DWORD pid : Descendants(kids, p->pid)) {
         if (key.first == AGENT_CLAUDE) id = ClaudeSessionOfPid(pid);
@@ -1693,17 +1708,23 @@ static void ComputeResumes() {
       bool exists = key.first != AGENT_CLAUDE ||
                     std::any_of(s.begin(), s.end(), [&](const AgentSession& a) { return a.id == id; });
       if (!exists) cmd = cmd.substr(0, cmd.size() - id.size() - 10) + " --session-id " + id;
-      g_resumeCmd[p] = cmd;
+      res[p->p] = cmd;
     }
     size_t k = 0;
-    for (Pane* p : rest) {
+    for (const ResumeIn* p : rest) {
       while (k < s.size() && taken.count(s[k].id)) k++;
       std::string id = k < s.size() ? s[k++].id : "";
       if (!id.empty()) taken.insert(id);
-      g_resumeCmd[p] = ResumeCommand(p->lastCmd, id, key.first);
+      res[p->p] = ResumeCommand(p->lastCmd, id, key.first);
     }
   }
+  return res;
 }
+
+static std::vector<Pane*> WindowPanes();
+
+// For the panes of the window being handled, now.
+static void ComputeResumes() { g_resumeCmd = ResumeCommands(ResumeInputs(WindowPanes())); }
 
 // ---------------------------------------------------------------------------
 // Sesión: pestañas, divisiones y última orden de cada panel
@@ -1751,7 +1772,9 @@ static bool WriteSessionFile(const std::wstring& path, const std::string& data) 
   return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
-static void SaveSession() {
+// The window's session, now. lookup: the conversations of what runs in it are looked up here (a window closing);
+// otherwise they are those SaveChanged looked up on a worker.
+static void SaveSession(bool lookup = true) {
   g_win->saveDue = false;
   if (g_win->tabs.empty() || g_win->sessionPath.empty()) return;
   std::ostringstream o;
@@ -1764,7 +1787,7 @@ static void SaveSession() {
                (wp.showCmd == SW_SHOWMINIMIZED && (wp.flags & WPF_RESTORETOMAXIMIZED));
     o << "win " << r.left << " " << r.top << " " << r.right << " " << r.bottom << " " << (max ? 1 : 0) << "\n";
   }
-  ComputeResumes();
+  if (lookup) ComputeResumes();
   for (auto& t : g_win->tabs) {
     std::vector<Pane*> ls;
     Leaves(t.root, ls);
@@ -2018,7 +2041,7 @@ static void SendKey(Pane* p, VTermKey key, VTermModifier mod) {
     if (!cmd.empty()) p->submittedCmd = cmd;
     if (!cmd.empty() && cmd != "exit" && cmd != "logout") p->lastCmd = cmd;
     LeaveCriticalSection(&p->cs);
-    if (!cmd.empty()) SaveSession();
+    if (!cmd.empty()) SessionChanged();
     EnterCriticalSection(&p->cs);
   } else {
     MarkLineStart(p);
@@ -2203,7 +2226,7 @@ static void SetZoom(int z) {
   MakeFonts();
   Relayout();
   Toast(Tf(S_ZOOM, g_win->zoom));
-  SaveSession();
+  SessionChanged();
 }
 
 static void SetFontSize(int px) {
@@ -2211,7 +2234,7 @@ static void SetFontSize(int px) {
   MakeFonts();
   Relayout();
   Toast(Tf(S_FONT, g_win->fontPx));
-  SaveSession();
+  SessionChanged();
 }
 
 static std::wstring ShortTitle(Pane* p);
@@ -2231,7 +2254,7 @@ static void EndRename(bool commit) {
     std::wstring t = g_win->renameText;
     size_t a = t.find_first_not_of(L" \t"), b = t.find_last_not_of(L" \t");
     g_win->tabs[g_win->renameTab].name = a == std::wstring::npos ? L"" : t.substr(a, b - a + 1);
-    SaveSession();
+    SessionChanged();
   }
   g_win->renameTab = -1;
   InvalidateRect(g_win->hwnd, nullptr, FALSE);
@@ -2395,7 +2418,7 @@ static void HideTab(int i) {
   if ((int)g_win->tabs.size() - HiddenCount() <= 1) return;  // siempre queda una visible
   g_win->tabs[i].hidden = true;
   if (i == g_win->activeTab) ActivateTab(NextVisibleTab(i, 1));
-  SaveSession();
+  SessionChanged();
   Relayout();
 }
 
@@ -2435,7 +2458,7 @@ static void HiddenMenu(POINT screen) {
   if (cmd == 1)
     for (auto& t : g_win->tabs) t.hidden = false;
   else if (cmd >= 100) ActivateTab(cmd - 100);
-  if (cmd) SaveSession(), Relayout();
+  if (cmd) SessionChanged(), Relayout();
 }
 
 // ---------------------------------------------------------------------------
@@ -2491,13 +2514,12 @@ static void Detach(int tabIdx, Pane* single, POINT screen) {
   in.script = in.childScript = g_win->childScript;
   in.adopt = TakeOut(tabIdx, single);
   if (Window* to = OpenWindow(in)) {
-    InWindow iw(to);
-    SaveSession();
+    SessionChanged(to);
   } else {  // no new window: it stays here, as a tab
     g_win->tabs.push_back(in.adopt);
     ActivateTab((int)g_win->tabs.size() - 1);
   }
-  SaveSession();
+  SessionChanged();
 }
 
 static bool OutsideWindow(POINT screen) {
@@ -2508,7 +2530,7 @@ static bool OutsideWindow(POINT screen) {
 
 static void ToggleVerticalTabs() {
   g_win->vertTabs = !g_win->vertTabs;
-  SaveSession();
+  SessionChanged();
   Relayout();
 }
 
@@ -2891,7 +2913,7 @@ static void BringToFront(HWND h) {
 // «Abrir Warp aquí»: pestaña nueva en esa carpeta, detrás de la activa.
 static void OpenDirTab(const std::wstring& dir) {
   NewTab(g_win->tabs.empty() ? -1 : g_win->activeTab + 1, dir);
-  SaveSession();
+  SessionChanged();
   BringToFront(g_win->hwnd);
   InvalidateRect(g_win->hwnd, nullptr, FALSE);
 }
@@ -3079,7 +3101,7 @@ static void SubmitEditor(Pane* p) {
   p->outBuf += u + "\r";
   LeaveCriticalSection(&p->cs);
   FlushOut(p);
-  if (!cmd.empty()) SaveSession();
+  if (!cmd.empty()) SessionChanged();
 }
 
 static std::wstring Lower(std::wstring s) {
@@ -5046,10 +5068,10 @@ static bool JoinWindow(Window* to, int tabIdx, Pane* single, POINT screen) {
     POINT at = screen;
     ScreenToClient(to->hwnd, &at);
     PutIn(t, at);
-    SaveSession();
+    SessionChanged();
   }
   BringToFront(to->hwnd);  // this window is in front: it may hand that over
-  if (!CloseIfEmpty()) SaveSession();
+  if (!CloseIfEmpty()) SessionChanged();
   return true;
 }
 
@@ -9257,7 +9279,7 @@ static void RunScriptStep() {
     RestartForUpdate(exe);
     return;
   } else if (s.rfind(L"reopen:", 0) == 0) {  // as if toggled in the title-bar menu
-    if (!g_win->isMain) g_win->reopen = s.substr(7) == L"on", SaveSession();
+    if (!g_win->isMain) g_win->reopen = s.substr(7) == L"on", SessionChanged();
   } else if (s == L"window-info") {  // main or not, «Reopen on restart» and its tabs
     std::wstring r = std::wstring(L"window: ") + (g_win->isMain ? L"main" : L"other") + L" reopen=" + (g_win->reopen ? L"1" : L"0");
     for (auto& t : g_win->tabs) r += L" [" + (t.name.empty() ? ShortTitle(t.active) : t.name) + L"]";
@@ -9585,15 +9607,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (cmd >= 3000 && cmd < 3000 + (int)devs.size()) SetTyping(devs[cmd - 3000].id, !typing.count(devs[cmd - 3000].id));
         if (cmd == 5 && !g_win->isMain) {
           g_win->reopen = !g_win->reopen;
-          SaveSession();
+          SessionChanged();
         }
         if (cmd == 7) SetToasts(!ToastsOn());  // every window reads it when it has something to say
         if (cmd >= 100 && cmd < 100 + kLangCount) {  // every window
           g_lang = cmd - 100;
-          for (Window* w : g_windows) {
-            InWindow in(w);
-            SaveSession();
-          }
+          for (Window* w : g_windows) SessionChanged(w);
           InvalidateAll();
         }
         if (cmd >= 200 && cmd < 200 + kFontCount) SetTerminalFont(kFonts[cmd - 200].face);
@@ -10572,6 +10591,54 @@ static void OnDirty() {
   }
 }
 
+// The sessions that changed (TIMER_SAVE): the conversations of what runs in them are looked up first on a worker, so no
+// window waits for the disk or for the Restart Manager (Codex), then they are saved (OnResumes). One lookup at a time.
+struct ResumeJob {
+  std::vector<ResumeIn> in;
+  std::map<Pane*, std::string> out;
+};
+static bool g_resuming = false;
+
+static DWORD WINAPI ResumeLookupThread(LPVOID arg) {
+  auto* job = (ResumeJob*)arg;
+  job->out = ResumeCommands(job->in);
+  if (!PostMessage(g_host, WM_APP_RESUMES, 0, (LPARAM)job)) delete job;
+  return 0;
+}
+
+static void OnResumes(ResumeJob* job) {
+  std::unique_ptr<ResumeJob> j(job);
+  g_resuming = false;
+  g_resumeCmd.clear();
+  std::set<Pane*> looked;
+  for (auto& r : j->in) looked.insert(r.p);
+  for (auto& [p, cmd] : j->out)
+    if (g_live.count(p)) g_resumeCmd[p] = cmd;
+  for (Window* w : std::vector<Window*>(g_windows))
+    if (w->saveDue) {
+      InWindow in(w);
+      SaveSession(false);
+      for (auto& r : ResumeInputs(WindowPanes()))  // started meanwhile: saved again, with its conversation
+        if (!looked.count(r.p)) SessionChanged(w);
+    }
+}
+
+static void SaveChanged() {
+  if (g_resuming) return;  // saved when the lookup answers (OnResumes)
+  std::vector<Pane*> panes;
+  for (Window* w : g_windows)
+    if (w->saveDue)
+      for (auto& t : w->tabs) Leaves(t.root, panes);
+  auto* job = new ResumeJob{ResumeInputs(panes), {}};
+  if (!job->in.empty())
+    if (HANDLE t = CreateThread(nullptr, 0, ResumeLookupThread, job, 0, nullptr)) {
+      CloseHandle(t);
+      g_resuming = true;
+      return;
+    }
+  OnResumes(job);  // nothing to look up
+}
+
 // Every 250 ms: what each pane runs (every second), the reconnect loops, and the last command written at the prompt of
 // a shell without integration once it has started.
 static void OnRestoreTick() {
@@ -10584,8 +10651,9 @@ static void OnRestoreTick() {
   // Escribe la última orden en el prompt cuando la shell ha terminado de arrancar.
   DWORD now = GetTickCount();
   for (Pane* p : g_live) {
-    // Shells sin integración (WARPLITE_SHELL): se escribe en su prompt tras arrancar.
-    if (p->restoreCmd.empty() || !p->proc || p->integrated) continue;
+    // Shells sin integración (WARPLITE_SHELL): se escribe en su prompt tras arrancar. Only those: PowerShell may take
+    // longer than that to say it is ready (many panes starting on a busy computer), and its first prompt relaunches it.
+    if (p->restoreCmd.empty() || !p->proc || p->integrated || !p->plainShell) continue;
     bool settled = p->firstOut && now - p->lastOut > 400;
     if (now - p->spawnTick < (settled ? 6000u : 10000u)) continue;
     EnterCriticalSection(&p->cs);
@@ -10676,6 +10744,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       }
       return 0;
     case WM_APP_NETCHANGE: OnNetworkChange(); return 0;
+    case WM_APP_RESUMES: OnResumes((ResumeJob*)lp); return 0;
     case WM_APP_OPEN: {  // the other windows of this start (posted: the first one is on screen first)
       std::unique_ptr<std::vector<WindowInit>> list((std::vector<WindowInit>*)lp);
       for (auto& in : *list) OpenWindow(in);
@@ -10696,11 +10765,7 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       } else if (wp == TIMER_SAVE) {  // the sessions that changed (SessionChanged)
         KillTimer(hwnd, TIMER_SAVE);
         g_saveTimer = false;
-        for (Window* w : g_windows)
-          if (w->saveDue) {
-            InWindow in(w);
-            SaveSession();
-          }
+        SaveChanged();
       }
       return 0;
     case WM_COPYDATA: {

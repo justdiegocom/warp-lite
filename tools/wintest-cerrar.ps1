@@ -21,7 +21,8 @@ for ($i = 0; $i -lt $a.Count; $i++) {
   if ($a[$i] -eq '--model') { $model = $a[$i + 1] }
   if ($a[$i] -eq '--resume') { $res = $a[$i + 1] }
 }
-Add-Content -Encoding UTF8 "$PSScriptRoot\..\args.txt" ('claude ' + ($a -join ' '))
+# Several start at once (a restore): the log is shared, so a write that finds it busy tries again.
+for ($k = 0; $k -lt 100; $k++) { try { Add-Content -Encoding UTF8 "$PSScriptRoot\..\args.txt" ('claude ' + ($a -join ' ')) -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 30 } }
 $id = if ($res) { $res } else { $model.PadLeft(8, '0') + '-0000-4000-8000-000000000000' }
 Set-Content "$env:CLAUDE_CONFIG_DIR\sessions\$PID.json" "{`"pid`":$PID,`"sessionId`":`"$id`",`"cwd`":`"x`"}"
 Start-Sleep 300

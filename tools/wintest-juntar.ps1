@@ -24,7 +24,8 @@ $proj = New-Item -ItemType Directory "$dir\proj-juntar"
 # ssh and claude stand-ins: each start writes its arguments; claude also notes its conversation like the real one.
 $fake = @'
 $tool = $args[0]; $a = @($args | Select-Object -Skip 1)
-Add-Content -Encoding UTF8 "$PSScriptRoot\..\args-juntar.txt" (("$tool " + ($a -join ' ')).Trim())
+# Several start at once (a restore): the log is shared, so a write that finds it busy tries again.
+for ($k = 0; $k -lt 100; $k++) { try { Add-Content -Encoding UTF8 "$PSScriptRoot\..\args-juntar.txt" (("$tool " + ($a -join ' ')).Trim()) -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 30 } }
 if ($tool -eq 'claude') {
   $model = 'x'; $res = ''
   for ($i = 0; $i -lt $a.Count; $i++) { if ($a[$i] -eq '--model') { $model = $a[$i + 1] }; if ($a[$i] -eq '--resume') { $res = $a[$i + 1] } }
@@ -192,18 +193,18 @@ WaitNoneAlive
 
 # 6. A live counter dragged out and back (its own Warp, WARPLITE_DIR wins-juntar-c). C: the window, top left; the tab
 #    goes out to the right (N, a new window, which runs the child script: it drags it back onto C's tabs).
-$area = '0,0,1000,520'
+$area = '0,0,1280,640'
 $frames = 0
 function Frame { $script:frames++; 'desk-shot:{0},{1}\juntar-f{2:d3}.bmp' -f $area, $dir, $script:frames }
 # The frames in the order they are taken: C before and while it drags the tab out, both windows after; N dragging it
 # back; C after.
-$cOut = @('wait', 'label:C', 'rename:main', 'move:10,10,470,330', 'edit:cd C:\', 'submit', 'tab', 'wait', 'rename:contador', 'edit:cd C:\', 'submit',
+$cOut = @('wait', 'label:C', 'rename:main', 'move:10,10,620,300', 'edit:cd C:\', 'submit', 'tab', 'wait', 'rename:contador', 'edit:cd C:\', 'submit',
   'edit:contador', 'submit', 'wait', 'wait',
   'pids', 'grep:count-86 ', (Frame), 'wait', (Frame), 'wait', (Frame), (Wf 'out'), 'drag-start:tab:1', (Frame)) +
-  (@(1..6) | ForEach-Object { "drag-to:0,$(240 + 66 * $_),$(30 + 23 * $_)"; (Frame) }) +
+  (@(1..6) | ForEach-Object { "drag-to:0,$(308 + 75 * $_),$(30 + 52 * $_)"; (Frame) }) +
   @('drag-drop', (Frame), 'wait', (Frame), 'wait', (Frame), 'wait', (Frame), 'window-count')
 $nBack = @('wait', 'label:N', 'pids', 'grep:count-86 ', (Wf 'back'), 'drag-start:tab:0', (Frame)) +
-  (@(1..6) | ForEach-Object { "drag-to:C,$(380 - 50 * $_),$(30 + 40 * (6 - $_))"; (Frame) }) + @('drag-to:C,90,20', (Frame), 'drag-drop')
+  (@(1..6) | ForEach-Object { "drag-to:C,$(640 - 90 * $_),$(320 - 50 * $_)"; (Frame) }) + @('drag-to:C,90,20', (Frame), 'drag-drop')
 $cBack = @((Wf 'joined'), (Frame), 'wait', (Frame), 'pids', 'grep:count-86 ', 'windows', 'wait', (Frame), 'wait', 'grep:count-86 ', (Frame), (Wf 'endc'), 'quit-all')
 $env:WARPLITE_CHILD_SCRIPT = $nBack -join '|'
 $cSteps = $cOut + $cBack

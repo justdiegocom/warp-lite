@@ -15,7 +15,8 @@ New-Item -ItemType Directory $wins, $bin, "$env:CLAUDE_CONFIG_DIR\sessions" | Ou
 $proj = New-Item -ItemType Directory "$dir\proj-recuperar"
 $fake = @'
 $tool = $args[0]; $a = @($args | Select-Object -Skip 1)
-Add-Content -Encoding UTF8 "$PSScriptRoot\..\args-recuperar.txt" (("$tool " + ($a -join ' ')).Trim())
+# Several start at once (a restore): the log is shared, so a write that finds it busy tries again.
+for ($k = 0; $k -lt 100; $k++) { try { Add-Content -Encoding UTF8 "$PSScriptRoot\..\args-recuperar.txt" (("$tool " + ($a -join ' ')).Trim()) -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 30 } }
 if ($tool -eq 'claude') {
   $model = 'x'; $res = ''
   for ($i = 0; $i -lt $a.Count; $i++) { if ($a[$i] -eq '--model') { $model = $a[$i + 1] }; if ($a[$i] -eq '--resume') { $res = $a[$i + 1] } }
@@ -74,11 +75,12 @@ $m = Warp @('wait', 'rename:principal', 'edit:ssh -t devbox "tmux new -A -s main
   'wait', (Wf 'crash'), 'crash')
 Start-Sleep 4
 $s = Warp @('wait', 'rename:segunda', 'splitR', 'wait', "edit:cd '$($proj.FullName)'", 'submit', 'wait', 'edit:claude --model m1', 'submit',
-  'tab', 'wait', 'rename:oculta', 'hide-tab', 'wait')
+  'tab', 'wait', 'rename:oculta', 'hide-tab', 'wait', 'window-info')
 $n1 = WaitLaunched 'ssh *'
 $n2 = WaitLaunched 'claude *'
 Check ($n1 -eq 1 -and $n2 -eq 1) "ssh and Claude Code running: $(@(Launched) -join ' / ')"
-Start-Sleep 5  # what each pane runs is looked at every second, and the sessions are saved a second after a change
+$null = WaitFor '^window: other reopen=0 \[segunda\] \[oculta\]'  # the second window has done its steps
+Start-Sleep 4  # what each pane runs is looked at every second, and the sessions are saved a second after a change
 $before = @(Alive)
 $files = @(Get-ChildItem "$wins\window-*.txt" | ForEach-Object Name)
 Check ($before.Count -eq 1 -and $files.Count -eq 3) "one process, three windows saved: $($files -join ', ')"
