@@ -103,8 +103,8 @@ const LIST_AGE: Duration = Duration::from_secs(12 * 3600);
 ///
 /// Finding it prints `@claude <path>`, `@codex <path>` or `@none`; listing prints `@agent <id> <1 working | 0> <first
 /// record's time | -> <last write, Unix s | -> <its meta.json>` for each subagent that wrote in the last 12 hours; then
-/// come the transcript's lines from $4 (from the last 3 MB the first time; only the record types the phone shows, and
-/// only whole lines) and `@next <offset>`, where the next fetch starts. It reads only transcripts (`.jsonl` under
+/// come the transcript's lines from $4 (from the last 3 MB the first time, at most 8 MB at a time; only the record types
+/// the phone shows, and only whole lines: a longer line is skipped) and `@next <offset>`, where the next fetch starts. It reads only transcripts (`.jsonl` under
 /// `.claude/projects` or `.codex/sessions`) and what Claude Code writes about them; for Codex in tmux, `tmux
 /// list-panes` and `ps` say which process runs in that session, and `/proc` which conversation it has open.
 pub const REMOTE_SCRIPT: &str = r#"h=$1 a=$2 t=$3 o=$4 l=$5
@@ -169,11 +169,12 @@ s=$(wc -c < "$t" 2>/dev/null | tr -d ' ')
 [ -n "$s" ] || { echo "@next 0"; exit 0; }
 if [ "$o" -lt 0 ]; then o=$((s + o)); [ "$o" -ge 0 ] || o=0; fi
 [ "$o" -le "$s" ] || o=0
-tail -c +$((o + 1)) "$t" | head -c $((s - o)) | LC_ALL=C awk -v o="$o" -v total=$((s - o)) -v e="$e" '
+n=$((s - o)); [ "$n" -le 8000000 ] || n=8000000
+tail -c +$((o + 1)) "$t" | head -c $n | LC_ALL=C awk -v o="$o" -v total=$n -v e="$e" '
 function out(l) { if (l ~ e && (substr(l, 1, 9) != "{\"type\":\"" || l ~ ("^[{]" e))) print l }
 NR > 1 { out(prev) }
 { prev = $0; n += length($0) + 1 }
-END { if (NR == 0) print "@next " o; else if (n == total) { out(prev); print "@next " (o + n) } else print "@next " (o + n - length(prev) - 1) }'
+END { if (NR == 0) print "@next " o; else if (n == total) { out(prev); print "@next " (o + n) } else if (NR == 1 && total >= 8000000) print "@next " (o + total); else print "@next " (o + n - length(prev) - 1) }'
 "#;
 
 /// The ssh a pane runs: the options to reuse (port, user, key, jump host, config file), the host, the tmux session its
@@ -292,10 +293,11 @@ struct Remote {
     listing: Option<Vec<Listed>>,
 }
 
-/// One ssh running, and the files it writes to (in the sidecar's folder, read once it has ended, then deleted).
+/// One ssh running, where its output goes, and the file its errors go to (in the sidecar's folder, read once it has
+/// ended, then deleted).
 struct Fetch {
     proc: Proc,
-    out: PathBuf,
+    out: Output,
     err: PathBuf,
     started: Instant,
     /// It lists the subagents.
@@ -307,9 +309,106 @@ impl Drop for Fetch {
         if !self.proc.exited() {
             self.proc.end();
         }
-        let _ = std::fs::remove_file(&self.out);
+        self.out.remove();
         let _ = std::fs::remove_file(&self.err);
     }
+}
+
+/// Most a fetch may bring (the remote script sends at most 8 MB of a transcript at a time).
+const MAX_OUTPUT: u64 = 24 << 20;
+
+/// Where ssh's standard output goes: a file read once it has ended, or on Windows a pipe a thread reads meanwhile.
+enum Output {
+    #[cfg(not(windows))]
+    File(PathBuf),
+    #[cfg(windows)]
+    Pipe(Option<std::thread::JoinHandle<Vec<u8>>>),
+}
+
+impl Output {
+    /// All of it is there (ssh has ended and, for a pipe, the thread has read it to its end).
+    fn ready(&self) -> bool {
+        match self {
+            #[cfg(not(windows))]
+            Output::File(_) => true,
+            #[cfg(windows)]
+            Output::Pipe(t) => t.as_ref().is_none_or(|t| t.is_finished()),
+        }
+    }
+
+    fn read(&mut self) -> Vec<u8> {
+        match self {
+            #[cfg(not(windows))]
+            Output::File(p) => {
+                let mut b = Vec::new();
+                let _ = std::fs::File::open(&*p).and_then(|f| f.take(MAX_OUTPUT).read_to_end(&mut b));
+                b
+            }
+            #[cfg(windows)]
+            Output::Pipe(t) => t.take().and_then(|t| t.join().ok()).unwrap_or_default(),
+        }
+    }
+
+    fn remove(&mut self) {
+        match self {
+            #[cfg(not(windows))]
+            Output::File(p) => {
+                let _ = std::fs::remove_file(&*p);
+            }
+            #[cfg(windows)]
+            Output::Pipe(_) => {}
+        }
+    }
+}
+
+/// What ssh's standard output is given, and where it ends up. Here a new file in the sidecar's folder.
+#[cfg(not(windows))]
+fn output(path: &Path) -> std::io::Result<(std::fs::File, Output)> {
+    Ok((std::fs::File::create_new(path)?, Output::File(path.to_path_buf())))
+}
+
+/// On Windows a named pipe, which a thread reads while ssh writes: the client end ssh gets is opened for overlapped I/O,
+/// which is how OpenSSH for Windows (9.5) writes. Every other way loses output in one kind of session or the other
+/// (measured with 2 MB, from a process with no console like this one): a plain file or pipe stops after 64 to 170 KB
+/// in session 0 (where services and ssh logins run), and an overlapped file gets nothing at all in the user's own
+/// session; this one brings it all in both, in under 2 s.
+#[cfg(windows)]
+fn output(_: &Path) -> std::io::Result<(std::fs::File, Output)> {
+    use std::os::windows::{fs::OpenOptionsExt, io::FromRawHandle};
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_INBOUND},
+        System::Pipes::{CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT},
+    };
+    static N: AtomicU64 = AtomicU64::new(0);
+    let name = format!(r"\\.\pipe\warp-remote-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let server = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            1 << 16,
+            1 << 16,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if server == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Owned from here: closed if anything below fails.
+    let server = unsafe { std::fs::File::from_raw_handle(server as _) };
+    let client = std::fs::OpenOptions::new().write(true).custom_flags(FILE_FLAG_OVERLAPPED).open(&name)?;
+    // It ends when every copy of the client end is closed: ssh's when it ends (or is ended), this process's right after
+    // starting it.
+    let reader = std::thread::Builder::new().name("ssh-output".into()).spawn(move || {
+        let mut b = Vec::new();
+        let _ = server.take(MAX_OUTPUT).read_to_end(&mut b);
+        b
+    })?;
+    Ok((client, Output::Pipe(Some(reader))))
 }
 
 /// A transcript path as the remote script prints it, safe to send back to it: only `[A-Za-z0-9/._-]`, a `.jsonl`.
@@ -383,9 +482,9 @@ impl Remote {
         let mut lines = Vec::new();
         self.dirty |= screen_changed;
         if let Some(f) = self.fetch.as_mut() {
-            if f.proc.exited() {
+            if f.proc.exited() && f.out.ready() {
                 let f = self.fetch.take().unwrap();
-                self.finish(&f, &mut lines);
+                self.finish(f, &mut lines);
             } else if f.started.elapsed() > FETCH_TIMEOUT {
                 self.fetch = None;  // ends it
                 self.error = "no answer".into();
@@ -413,7 +512,7 @@ impl Remote {
     fn start(&mut self) -> std::io::Result<Fetch> {
         static N: AtomicU64 = AtomicU64::new(0);
         let base = format!("watch-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
-        let (out, err) = (self.dir.join(format!("{base}-out.tmp")), self.dir.join(format!("{base}-err.tmp")));
+        let (out_path, err) = (self.dir.join(format!("{base}-out.tmp")), self.dir.join(format!("{base}-err.tmp")));
         let (path, offset) = match &self.found {
             Some((_, p)) => (p.as_str(), self.offset),
             None => ("-", 0),
@@ -434,26 +533,27 @@ impl Remote {
             .collect();
         args.extend(self.opts.iter().cloned());
         args.extend(["--".to_string(), self.host.clone(), remote]);
-        let o = output_file(&out)?;
-        let e = match output_file(&err) {
+        // Its errors (a few lines at most) go to a plain file, which takes them in every kind of session.
+        let (o, mut out) = output(&out_path)?;
+        let e = match std::fs::File::create_new(&err) {
             Ok(e) => e,
             Err(x) => {
-                let _ = std::fs::remove_file(&out);
+                out.remove();
                 return Err(x);
             }
         };
         match spawn_ssh(&args, o, e) {
             Ok(proc) => Ok(Fetch { proc, out, err, started: Instant::now(), lists }),
             Err(x) => {
-                let _ = std::fs::remove_file(&out);
+                out.remove();
                 let _ = std::fs::remove_file(&err);
                 Err(x)
             }
         }
     }
 
-    fn finish(&mut self, f: &Fetch, lines: &mut Vec<Vec<u8>>) {
-        let text = std::fs::read(&f.out).unwrap_or_default();
+    fn finish(&mut self, mut f: Fetch, lines: &mut Vec<Vec<u8>>) {
+        let text = f.out.read();
         let mut any = false;
         let mut listing = Vec::new();
         for l in text.split(|b| *b == b'\n') {
@@ -496,17 +596,6 @@ impl Remote {
     }
 }
 
-/// A new file for what ssh writes. On Windows opened for overlapped I/O, which is how ssh (OpenSSH for Windows) writes
-/// its output: to a handle opened without it, it stops after 100 to 200 KB (measured), and a conversation's first fetch
-/// is often more (opened with it, 12 MB came in 0.7 s).
-fn output_file(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create_new(true);
-    #[cfg(windows)]
-    std::os::windows::fs::OpenOptionsExt::custom_flags(&mut o, 0x4000_0000);  // FILE_FLAG_OVERLAPPED
-    o.open(path)
-}
-
 /// Starts ssh with these arguments, writing to these files.
 #[cfg(not(windows))]
 fn spawn_ssh(args: &[String], out: std::fs::File, err: std::fs::File) -> std::io::Result<Proc> {
@@ -528,16 +617,16 @@ impl Proc {
     }
 }
 
-/// On Windows, ssh (OpenSSH for Windows 9.5) writes all it receives only to a file nobody else has open, opened for
-/// overlapped I/O (see [`output_file`]): to a pipe it stops after the first write. It gets a hidden console
-/// (CREATE_NEW_CONSOLE with SW_HIDE, as `Start-Process -WindowStyle Hidden`: never a window on the screen), and what it
-/// wrote is read once it has ended.
+/// On Windows, ssh gets a console with no window (CREATE_NO_WINDOW), which also programs it starts (a ProxyCommand)
+/// share: a new console of its own would be handed to the default terminal app in the user's session (Windows Terminal,
+/// which never gives its output back and could show a window), and none at all would make each program it starts open
+/// one. Its output goes to the pipe of [`output`].
 #[cfg(windows)]
 fn spawn_ssh(args: &[String], out: std::fs::File, err: std::fs::File) -> std::io::Result<Proc> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE_FLAG_INHERIT, SetHandleInformation},
-        System::Threading::{CREATE_NEW_CONSOLE, CreateProcessW, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW},
+        System::Threading::{CREATE_NO_WINDOW, CreateProcessW, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW},
     };
     let exe = std::env::var_os("PATH")
         .into_iter()
@@ -558,13 +647,12 @@ fn spawn_ssh(args: &[String], out: std::fs::File, err: std::fs::File) -> std::io
         }
         let mut si: STARTUPINFOW = std::mem::zeroed();
         si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-        si.wShowWindow = 0;  // SW_HIDE
+        si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdInput = nul.as_raw_handle();
         si.hStdOutput = out.as_raw_handle();
         si.hStdError = err.as_raw_handle();
         let app = wide(&exe);
-        CreateProcessW(app.as_ptr(), line.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, CREATE_NEW_CONSOLE, std::ptr::null(), std::ptr::null(), &si, &mut pi)
+        CreateProcessW(app.as_ptr(), line.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, CREATE_NO_WINDOW, std::ptr::null(), std::ptr::null(), &si, &mut pi)
     };
     if ok == 0 {
         return Err(std::io::Error::last_os_error());
@@ -1118,6 +1206,12 @@ mod tests {
         assert_eq!(run_script(&dir, &["-", "claude", p, &end.to_string()]), [format!("@next {end}")]);
         // From the end: negative.
         assert_eq!(run_script(&dir, &["-", "claude", p, &format!("-{}", c.len() + 1)]), [c.to_string(), format!("@next {end}")]);
+        // At most 8 MB at a time; a line longer than that is skipped, and what follows it comes next.
+        let big = proj.join("big.jsonl");
+        std::fs::write(&big, format!("{}\n{a}\n", "x".repeat(9_000_000))).unwrap();
+        let bp = big.to_str().unwrap();
+        assert_eq!(run_script(&dir, &["-", "claude", bp, "0"]), ["@next 8000000"]);
+        assert_eq!(run_script(&dir, &["-", "claude", bp, "8000000"]), [a.to_string(), format!("@next {}", 9_000_001 + a.len() + 1)]);
         // Not a transcript: nothing is read.
         assert_eq!(run_script(&dir, &["-", "claude", "/etc/passwd", "0"]), ["@none"]);
         assert!(safe_path("/home/u/.claude/projects/-tmp-x/9d09-21b2.jsonl") && !safe_path("/x/'a'.jsonl") && !safe_path("/x/../y.jsonl"));
