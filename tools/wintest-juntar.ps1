@@ -7,7 +7,8 @@
 # window moved there: that window closes and its file is discarded. (4) A tab moved on its own window's tabs, as before;
 # dropped on a window of another Warp (no target), it opens in a new window of its own Warp, as when dropped anywhere
 # else, and the other Warp is untouched. (5) Windows overlapping: the one in view under the cursor takes it, also over
-# the area of the one it comes from. (6) A tab with a live counter (a child process printing a number every 250 ms)
+# the area of the one it comes from. What moves keeps its attention pulse and what is typed but not sent in its input.
+# (6) A tab with a live counter (a child process printing a number every 250 ms)
 # dragged out to a new window and back: the counter goes on, the same process, its first lines still there.
 # Screenshots in juntar-*.bmp; the frames of (6) in juntar-f*.bmp (as a desk: every window where it is).
 $ErrorActionPreference = 'Stop'
@@ -73,17 +74,18 @@ function Check($ok, $what) { if (-not $ok) { $script:fail++ }; '{0} {1}' -f $(if
 # bottom right. A: where they come from, top left. A2: a window with one tab, bottom left. P (later): over A. Every one
 # after B is a second start of B's Warp: it hands its window to B's process and ends.
 $b = Warp $wins @('wait', 'label:B', 'rename:destino', 'move:512,0,500,380', 'wait', "shot:$dir\juntar-b-antes.bmp", (Wf 'b1'), 'windows', 'pids',
-  'grep:marker-remoto-86', "shot:$dir\juntar-b-pestana.bmp", (Wf 'hint'), 'join-hint', "shot:$dir\juntar-b-aviso.bmp", (Wf 'b2'), 'windows',
-  'pids', "shot:$dir\juntar-b-panel.bmp", 'vtabs', (Wf 'hint2'), 'join-hint', "shot:$dir\juntar-b-lateral.bmp", (Wf 'b3'), 'windows',
+  'grep:marker-remoto-86', 'attention', "shot:$dir\juntar-b-pestana.bmp", (Wf 'hint'), 'join-hint', "shot:$dir\juntar-b-aviso.bmp", (Wf 'b2'),
+  'windows', 'pids', 'grep:proj-juntar', "shot:$dir\juntar-b-panel.bmp", 'vtabs', (Wf 'hint2'), 'join-hint', "shot:$dir\juntar-b-lateral.bmp", (Wf 'b3'), 'windows',
   'window-count', (Wf 'b5'), 'windows', (Wf 'end'), 'quit-all')
 Start-Sleep 4
 $x = Warp $winsX @('wait', 'rename:otro-warp', 'move:512,390,500,370', (Wf 'end'), 'window-info', 'close')
-$env:WARPLITE_CHILD_SCRIPT = 'wait|window-info'  # the window a tab dropped outside opens says what it is
+$env:WARPLITE_CHILD_SCRIPT = 'wait|window-info|edit-text'  # the window a tab dropped outside opens says what it is
 $a = Warp $wins @('wait', 'label:A', 'rename:uno', 'move:0,0,500,380', 'tab', 'wait', 'rename:remoto', 'edit:Write-Output marker-remoto-86', 'submit',
-  'edit:ssh -t devbox "tmux new -A -s main"', 'submit', 'wait', 'wait', "shot:$dir\juntar-a-antes.bmp", 'pids', (Wf 'a1'), 'drop-tab:1,B,60,20', 'window-info',
+  'edit:ssh -t devbox "tmux new -A -s main"', 'submit', 'wait', 'wait', "shot:$dir\juntar-a-antes.bmp", 'pids',
+  'goto:0', 'feed:1:1b5d393b7807', 'notes', (Wf 'a1'), 'drop-tab:1,B,60,20', 'window-info',
   'splitR', 'wait', "edit:cd '$($proj.FullName)'", 'submit', 'wait', 'edit:claude --model m1', 'submit', 'wait', 'wait', 'pids',
   (Wf 'a2'), 'drop-pane:1,self,120,205', 'where', 'drag-start:pane:0', 'drag-to:B,430,210', (Wf 'drop'), 'drag-drop', 'window-info',
-  "shot:$dir\juntar-a-despues.bmp", 'tab', 'wait', 'rename:ajena', 'drag-tab:1,0', 'tabs', (Wf 'a4'), "drop-tab:0,$($x.Id),250,200", 'window-info',
+  "shot:$dir\juntar-a-despues.bmp", 'tab', 'wait', 'rename:ajena', 'edit:sin-enviar-86', 'drag-tab:1,0', 'tabs', (Wf 'a4'), "drop-tab:0,$($x.Id),250,200", 'window-info',
   'tab', 'wait', 'rename:encima', (Wf 'a5'), 'drag-start:tab:1', (Wf 'a5b'), 'drag-to:0,368,120', 'drag-drop', 'window-info', (Wf 'end'))
 $aExit = $a.WaitForExit(15000)
 Remove-Item Env:\WARPLITE_CHILD_SCRIPT
@@ -111,6 +113,9 @@ $before = Pid1 $p0 'A/remoto/0'; $after = Pid1 $p1 'B/remoto/0'
 Check ($before -gt 0 -and $before -eq $after -and (Get-Process -Id $after -ErrorAction SilentlyContinue)) "the same shell in B: pid $before -> $after"
 $g = WaitFor '^grep marker-remoto-86:'
 Check ($g -match ' B/remoto/0=\d+\[') "its scrollback came with it: $g"
+$nt = WaitFor '^notes: '
+$at = WaitFor '^attention: '
+Check ($nt -eq 'notes: alert:counted' -and $at -match '^attention: tab0/pane0=1 tab1/pane0=0 ') "a program said it finished while it wasn't in view: it pulses in B too ($nt; $at)"
 WaitShot 'b-pestana'
 
 # 2. A's split: its Claude Code pane (right) dropped on its other pane: swapped. Then dragged over B's pane (right
@@ -139,6 +144,8 @@ Check ((Entry $w 'B') -match '^\[remoto:2:ssh -t devbox "tmux new -A -s main",cl
 $p3 = WaitFor '^pids:.* B/remoto/1=\d+'
 $before = Pid1 $p2 'A/uno/1'; $after = Pid1 $p3 'B/remoto/1'
 Check ($before -gt 0 -and $before -eq $after) "the same shell for Claude Code: pid $before -> $after"
+$g = WaitFor '^grep proj-juntar:'
+Check ($g -match ' B/remoto/1=\d+\[' -and $g -notmatch ' B/remoto/0=') "the pane's scrollback came with it: $g"
 WaitShot 'b-panel'
 
 # 3. B with its tabs at the side. A2's only tab over them: the hint is on the tabs; dropped below them, A2 closes and
@@ -165,6 +172,8 @@ Check ($t -eq 'tabs: *ajena uno') "on its own tabs: moved there ($t)"
 Go 'a4'
 $c = WaitFor '^window: other reopen=0 \[ajena\]'
 Check ($c) "dropped on another Warp: a new window of its own: $c"
+$e = WaitFor '^edit: '
+Check ($e -eq 'edit: [sin-enviar-86]') "what was typed but not sent came with it: $e"
 $wa = WaitFor '^window: other reopen=0 \[uno' 3
 Check ($wa -eq 'window: other reopen=0 [uno]') "A without it: $wa"
 
