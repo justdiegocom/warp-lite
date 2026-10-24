@@ -434,8 +434,8 @@ impl Remote {
             .collect();
         args.extend(self.opts.iter().cloned());
         args.extend(["--".to_string(), self.host.clone(), remote]);
-        let o = std::fs::File::create_new(&out)?;
-        let e = match std::fs::File::create_new(&err) {
+        let o = output_file(&out)?;
+        let e = match output_file(&err) {
             Ok(e) => e,
             Err(x) => {
                 let _ = std::fs::remove_file(&out);
@@ -496,6 +496,17 @@ impl Remote {
     }
 }
 
+/// A new file for what ssh writes. On Windows opened for overlapped I/O, which is how ssh (OpenSSH for Windows) writes
+/// its output: to a handle opened without it, it stops after 100 to 200 KB (measured), and a conversation's first fetch
+/// is often more (opened with it, 12 MB came in 0.7 s).
+fn output_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(&mut o, 0x4000_0000);  // FILE_FLAG_OVERLAPPED
+    o.open(path)
+}
+
 /// Starts ssh with these arguments, writing to these files.
 #[cfg(not(windows))]
 fn spawn_ssh(args: &[String], out: std::fs::File, err: std::fs::File) -> std::io::Result<Proc> {
@@ -517,10 +528,10 @@ impl Proc {
     }
 }
 
-/// On Windows, ssh (OpenSSH for Windows 9.5) writes all it receives only to a file nobody else has open, and only
-/// when it has a console of its own: to a pipe it stops after the first write, and with no console, or a file read
-/// while it writes, it stops after a few KB. So it gets a hidden console (CREATE_NEW_CONSOLE with SW_HIDE, as
-/// `Start-Process -WindowStyle Hidden`: never a window on the screen), and what it wrote is read once it has ended.
+/// On Windows, ssh (OpenSSH for Windows 9.5) writes all it receives only to a file nobody else has open, opened for
+/// overlapped I/O (see [`output_file`]): to a pipe it stops after the first write. It gets a hidden console
+/// (CREATE_NEW_CONSOLE with SW_HIDE, as `Start-Process -WindowStyle Hidden`: never a window on the screen), and what it
+/// wrote is read once it has ended.
 #[cfg(windows)]
 fn spawn_ssh(args: &[String], out: std::fs::File, err: std::fs::File) -> std::io::Result<Proc> {
     use std::os::windows::io::AsRawHandle;

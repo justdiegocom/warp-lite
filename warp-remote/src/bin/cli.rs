@@ -130,10 +130,15 @@ async fn run(o: Opts) -> Result<()> {
         ["watch", w, p, rest @ ..] => {
             let (w, p) = pane(w, p)?;
             let n: u32 = rest.first().map(|s| s.parse()).transpose()?.unwrap_or(1);
-            // A subagent of that pane: the pane first (its watch must be open).
+            // A subagent of that pane: the pane first (its watch must be open, and its conversation found: 30 s at most).
             let agent = rest.get(1).copied().unwrap_or("");
             if !agent.is_empty() {
-                c.watch(w, p, 0, None, "").await?;
+                for _ in 0..30 {
+                    if c.watch(w, p, 0, None, "").await?.kind == "chat" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
             let mut since = 0;
             for i in 0..n {
