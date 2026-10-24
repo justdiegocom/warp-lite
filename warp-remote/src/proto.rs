@@ -39,6 +39,10 @@
 //! Codex conversation (a file on this computer, or over the user's own `ssh` for a pane running `ssh host`), and it
 //! stops on `unwatch`, when the connection ends or when nobody asked for a minute. `input` needs the device to be
 //! allowed to type (Warp: Paired devices → the device → Allow typing; error `typing_off` otherwise).
+//!
+//! Version 3 adds a subagent's own conversation, read-only: `watch` and `unwatch` with `agent` (an [`AgentInfo`]'s
+//! `id`, from the pane's `agents` or an item's `agent`) follow that subagent of the pane's Claude Code. A v2 host would
+//! ignore `agent` and answer with the pane itself, so an app only sends it to a v3 host.
 
 use iroh::endpoint::{ReadExactError, RecvStream, SendStream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -46,7 +50,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{Result, err};
 
 /// Protocol version this build speaks.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// Largest frame accepted (the host is reachable from the internet: never trust a length).
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -70,9 +74,17 @@ pub enum Request {
         since: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before: Option<u64>,
+        /// v3. That subagent of the pane's Claude Code instead (read-only: no screen, no questions, no typing).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        agent: String,
     },
-    /// v2. Stop following that pane.
-    Unwatch { window: u64, pane_id: u32 },
+    /// v2. Stop following that pane (v3: or that subagent of it).
+    Unwatch {
+        window: u64,
+        pane_id: u32,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        agent: String,
+    },
     /// v2. Typing into that pane, as if on the computer: `text` is pasted (one line), then `keys` are pressed (see
     /// [`KEYS`]). `option`: choose that option (0-based) of the question the pane shows, if it is still the one
     /// with that `prompt` id.
@@ -149,6 +161,44 @@ pub struct PaneView {
     /// Where the conversation comes from ("this computer", "ssh fr"), or why there is no chat.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// The subagents of this conversation (running ones first), when they changed since `since` (absent: unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<AgentInfo>>,
+    /// When the turn going on (or the last one) started: the last message you wrote (Unix ms; 0: unknown).
+    #[serde(default, skip_serializing_if = "is_zero64")]
+    pub turn_start: u64,
+    /// What the agent says it is doing now («Baking… (3m 12s · ↓ 4.2k tokens)», «Waiting for 3 background agents to
+    /// finish»), or the tool call that is running.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub activity: String,
+}
+
+/// A subagent (Claude Code's Agent tool: a foreground or background agent with its own conversation).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentInfo {
+    /// Its id (`watch` with `agent`); empty until it is known (the launch's answer says it).
+    #[serde(default)]
+    pub id: String,
+    /// Its type: "general-purpose", "Explore", "executor"…
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// "running", "done" or "failed".
+    pub status: String,
+    /// Started (or resumed), and when it last stopped (Unix ms; 0: unknown).
+    #[serde(default, skip_serializing_if = "is_zero64")]
+    pub started: u64,
+    #[serde(default, skip_serializing_if = "is_zero64")]
+    pub ended: u64,
+    /// What its last run took, as it reported when it finished (0: unknown).
+    #[serde(default, skip_serializing_if = "is_zero64")]
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "is_zero64")]
+    pub tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero64")]
+    pub tool_uses: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
 }
 
 /// One message of a conversation.
@@ -167,6 +217,21 @@ pub struct ChatItem {
     /// A tool call still running (or waiting for permission).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pending: bool,
+    /// When it was written (Unix ms; 0: unknown).
+    #[serde(default, skip_serializing_if = "is_zero64")]
+    pub ts: u64,
+    /// v3, a tool call: which tool ("Bash", "Edit", "Agent", "AskUserQuestion", "ExitPlanMode", Codex's "shell"…).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool: String,
+    /// v3, a tool call: what it came to, short («+12 −3», «exit 1», «120 lines», «green»).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub badge: String,
+    /// v3: the subagent an Agent call started (or a message about it is from).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentInfo>,
+    /// v3, an AskUserQuestion call: the options of its (first) question, with their descriptions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<PromptOption>,
 }
 
 /// A question with options on the pane's screen (Claude Code's permission prompts and menus, Codex's approvals).
@@ -215,9 +280,19 @@ pub struct Session {
     /// The pane's id in its window, for `watch` and `input` (stable while it is open; 0 from an older Warp).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub pane_id: u32,
+    /// Finishes and questions not seen yet on the computer (Warp's unread badge; 0 from an older Warp).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unread: u32,
+    /// An agent's pane: "working", "waiting" (a question waits for an answer) or "finished", from its screen.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
 }
 
 fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero64(n: &u64) -> bool {
     *n == 0
 }
 
@@ -303,7 +378,11 @@ mod tests {
         let s = Session { window: 1, tab: 0, pane: 0, ..Default::default() };
         assert!(!serde_json::to_string(&s).unwrap().contains("pane_id"));
         let w: Request = serde_json::from_str(r#"{"type":"watch","window":5,"pane_id":3}"#).unwrap();
-        assert_eq!(w, Request::Watch { window: 5, pane_id: 3, since: 0, before: None });
+        assert_eq!(w, Request::Watch { window: 5, pane_id: 3, since: 0, before: None, agent: String::new() });
+        // v3: a subagent; left out when empty, so a v2 host reads what it always did.
+        let sub = Request::Watch { window: 5, pane_id: 3, since: 0, before: None, agent: "a6d5e25a0889e3ee4".into() };
+        assert!(serde_json::to_string(&sub).unwrap().contains(r#""agent":"a6d5e25a0889e3ee4""#));
+        assert_eq!(&encode(&Request::Unwatch { window: 5, pane_id: 3, agent: String::new() }).unwrap()[4..], br#"{"type":"unwatch","window":5,"pane_id":3}"#);
         let i: Request = serde_json::from_str(r#"{"type":"input","window":5,"pane_id":3,"keys":["enter"]}"#).unwrap();
         assert!(matches!(i, Request::Input { ref text, ref keys, option: None, .. } if text.is_empty() && keys == &["enter"]));
         let ok = encode(&Response::Ok).unwrap();

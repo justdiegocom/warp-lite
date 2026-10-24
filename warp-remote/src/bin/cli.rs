@@ -6,7 +6,8 @@
 //!     ping [n]          n round trips (default 5)
 //!     path [seconds]    which network path the connection uses, once a second (default 10)
 //!     forget            forget the paired Warp
-//!     watch <window> <pane id> [n]      what that pane shows (JSON), n times a second apart (default 1)
+//!     watch <window> <pane id> [n [id]] what that pane shows (JSON), n times a second apart (default 1); with id,
+//!                                       that subagent of its Claude Code instead
 //!     type <window> <pane id> <text>    types that text and Enter (needs Allow typing in Warp)
 //!     key <window> <pane id> <key>...   presses keys (enter, esc, up, down, left, right, tab, backspace, ctrl_c)
 //!     pick <window> <pane id> <n>       chooses option n (from 1) of the question the pane shows
@@ -129,16 +130,22 @@ async fn run(o: Opts) -> Result<()> {
         ["watch", w, p, rest @ ..] => {
             let (w, p) = pane(w, p)?;
             let n: u32 = rest.first().map(|s| s.parse()).transpose()?.unwrap_or(1);
+            // A subagent of that pane: the pane first (its watch must be open).
+            let agent = rest.get(1).copied().unwrap_or("");
+            if !agent.is_empty() {
+                c.watch(w, p, 0, None, "").await?;
+            }
             let mut since = 0;
             for i in 0..n {
-                let v = c.watch(w, p, since, None).await?;
+                let v = c.watch(w, p, since, None, agent).await?;
                 since = v.rev;
                 println!("{}", serde_json::to_string(&v)?);
                 if i + 1 < n {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
-            c.unwatch(w, p).await
+            c.unwatch(w, p, agent).await?;
+            if agent.is_empty() { Ok(()) } else { c.unwatch(w, p, "").await }
         }
         ["type", w, p, text @ ..] => {
             let (w, p) = pane(w, p)?;
@@ -151,11 +158,11 @@ async fn run(o: Opts) -> Result<()> {
         ["pick", w, p, n] => {
             let (w, p) = pane(w, p)?;
             let n: u32 = n.parse()?;
-            let v = c.watch(w, p, 0, None).await?;
+            let v = c.watch(w, p, 0, None, "").await?;
             let q = v.prompt.ok_or_else(|| err("no question on that pane"))?;
             c.input(w, p, "", &[], Some(n.saturating_sub(1)), &q.id).await
         }
-        _ => Err(err("usage: warp-remote-cli [--state dir] [--name n] [--local | --relay-only] [--json] pair <ticket> | sessions | ping [n] | path [s] | forget | watch <window> <pane id> [n] | type <window> <pane id> <text> | key <window> <pane id> <key>... | pick <window> <pane id> <n>")),
+        _ => Err(err("usage: warp-remote-cli [--state dir] [--name n] [--local | --relay-only] [--json] pair <ticket> | sessions | ping [n] | path [s] | forget | watch <window> <pane id> [n [subagent id]] | type <window> <pane id> <text> | key <window> <pane id> <key>... | pick <window> <pane id> <n>")),
     };
     c.close().await;
     r

@@ -16,8 +16,9 @@
 //! - sidecar → a window, about one of its panes (by its id), `WM_COPYDATA` `kCopyRemotePane`, which a window only
 //!   takes from this sidecar's window: `screen <id> <scrollback rows>` and `info <id>` (answered with `WM_COPYDATA`
 //!   `kCopyRemoteAnswer` before it returns: `screen\t<rows>\t<cols>\n<line>\n…`, `info\t<agent>\t<running>\t<cwd>\t
-//!   <transcript>`), and `input <id> <device id> text\t<text>` / `key\t<name>` (TRUE if typed; the window checks the
-//!   device may type too).
+//!   <transcript>\t<ssh>`, where ssh is the command line of the ssh under the pane, also behind a wrapper; older Warps
+//!   send the first five), and `input <id> <device id> text\t<text>` / `key\t<name>` (TRUE if typed; the window
+//!   checks the device may type too).
 
 use std::{
     ptr::null,
@@ -157,7 +158,12 @@ impl WarpLink {
 
     /// The text of a pane: its last scrollback rows, then its screen.
     pub async fn screen(&self, window: u64, pane_id: u32) -> Result<PaneScreen> {
-        let a = self.pane(window, format!("screen {pane_id} {SCROLLBACK_ROWS}")).await?.ok_or_else(|| err("no answer"))?;
+        self.screen_rows(window, pane_id, SCROLLBACK_ROWS).await
+    }
+
+    /// Its screen and that many scrollback rows above it.
+    pub async fn screen_rows(&self, window: u64, pane_id: u32, back: usize) -> Result<PaneScreen> {
+        let a = self.pane(window, format!("screen {pane_id} {back}")).await?.ok_or_else(|| err("no answer"))?;
         parse_screen(&a).ok_or_else(|| err("bad answer"))
     }
 
@@ -167,7 +173,7 @@ impl WarpLink {
         if f.len() < 5 || f[0] != "info" {
             return Err(err("bad answer"));
         }
-        Ok(PaneInfo { agent: f[1].into(), running: f[2].into(), cwd: f[3].into(), transcript: f[4].into() })
+        Ok(PaneInfo { agent: f[1].into(), running: f[2].into(), cwd: f[3].into(), transcript: f[4].into(), ssh: f.get(5).map(|s| s.to_string()).unwrap_or_default() })
     }
 
     pub async fn input(&self, window: u64, pane_id: u32, device: &str, what: &PaneInput) -> Result<()> {
@@ -391,7 +397,7 @@ pub fn end_children_with_me() {
 }
 
 /// Warp's pane list: one line per pane, fields separated by tabs: tab, pane, title, folder, what is
-/// running, and (newer Warps) the tab's name, the agent (claude / codex) and the pane's id.
+/// running, and (newer Warps) the tab's name, the agent (claude / codex), the pane's id and its unread count.
 pub fn parse_pane_list(window: u64, text: &str) -> Vec<Session> {
     text.lines()
         .filter_map(|l| {
@@ -410,6 +416,8 @@ pub fn parse_pane_list(window: u64, text: &str) -> Vec<Session> {
                 tab_name: f.get(5).map(|s| s.to_string()).unwrap_or_else(|| f[2].to_string()),
                 agent: f.get(6).map(|s| s.to_string()).unwrap_or_default(),
                 pane_id: f.get(7).and_then(|s| s.parse().ok()).unwrap_or(0),
+                unread: f.get(8).and_then(|s| s.parse().ok()).unwrap_or(0),
+                status: String::new(),
             })
         })
         .collect()
@@ -464,9 +472,9 @@ mod tests {
 
     #[test]
     fn pane_list() {
-        let s = parse_pane_list(7, "0\t0\tclaude chat\tC:\\src\tclaude\twork\tclaude\t12\n0\t1\tpwsh\tC:\\\t\n");
+        let s = parse_pane_list(7, "0\t0\tclaude chat\tC:\\src\tclaude\twork\tclaude\t12\t3\n0\t1\tpwsh\tC:\\\t\n");
         assert_eq!(s.len(), 2);
-        assert_eq!((s[0].tab_name.as_str(), s[0].busy, s[0].agent.as_str(), s[0].pane_id), ("work", true, "claude", 12));
+        assert_eq!((s[0].tab_name.as_str(), s[0].busy, s[0].agent.as_str(), s[0].pane_id, s[0].unread), ("work", true, "claude", 12, 3));
         assert_eq!((s[1].pane, s[1].busy, s[1].tab_name.as_str(), s[1].pane_id), (1, false, "pwsh", 0));
         let sc = parse_screen("screen\t2\t80\nold\nPS C:\\> dir\nPS C:\\> ").unwrap();
         assert_eq!((sc.rows, sc.lines.len(), sc.visible()[0].as_str()), (2, 3, "PS C:\\> dir"));

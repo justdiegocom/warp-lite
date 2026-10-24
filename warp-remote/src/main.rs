@@ -89,6 +89,10 @@ impl SessionSource for WarpSource {
         self.0.screen(window, pane_id).await
     }
 
+    async fn visible(&self, window: u64, pane_id: u32) -> Result<PaneScreen> {
+        self.0.screen_rows(window, pane_id, 0).await
+    }
+
     async fn info(&self, window: u64, pane_id: u32) -> Result<PaneInfo> {
         self.0.info(window, pane_id).await
     }
@@ -118,6 +122,14 @@ impl SessionSource for Source {
             Source::Mock(m) => m.screen(window, pane_id).await,
             #[cfg(windows)]
             Source::Warp(w) => w.screen(window, pane_id).await,
+        }
+    }
+
+    async fn visible(&self, window: u64, pane_id: u32) -> Result<PaneScreen> {
+        match self {
+            Source::Mock(m) => m.visible(window, pane_id).await,
+            #[cfg(windows)]
+            Source::Warp(w) => w.visible(window, pane_id).await,
         }
     }
 
