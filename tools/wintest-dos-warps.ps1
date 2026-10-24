@@ -3,6 +3,9 @@
 # reach a window of another Warp, no quit-all is sent at all. (2) The shortcut opened twice at the same
 # time: only one of the two windows becomes the main one. (3) Two Warps opened one after the other (the
 # shortcut twice), each closed with its X: opening Warp again brings back only the first one, the main one.
+# (4) Every window of a Warp lives in its first process: a second start (the shortcut, «Open Warp here» with --cd)
+# hands its request to it and ends at once, never to the other Warp; --cd opens a new tab in that folder in its window
+# in front.
 $ErrorActionPreference = 'Stop'
 $dir = $PSScriptRoot
 $env:WARPLITE_NO_UPDATE = '1'
@@ -38,6 +41,8 @@ Start-Sleep 4
 $a1 = Warp $winsA @('wait', 'rename:a-principal', 'window-info')
 Start-Sleep 4
 $a2 = Warp $winsA @('wait', 'rename:a-segunda', 'window-info', 'quit-all-targets')
+$handed = $a2.WaitForExit(15000)
+Check ($handed -and $a2.ExitCode -eq 0 -and (Alive).Count -eq 2) "A's second start handed its window to A's process and ended ($((Alive).Count) processes: A and B)"
 WaitFor $winsA '^quit-all-targets'
 $dry = @(@(Bench $winsA) -match '^quit-all-targets')[0]
 Check ($dry -match '^quit-all-targets: 1 of this Warp, [1-9]\d* of others$') "dry run in A: $dry"
@@ -82,6 +87,20 @@ Start-Sleep 6
 Remove-Item Env:\WARPLITE_CHILD_SCRIPT
 $r = @(Bench $winsA)
 Check ("$r" -eq 'window: main reopen=0 [hellomatik]') "opened again: $($r -join ' / ')"
+
+# 4. «Open Warp here» with Warp open: a new tab in that folder, in A's window; the starts end at once.
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $winsA
+$p1 = Warp $winsA @('wait', 'rename:a-cd', 'window-info', "wait-file:$dir\go-dos-cd.txt", 'wait', 'active', 'windows', 'close')
+WaitFor $winsA '^window: main reopen=0 \[a-cd\]'
+$env:WARPLITE_DIR = $winsA
+$cd = Start-Process -FilePath "$dir\warp-lite.exe" -ArgumentList '--cd "C:\Windows"' -PassThru
+$ended = $cd.WaitForExit(15000)
+Check ($ended -and $cd.ExitCode -eq 0 -and (Alive).Count -eq 1) "--cd handed to the running Warp, ended at once ($((Alive).Count) process)"
+New-Item -ItemType File -Force "$dir\go-dos-cd.txt" | Out-Null
+WaitAll $p1
+$d = @(Bench $winsA | Where-Object { $_ -notlike 'window: *' })
+Check (($d -match '^active: tab 1 \[.*\] C:\\Windows').Count -eq 1 -and ($d -match '^windows: w\d+=\[a-cd:1\] \[[^\]]*:1\]$').Count -eq 1) "a new tab in C:\Windows, in that window: $($d -join ' / ')"
+Remove-Item -Force -ErrorAction SilentlyContinue "$dir\go-dos-cd.txt"
 
 WaitNoneAlive
 Check ((Alive).Count -eq 0) "no test processes alive ($((Alive).Count))"

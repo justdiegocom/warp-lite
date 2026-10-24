@@ -15,7 +15,8 @@ $xdir = New-Item -ItemType Directory -Force ("$env:CODEX_HOME\sessions\" + (Get-
 $fake = @'
 param([string]$tool)
 $a = @($args)
-Add-Content -Encoding UTF8 "$PSScriptRoot\..\args.txt" (("$tool " + ($a -join ' ')).Trim())
+# Several start at once (a restore): the log is shared, so a write that finds it busy tries again.
+for ($k = 0; $k -lt 100; $k++) { try { Add-Content -Encoding UTF8 "$PSScriptRoot\..\args.txt" (("$tool " + ($a -join ' ')).Trim()) -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 30 } }
 $model = 'x'; $res = ''
 for ($i = 0; $i -lt $a.Count; $i++) {
   if ($a[$i] -in '--model', '-m') { $model = $a[$i + 1] }

@@ -1,23 +1,21 @@
-//! The sidecar's side of talking to Warp's windows (Windows only).
+//! The sidecar's side of talking to Warp (Windows only).
 //!
-//! Warp's windows already list their panes to each other for the terminal switcher (Ctrl+Shift+K):
-//! a window sends the registered message `warp-lite-list-panes` with its own HWND, and each window
-//! of the same Warp answers with `WM_COPYDATA` (`kCopyPaneList`), one line per pane. Windows only
-//! answer a requester that carries the window property `warp-lite-instance` with their own
-//! instance key, so the sidecar has a hidden message-only window with that property and asks the
-//! same way. Nothing new is needed in Warp for the list.
+//! Every window of a Warp lives in one process, which has a hidden message-only window (class `WarpLiteHost`) with
+//! the window property `warp-lite-instance` set to that Warp's instance key: that is the one endpoint. The sidecar
+//! has a hidden message-only window of its own with the same property; Warp only answers a requester that carries it.
 //!
-//! The other direction, also through that window:
+//! - sidecar → Warp: the registered message `warp-lite-list-panes` with the sidecar's HWND, answered with
+//!   `WM_COPYDATA` (`kCopyPaneList`): one line per pane of every window (see [`parse_pane_list`]).
 //! - Warp → sidecar: `WM_COPYDATA` `kCopyRemote` with a command (`pair <hwnd>`, `reload`, `quit`),
 //!   and `warp-lite-remote-state` (sent) answers how many phones are connected.
-//! - sidecar → Warp: `warp-lite-remote` posted to every window of that Warp (wParam: phones
-//!   connected; lParam: 0 state, 1 a phone was paired, 2 the pairing code ended), and the ticket as
-//!   `WM_COPYDATA` `kCopyRemoteTicket` (`ticket\t<text>\t<seconds>` or `error\t<message>`).
-//! - sidecar → a window, about one of its panes (by its id), `WM_COPYDATA` `kCopyRemotePane`, which a window only
-//!   takes from this sidecar's window: `screen <id> <scrollback rows>` and `info <id>` (answered with `WM_COPYDATA`
-//!   `kCopyRemoteAnswer` before it returns: `screen\t<rows>\t<cols>\n<line>\n…`, `info\t<agent>\t<running>\t<cwd>\t
-//!   <transcript>`), and `input <id> <device id> text\t<text>` / `key\t<name>` (TRUE if typed; the window checks the
-//!   device may type too).
+//! - sidecar → Warp: `warp-lite-remote` posted to it (wParam: phones connected; lParam: 0 state, 1 a phone was
+//!   paired, 2 the pairing code ended), and the ticket as `WM_COPYDATA` `kCopyRemoteTicket` to the HWND of `pair`
+//!   (`ticket\t<text>\t<seconds>` or `error\t<message>`).
+//! - sidecar → Warp, about one pane (by its id, whichever window it is in now: a pane moved to another window keeps
+//!   its id), `WM_COPYDATA` `kCopyRemotePane`, which Warp only takes from this sidecar's window: `screen <id>
+//!   <scrollback rows>` and `info <id>` (answered with `WM_COPYDATA` `kCopyRemoteAnswer` before it returns:
+//!   `screen\t<rows>\t<cols>\n<line>\n…`, `info\t<agent>\t<running>\t<cwd>\t<transcript>`), and `input <id> <device id>
+//!   text\t<text>` / `key\t<name>` (TRUE if typed; Warp checks the device may type too).
 
 use std::{
     ptr::null,
@@ -41,7 +39,7 @@ use windows_sys::Win32::{
         Threading::{CreateMutexW, GetCurrentProcess, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
     },
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW, GetMessageW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW, GetMessageW,
         GetPropW, GetWindowThreadProcessId, HWND_MESSAGE, MSG, PostMessageW, RegisterClassW, RegisterWindowMessageW,
         RemovePropW, SMTO_ABORTIFHUNG, SMTO_NORMAL, SendMessageTimeoutW, SetPropW, WM_APP, WM_CLOSE, WM_COPYDATA,
         WNDCLASSW,
@@ -190,10 +188,10 @@ impl WarpLink {
         SHARED.get().unwrap().phones.store(n, Ordering::Relaxed);
     }
 
-    /// Tells every window of this Warp (title-bar indicator, pairing card).
+    /// Tells this Warp (title-bar indicator, pairing card).
     pub fn notify(&self, phones: usize, event: isize) {
         let s = SHARED.get().unwrap();
-        for h in warp_windows(s.key) {
+        for h in warp_hosts(s.key) {
             unsafe { PostMessageW(h as HWND, s.msg_remote, phones, event) };
         }
     }
@@ -222,25 +220,23 @@ impl WarpLink {
     }
 }
 
-/// The windows of this Warp (class WarpLite with its instance key), front to back.
-fn warp_windows(key: isize) -> Vec<isize> {
-    struct Ctx {
-        key: isize,
-        out: Vec<isize>,
-    }
-    unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> i32 {
-        let c = unsafe { &mut *(lp as *mut Ctx) };
-        let mut cls = [0u16; 32];
-        let n = unsafe { GetClassNameW(h, cls.as_mut_ptr(), 32) } as usize;
-        let prop = wide("warp-lite-instance");
-        if String::from_utf16_lossy(&cls[..n]) == "WarpLite" && unsafe { GetPropW(h, prop.as_ptr()) } as isize == c.key {
-            c.out.push(h as isize);
+/// This Warp's hidden message windows (class WarpLiteHost with its instance key): one, while it runs (two for a moment
+/// while an update restart hands over).
+fn warp_hosts(key: isize) -> Vec<isize> {
+    let class = wide("WarpLiteHost");
+    let prop = wide("warp-lite-instance");
+    let mut out = Vec::new();
+    let mut h: HWND = std::ptr::null_mut();
+    loop {
+        h = unsafe { FindWindowExW(HWND_MESSAGE, h, class.as_ptr(), null()) };
+        if h.is_null() {
+            break;
         }
-        1
+        if unsafe { GetPropW(h, prop.as_ptr()) } as isize == key {
+            out.push(h as isize);
+        }
     }
-    let mut ctx = Ctx { key, out: Vec::new() };
-    unsafe { EnumWindows(Some(each), &mut ctx as *mut Ctx as LPARAM) };
-    ctx.out
+    out
 }
 
 unsafe fn window_thread(ready: std::sync::mpsc::Sender<isize>) {
@@ -280,10 +276,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         return 0;
     }
     if msg == WM_APP_LIST {
-        // Each window answers with WM_COPYDATA while SendMessageTimeout waits (handled re-entrantly below),
+        // Warp answers with WM_COPYDATA while SendMessageTimeout waits (handled re-entrantly below),
         // so nothing may stay locked across the call.
         s.collected.lock().unwrap().clear();
-        for h in warp_windows(s.key) {
+        for h in warp_hosts(s.key) {
             let mut r = 0usize;
             unsafe { SendMessageTimeoutW(h as HWND, s.msg_list, hwnd as WPARAM, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 1000, &mut r) };
         }
@@ -295,20 +291,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         return 0;
     }
     if msg == WM_APP_PANE {
-        // Only to a window of this Warp (the phone names it), one at a time; its answer arrives re-entrantly.
+        // To this Warp, which finds the pane by its id (the phone's window is only where it was listed), one at a time;
+        // its answer arrives re-entrantly.
         let todo = std::mem::take(&mut *s.pane_requests.lock().unwrap());
-        let ours = warp_windows(s.key);
-        for (window, text, tx) in todo {
-            if !ours.contains(&window) {
+        let host = warp_hosts(s.key).first().copied();
+        for (_window, text, tx) in todo {
+            let Some(host) = host else {
                 let _ = tx.send(Err(err("no such window")));
                 continue;
-            }
+            };
             *s.answer.lock().unwrap() = None;
             let data: Vec<u16> = text.encode_utf16().collect();
             let cd = COPYDATASTRUCT { dwData: COPY_REMOTE_PANE, cbData: (data.len() * 2) as u32, lpData: data.as_ptr() as *mut _ };
             let mut r = 0usize;
             let sent = unsafe {
-                SendMessageTimeoutW(window as HWND, WM_COPYDATA, hwnd as WPARAM, &cd as *const _ as LPARAM, SMTO_ABORTIFHUNG | SMTO_NORMAL, 2000, &mut r)
+                SendMessageTimeoutW(host as HWND, WM_COPYDATA, hwnd as WPARAM, &cd as *const _ as LPARAM, SMTO_ABORTIFHUNG | SMTO_NORMAL, 2000, &mut r)
             };
             let answer = s.answer.lock().unwrap().take();
             let _ = tx.send(if sent == 0 || r == 0 { Err(err("no such pane")) } else { Ok(answer) });
@@ -391,7 +388,7 @@ pub fn end_children_with_me() {
 }
 
 /// Warp's pane list: one line per pane, fields separated by tabs: tab, pane, title, folder, what is
-/// running, and (newer Warps) the tab's name, the agent (claude / codex) and the pane's id.
+/// running, the tab's name, the agent (claude / codex), the pane's id and its window (`window` when a line has none).
 pub fn parse_pane_list(window: u64, text: &str) -> Vec<Session> {
     text.lines()
         .filter_map(|l| {
@@ -400,7 +397,7 @@ pub fn parse_pane_list(window: u64, text: &str) -> Vec<Session> {
                 return None;
             }
             Some(Session {
-                window,
+                window: f.get(8).and_then(|s| s.parse().ok()).unwrap_or(window),
                 tab: f[0].parse().ok()?,
                 pane: f[1].parse().ok()?,
                 title: f[2].to_string(),
@@ -427,8 +424,8 @@ pub fn single_instance(key: isize) -> bool {
     r == WAIT_OBJECT_0 || r == WAIT_ABANDONED  // the handle stays open (owned) until this process ends
 }
 
-/// Lives as long as a window of this Warp is open: waits for the process that started it, then for
-/// another window's process, and sends `Quit` when none is left. No polling.
+/// Lives as long as this Warp runs: waits for the process that started it, then for the one that took over (an
+/// update restart), and sends `Quit` when none is left. No polling.
 pub fn follow_warp(pid: u32, key: isize, tx: UnboundedSender<Cmd>) {
     std::thread::spawn(move || {
         let mut pid = pid;
@@ -440,7 +437,7 @@ pub fn follow_warp(pid: u32, key: isize, tx: UnboundedSender<Cmd>) {
                     CloseHandle(h);
                 }
             }
-            let next = warp_windows(key).into_iter().map(|w| {
+            let next = warp_hosts(key).into_iter().map(|w| {
                 let mut p = 0u32;
                 unsafe { GetWindowThreadProcessId(w as HWND, &mut p) };
                 p
@@ -452,7 +449,7 @@ pub fn follow_warp(pid: u32, key: isize, tx: UnboundedSender<Cmd>) {
                     let _ = tx.send(Cmd::Quit);
                     return;
                 }
-                None => std::thread::sleep(Duration::from_millis(300)),  // its window is still closing
+                None => std::thread::sleep(Duration::from_millis(300)),  // its hidden window is still closing
             }
         }
     });
@@ -464,10 +461,10 @@ mod tests {
 
     #[test]
     fn pane_list() {
-        let s = parse_pane_list(7, "0\t0\tclaude chat\tC:\\src\tclaude\twork\tclaude\t12\n0\t1\tpwsh\tC:\\\t\n");
+        let s = parse_pane_list(7, "0\t0\tclaude chat\tC:\\src\tclaude\twork\tclaude\t12\t99\n0\t1\tpwsh\tC:\\\t\n");
         assert_eq!(s.len(), 2);
-        assert_eq!((s[0].tab_name.as_str(), s[0].busy, s[0].agent.as_str(), s[0].pane_id), ("work", true, "claude", 12));
-        assert_eq!((s[1].pane, s[1].busy, s[1].tab_name.as_str(), s[1].pane_id), (1, false, "pwsh", 0));
+        assert_eq!((s[0].tab_name.as_str(), s[0].busy, s[0].agent.as_str(), s[0].pane_id, s[0].window), ("work", true, "claude", 12, 99));
+        assert_eq!((s[1].pane, s[1].busy, s[1].tab_name.as_str(), s[1].pane_id, s[1].window), (1, false, "pwsh", 0, 7));
         let sc = parse_screen("screen\t2\t80\nold\nPS C:\\> dir\nPS C:\\> ").unwrap();
         assert_eq!((sc.rows, sc.lines.len(), sc.visible()[0].as_str()), (2, 3, "PS C:\\> dir"));
         assert!(parse_screen("info\tx").is_none());

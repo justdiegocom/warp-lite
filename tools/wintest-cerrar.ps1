@@ -1,9 +1,10 @@
 # Which windows come back when Warp opens again (WARPLITE_DIR, like the real one): the main window (the
 # first one) always; the others only with «Reopen on restart» (reopen:on, as in the title-bar menu),
 # whether closed with their X or with quit-all (Ctrl+Shift+Q); after an update restart all of them, and
-# they keep their setting. Also: a tab moved out to a new window still resumes its Claude Code (fake
-# claude, like the real one: its conversation in sessions\<pid>.json); windows saved by a version before
-# the main window; a main window whose file is gone; the main window closed with its last tab.
+# they keep their setting. Also: a tab moved out to a new window keeps its Claude Code running (fake
+# claude, like the real one: its conversation in sessions\<pid>.json), never launched again; windows saved by a
+# version before the main window; a main window whose file is gone; the main window closed with its last tab.
+# Every window of a Warp is in one process: a second start hands its window to it and ends.
 $ErrorActionPreference = 'Stop'
 $dir = $PSScriptRoot
 $wins = "$dir\wins"
@@ -20,7 +21,8 @@ for ($i = 0; $i -lt $a.Count; $i++) {
   if ($a[$i] -eq '--model') { $model = $a[$i + 1] }
   if ($a[$i] -eq '--resume') { $res = $a[$i + 1] }
 }
-Add-Content -Encoding UTF8 "$PSScriptRoot\..\args.txt" ('claude ' + ($a -join ' '))
+# Several start at once (a restore): the log is shared, so a write that finds it busy tries again.
+for ($k = 0; $k -lt 100; $k++) { try { Add-Content -Encoding UTF8 "$PSScriptRoot\..\args.txt" ('claude ' + ($a -join ' ')) -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 30 } }
 $id = if ($res) { $res } else { $model.PadLeft(8, '0') + '-0000-4000-8000-000000000000' }
 Set-Content "$env:CLAUDE_CONFIG_DIR\sessions\$PID.json" "{`"pid`":$PID,`"sessionId`":`"$id`",`"cwd`":`"x`"}"
 Start-Sleep 300
@@ -46,6 +48,20 @@ function TabNames($f) {
   })
 }
 function Alive { @(Get-Process warp-lite -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$dir\*" }) }
+Add-Type -Namespace WarpTest -Name Win -MemberDefinition @'
+public delegate bool EnumProc(System.IntPtr h, System.IntPtr l);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc f, System.IntPtr l);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr h, out uint pid);
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern int GetClassName(System.IntPtr h, System.Text.StringBuilder s, int n);
+public static int Count(uint pid) {
+  int n = 0;
+  EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p); var s = new System.Text.StringBuilder(32); GetClassName(h, s, 32);
+                          if (p == pid && s.ToString() == "WarpLite") n++; return true; }, System.IntPtr.Zero);
+  return n;
+}
+'@
+function Windows { $n = 0; foreach ($p in Alive) { $n += [WarpTest.Win]::Count([uint32]$p.Id) }; $n }  # Warp windows open in this test
 function WaitAll($procs, $ms = 90000) { foreach ($p in $procs) { if (-not $p.WaitForExit($ms)) { $p.Kill(); 'TIMEOUT' } } }
 function WaitNoneAlive($sec = 30) { for ($t = 0; $t -lt $sec * 2 -and (Alive).Count; $t++) { Start-Sleep -Milliseconds 500 } }
 function Fresh { WaitNoneAlive; Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $wins; New-Item -ItemType Directory $wins | Out-Null }
@@ -86,7 +102,7 @@ Check ($b -contains 'window: main reopen=0 [principal]') 'main window: the tab m
 Check ($b -contains 'window: other reopen=0 [sacada]') 'the tab moved out opened in a new window'
 Check ($b -contains 'window: other reopen=0 [segunda]') 'second Warp: another window'
 $args1 = @(Get-Content -Encoding UTF8 "$dir\args.txt" -ErrorAction SilentlyContinue)
-Check ($args1 -contains "claude --model m1 --resume $m1") "moved tab resumed its conversation: $($args1 -join ' / ')"
+Check ("$args1" -eq 'claude --model m1') "the moved tab's Claude Code went on running, never launched again: $($args1 -join ' / ')"
 Check ("$(Files)" -eq 'window-main.txt') "saved after closing them with their X: $(Files)"
 $r = Reopen
 Check ("$r" -eq 'window: main reopen=0 [principal]') "opened again: $($r -join ' / ')"
@@ -120,10 +136,10 @@ $env:WARPLITE_CHILD_SCRIPT = ((@('wait') * 14) + @('close')) -join '|'
 $m = Warp @('wait', 'rename:principal', 'tab', 'wait', 'rename:sacada', 'detach-tab', 'wait', 'close')
 Start-Sleep 3
 $s = Warp (@('wait', 'rename:segunda') + @('wait') * 16 + @('close'))
-WaitAll $m
-Start-Sleep 1
-Check ((Test-Path "$wins\window-main.txt") -and (Alive).Count -eq 2) "main closed first: kept, the other two still open ($((Alive).Count))"
-WaitAll $s
+for ($t = 0; $t -lt 60 -and (Windows) -ne 3; $t++) { Start-Sleep -Milliseconds 500 }  # all three open
+for ($t = 0; $t -lt 60 -and (Windows) -ne 2; $t++) { Start-Sleep -Milliseconds 500 }  # then the main one closed
+Check ((Test-Path "$wins\window-main.txt") -and (Windows) -eq 2) "main closed first: kept, the other two still open ($(Windows))"
+WaitAll $m, $s
 WaitNoneAlive
 Remove-Item Env:\WARPLITE_CHILD_SCRIPT
 Check ("$(Files)" -eq 'window-main.txt') "then the others closed: $(Files)"
@@ -142,7 +158,7 @@ WaitAll $m, $x1, $x2
 WaitFor '^window: other' 4 60   # sacada before the restart, then the three restored ones
 Start-Sleep 2
 $b = @(Bench | Sort-Object)
-Check ((Alive).Count -eq 4) "after the update restart: $((Alive).Count) windows open (main + 3)"
+Check ((Alive).Count -eq 1 -and (Windows) -eq 4) "after the update restart: $(Windows) windows open (main + 3) in $((Alive).Count) process"
 Check ("$b" -eq 'window: other reopen=0 [sacada] window: other reopen=0 [sacada] window: other reopen=0 [sinmarcar] window: other reopen=1 [marcada]') "restored: $($b -join ' / ')"
 Remove-Item "$wins\*.bench" -ErrorAction SilentlyContinue
 WaitAll (Warp @('wait', 'wait', 'window-info', 'quit-all'))
