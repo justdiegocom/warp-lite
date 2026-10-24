@@ -57,11 +57,13 @@ struct Call {
     tool: String,
 }
 
-/// A subagent: what the phone sees of it, the Agent call that started it, and the items that show it.
+/// A subagent: what the phone sees of it, the Agent call that started it, the items that show it, and its reports
+/// (which keep its status of then, and only learn its name).
 struct Sub {
     info: AgentInfo,
     call: String,
     items: Vec<u64>,
+    reports: Vec<u64>,
 }
 
 /// One subagent as the host found it in `<session>/subagents`: its id, whether it is still working (its file doesn't end
@@ -384,9 +386,18 @@ impl Chat {
             return;
         }
         self.agents_rev = rev;
-        let (info, items) = (self.subs[k].info.clone(), self.subs[k].items.clone());
+        let (info, items, reports) = (self.subs[k].info.clone(), self.subs[k].items.clone(), self.subs[k].reports.clone());
         for id in items {
             self.update(id, rev, |i| i.agent = Some(info.clone()));
+        }
+        if (info.id.as_str(), info.name.as_str(), info.description.as_str()) != (before.id.as_str(), before.name.as_str(), before.description.as_str()) {
+            for id in reports {
+                self.update(id, rev, |i| {
+                    if let Some(a) = i.agent.as_mut() {
+                        (a.id, a.name, a.description) = (info.id.clone(), info.name.clone(), info.description.clone());
+                    }
+                });
+            }
         }
     }
 
@@ -404,6 +415,7 @@ impl Chat {
             let other = self.subs.remove(k);
             let s = &mut self.subs[keep];
             s.items.extend(other.items);
+            s.reports.extend(other.reports);
             if s.call.is_empty() {
                 s.call = other.call;
             }
@@ -431,7 +443,7 @@ impl Chat {
     }
 
     fn new_sub(&mut self, info: AgentInfo, call: &str, rev: u64) -> usize {
-        self.subs.push(Sub { info, call: call.to_string(), items: Vec::new() });
+        self.subs.push(Sub { info, call: call.to_string(), items: Vec::new(), reports: Vec::new() });
         if self.subs.len() > MAX_AGENTS {
             // The one that stopped longest ago goes.
             if let Some(k) = (0..self.subs.len()).filter(|&k| self.subs[k].info.status != "running").min_by_key(|&k| self.subs[k].info.ended.max(self.subs[k].info.started)) {
@@ -494,13 +506,14 @@ impl Chat {
         let k = self.subs.iter().position(|s| (!id.is_empty() && s.info.id == id) || (!sub_call.is_empty() && s.call == sub_call)).unwrap_or(k);
         let info = self.subs[k].info.clone();
         let text = if summary.is_empty() { format!("Agent “{}” {}", info.description, if ok { "finished" } else { "stopped" }) } else { cut(summary, 200) };
+        // The report keeps the subagent as it was when it came (resumed later, its card above shows it working again).
         let item = self.push("tool", text, cut(tag(t, "result"), MAX_REPORT), ts, rev);
         self.update(item, rev, |i| {
             i.tool = "Agent".into();
             i.failed = !ok;
             i.agent = Some(info);
         });
-        self.subs[k].items.push(item);
+        self.subs[k].reports.push(item);
     }
 
     /// What the host found in `<session>/subagents`: subagents that started before the part of the transcript that was
@@ -946,6 +959,15 @@ mod tests {
         // Its card in the chat changed with it.
         let (later, _) = c.since(98, 100, 1 << 20);
         assert!(later.iter().any(|i| i.agent.as_ref().is_some_and(|a| a.id == "a6d5e25a0889e3ee4" && a.status == "done")));
+        // A report of one started before the part read: its name comes from the list, its status stays the report's.
+        let n = serde_json::json!({"type":"user","message":{"content":"<task-notification>\n<task-id>a0514333bb2b2223f</task-id>\n<status>completed</status>\n<summary>Agent \"Install it\" finished</summary>\n<result>ok</result>\n</task-notification>"}});
+        c.feed(n.to_string().as_bytes(), 100);
+        let meta = serde_json::json!({"agentType":"general-purpose","description":"Install it"});
+        c.merge_listed(&[Listed { id: "a0514333bb2b2223f".into(), running: true, started: 1, modified: 0, meta }], 101);
+        let (items, _) = c.since(0, 100, 1 << 20);
+        let report = items.last().unwrap().agent.as_ref().unwrap();
+        assert_eq!((report.name.as_str(), report.status.as_str()), ("general-purpose", "done"));
+        assert_eq!(c.agent_info("a0514333bb2b2223f").unwrap().status, "running");
     }
 
     /// A subagent's own file: every record is a sidechain one, and its task comes first.

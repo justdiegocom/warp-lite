@@ -29,10 +29,11 @@ fn strip_frame(line: &str) -> &str {
     }
 }
 
-/// A line that is only a rule (───, ╌╌╌, ━━━), the edges of a dialog.
+/// A line that is only a rule (───, ╌╌╌, ━━━), the edges of a dialog; a character cut at the pane's edge may end it.
 fn is_rule(line: &str) -> bool {
     let t = line.trim();
-    t.chars().count() >= 8 && t.chars().all(|c| matches!(c, '─' | '━' | '╌' | '┄' | '┈' | '═' | '-' | '╭' | '╮' | '╰' | '╯' | '┌' | '┐' | '└' | '┘'))
+    let rule = |c: char| matches!(c, '─' | '━' | '╌' | '┄' | '┈' | '═' | '-' | '╭' | '╮' | '╰' | '╯' | '┌' | '┐' | '└' | '┘');
+    t.chars().filter(|&c| rule(c)).count() >= 8 && t.chars().filter(|&c| !rule(c)).count() <= 2 && t.starts_with(rule)
 }
 
 fn is_solid_rule(line: &str) -> bool {
@@ -108,6 +109,9 @@ fn numbered(lines: &[&str]) -> Option<Prompt> {
                 return None;  // two blank lines: not one group
             }
             continue;
+        }
+        if is_rule(line) && opts.last().is_some_and(|o| o.row == r + 1) {
+            continue;  // a rule between options (Claude Code's «Chat about this» under its question's own)
         }
         match parse_option(r, line) {
             Some(o) if o.num == Some(want) => {
@@ -546,6 +550,34 @@ mod tests {
   ◯ general-purpose 1m 1s · ↓ 1.1k
 
 [fnviewer]0:claude*                                \"vnic-main\" 23:10 23-Oct-26";
+
+    // Claude Code 2.1.308's AskUserQuestion: its own options, then a rule and «Chat about this» (a rule cut at the edge).
+    const ASK: &str = "\
+❯ Use the AskUserQuestion tool to ask me which color I like
+────────────────────────────────────�
+ ☐ Color
+Which color do you like: red, green or blue?
+❯ 1. Red
+     Choose red
+  2. Green
+     Choose green
+  3. Blue
+     Choose blue
+  4. Type something.
+────────────────────────────────────�
+  5. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to cancel";
+
+    #[test]
+    fn ask_user_question() {
+        let r = rows(ASK);
+        let p = prompt(&r).expect("prompt");
+        assert_eq!(p.options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(), ["Red", "Green", "Blue", "Type something.", "Chat about this"]);
+        assert_eq!((p.options[1].hint.as_str(), p.selected), ("Choose green", 0));
+        assert!(p.question.ends_with("Which color do you like: red, green or blue?"), "{}", p.question);
+        assert_eq!(status(&r, "claude", true, true), "waiting");
+        assert_eq!(keys_for(0, 1), ["down", "enter"]);
+    }
 
     #[test]
     fn background_agents_footer() {
