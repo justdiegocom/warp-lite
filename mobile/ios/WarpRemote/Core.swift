@@ -55,6 +55,8 @@ struct Answer: Decodable {
     var sessions: [Session]? = nil
     var rtt_ms: Double? = nil
     var pane: PaneState? = nil
+    /// The protocol both sides speak (3: subagents can be opened).
+    var version: Int? = nil
 }
 
 struct NetPath: Decodable, Equatable {
@@ -76,7 +78,18 @@ struct Session: Decodable, Identifiable, Hashable {
     var agent: String? = nil
     /// The pane's id in its window (nil from an older Warp, which can't show a pane's content).
     var pane_id: UInt32? = nil
+    /// Finishes and questions not seen yet on the computer (Warp's unread badge).
+    var unread: Int? = nil
+    /// An agent's pane: "working", "waiting" (a question waits for an answer) or "finished".
+    var status: String? = nil
     var id: String { "\(window)-\(tab)-\(pane)" }
+}
+
+/// A subagent of a pane's Claude Code, opened from its card or its chip (read-only).
+struct SubagentRoute: Hashable {
+    var session: Session
+    var agent: String
+    var title: String
 }
 
 /// What a pane shows (warp-remote's PaneView): a chat from Claude Code's or Codex's transcript, or the screen as text.
@@ -93,6 +106,12 @@ struct PaneState: Decodable {
     var prompt: Prompt? = nil
     var typing: Bool? = nil
     var note: String? = nil
+    /// The subagents (running ones first), when they changed.
+    var agents: [AgentInfo]? = nil
+    /// When the turn going on (or the last one) started (Unix ms).
+    var turn_start: UInt64? = nil
+    /// What the agent says it is doing («Baking… (3m 12s · ↓ 4.2k tokens)»), or the tool call running.
+    var activity: String? = nil
 }
 
 struct ChatItem: Decodable, Identifiable, Equatable {
@@ -103,6 +122,36 @@ struct ChatItem: Decodable, Identifiable, Equatable {
     var detail: String? = nil
     var failed: Bool? = nil
     var pending: Bool? = nil
+    /// Unix ms.
+    var ts: UInt64? = nil
+    /// The tool of a tool call ("Bash", "Edit", "Agent", "AskUserQuestion", "ExitPlanMode"…).
+    var tool: String? = nil
+    /// What it came to, short («+12 −3», «exit 1»).
+    var badge: String? = nil
+    /// The subagent it started (or a report of).
+    var agent: AgentInfo? = nil
+    /// An AskUserQuestion's options.
+    var options: [PromptOption]? = nil
+}
+
+/// A subagent: Claude Code's Agent tool, in the foreground or the background, with its own conversation.
+struct AgentInfo: Decodable, Equatable {
+    /// Empty until the computer knows it.
+    var id: String
+    var name: String
+    var description: String? = nil
+    /// "running", "done" or "failed".
+    var status: String
+    var started: UInt64? = nil
+    var ended: UInt64? = nil
+    var duration_ms: UInt64? = nil
+    var tokens: UInt64? = nil
+    var tool_uses: UInt64? = nil
+    var background: Bool? = nil
+
+    var running: Bool { status == "running" }
+    /// Stable within a list even before the id is known.
+    var key: String { id.isEmpty ? "\(name)-\(started ?? 0)-\(description ?? "")" : id }
 }
 
 /// A question on the pane's screen with its options (Claude Code's permission prompts and menus, Codex's approvals).

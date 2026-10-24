@@ -7,14 +7,18 @@
 #   mobile/ios/build.sh demo               → the app end to end in the booted Simulator against a real Warp, with real
 #     taps (WarpRemoteUITests/DemoTests.swift): TEST_RUNNER_PAIR_TICKET=<code> TEST_RUNNER_CHAT_TAB=<tab>
 #     [TEST_RUNNER_SHELL_TAB=<tab> TEST_RUNNER_REPLY=… TEST_RUNNER_SHOTS=<folder>]
+#   mobile/ios/build.sh chat-demo <sim id> → the chat in that Simulator against a real Warp (WarpRemoteUITests/
+#     ChatDemoTests.swift): a pane with subagents (only looked at) and one of its subagents, then a Claude Code of its own
+#     answered with buttons and a quick reply: TEST_RUNNER_PAIR_TICKET=<code> TEST_RUNNER_CHAT_TAB=<tab>
+#     TEST_RUNNER_DEMO_TAB=<tab> [TEST_RUNNER_SHOTS=<folder>]
 # Needs Xcode, xcodegen and rustup's aarch64-apple-ios / aarch64-apple-ios-sim targets.
 set -euo pipefail
 cd "$(dirname "$0")"
 kind=${1:-sim}
 case "$kind" in
-  sim | demo) target=aarch64-apple-ios-sim plat=iphonesimulator ;;
+  sim | demo | chat-demo) target=aarch64-apple-ios-sim plat=iphonesimulator ;;
   device | ipa) target=aarch64-apple-ios plat=iphoneos ;;
-  *) echo "usage: $0 sim | device <TEAM_ID> | ipa | demo" >&2; exit 2 ;;
+  *) echo "usage: $0 sim | device <TEAM_ID> | ipa | demo | chat-demo <sim id>" >&2; exit 2 ;;
 esac
 (cd ../core && cargo build --release --locked --target "$target")
 mkdir -p "build/rust/$plat"
@@ -27,6 +31,9 @@ case "$kind" in
     booted=$(xcrun simctl list devices booted | sed -n 's/.*(\([0-9A-F-]\{36\}\)) (Booted).*/\1/p' | head -n 1)
     [[ -n "$booted" ]] || { echo "boot a Simulator first (xcrun simctl boot 'iPhone 17 Pro')" >&2; exit 1; }
     exec xcodebuild "${args[@]}" -destination "id=$booted" CODE_SIGN_IDENTITY=- -only-testing:WarpRemoteUITests/DemoTests test -quiet ;;
+  chat-demo)
+    sim=${2:?the Simulator to run it in (xcrun simctl list devices)}
+    exec xcodebuild "${args[@]}" -destination "id=$sim" CODE_SIGN_IDENTITY=- -only-testing:WarpRemoteUITests/ChatDemoTests test -quiet ;;
   device)
     team=${2:?team id: Xcode → Settings → Accounts}
     xcodebuild "${args[@]}" -destination 'generic/platform=iOS' -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
