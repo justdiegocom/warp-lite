@@ -320,12 +320,11 @@ pub fn agent(rows: &[String]) -> &'static str {
 pub fn tmux_session(rows: &[String]) -> Option<String> {
     let last = rows.iter().rev().find(|l| !l.trim().is_empty())?;
     let rest = last.strip_prefix('[')?;
-    if let Some(end) = rest.find("] ") {
-        let name = &rest[..end];
-        return valid_name(name).then(|| name.to_string());
-    }
-    if let Some(end) = rest.find(']').filter(|&e| e <= 8)
+    // The first «]» ends the name (a name has none), unless the name was cut: then it is one further on the line
+    // (status-right's «[0,9] » when the window is bigger than the client), after characters a name can't have.
+    if let Some(end) = rest.find(']')
         && valid_name(&rest[..end])
+        && (rest[end + 1..].starts_with(' ') || end <= 8)
     {
         return Some(rest[..end].to_string());
     }
@@ -514,6 +513,10 @@ mod tests {
         // A name of 8 fills status-left with its brackets, with no space after them.
         assert_eq!(tmux_session(&rows("[fnviewer]0:claude*                \"host\" 23:10 23-Oct-26")).as_deref(), Some("fnviewer"));
         assert_eq!(tmux_session(&rows("[warp] 0:zsh*")).as_deref(), Some("warp"));
+        // With a client smaller than the window, status-right starts with the offset («[0,9] »).
+        assert_eq!(tmux_session(&rows("[fnviewer]0:claude*          [0,9] agents: 2 \"host\" 09:52")).as_deref(), Some("fnviewer"));
+        assert_eq!(tmux_session(&rows("[warp] 0:zsh*   [0,9] agents: 2")).as_deref(), Some("warp"));
+        assert_eq!(tmux_session(&rows("[radarnite0:claude*   [0,9] agents: 2")).as_deref(), Some("radarnite*"));
         // A cut name, resolved by the script the remote command runs with the session's name (`ssh -t fr "~/bin/fr-session radarnite"`).
         let words: Vec<String> = ["~/bin/fr-session", "radarnite"].map(String::from).to_vec();
         let cut9 = rows("[radarnite0:claude*  \"host\" 23:10 23-Oct-26");
