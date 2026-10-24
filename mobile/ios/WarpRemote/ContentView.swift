@@ -4,13 +4,16 @@ struct ContentView: View {
     @EnvironmentObject var model: Model
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $model.nav) {
             Group {
                 if model.paired { HostView() } else { PairView() }
             }
             .background(Color(white: 0.02).ignoresSafeArea())
             .navigationDestination(for: Session.self) { s in
                 PaneView(session: s, core: model.core)
+            }
+            .navigationDestination(for: SubagentRoute.self) { r in
+                PaneView(session: r.session, core: model.core, agent: r.agent, title: r.title)
             }
         }
         .task { await model.start() }
@@ -110,6 +113,11 @@ struct HostView: View {
         }
         .scrollContentBackground(.hidden)
         .refreshable { await model.refresh() }
+        .onAppear {
+            model.listVisible = true
+            Task { await model.refresh() }
+        }
+        .onDisappear { model.listVisible = false }
         .navigationTitle(model.host.isEmpty ? "Warp" : model.host)
         .toolbar {
             Menu {
@@ -218,12 +226,11 @@ struct SessionRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Circle()
-                .fill(session.busy ? Color.green : Color.secondary.opacity(0.4))
-                .frame(width: 8, height: 8)
-                .padding(.top, 6)
+            marker
+                .frame(width: 10, height: 10)
+                .padding(.top, 5)
             VStack(alignment: .leading, spacing: 3) {
-                HStack {
+                HStack(spacing: 6) {
                     Text(session.title).font(.body.weight(.medium)).lineLimit(1)
                     if let agent = session.agent, !agent.isEmpty {
                         Text(agent == "claude" ? "Claude" : agent == "codex" ? "Codex" : agent)
@@ -233,14 +240,47 @@ struct SessionRow: View {
                     }
                 }
                 Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                if session.status == "waiting" {
+                    HStack(spacing: 4) {
+                        Image(systemName: "hand.raised.fill")
+                        Text("Waiting for you")
+                    }
+                    .font(.caption.weight(.semibold)).foregroundStyle(.yellow)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("waiting")
+                } else if session.status == "working" {
+                    Text("Working…").font(.caption).foregroundStyle(.orange)
+                }
+            }
+            Spacer(minLength: 4)
+            if let n = session.unread, n > 0 {
+                Text(n > 9 ? "9+" : "\(n)")
+                    .font(.caption.weight(.bold)).foregroundStyle(.white)
+                    .frame(minWidth: 22, minHeight: 22)
+                    .padding(.horizontal, n > 9 ? 4 : 0)
+                    .background(Capsule().fill(accent))
+                    .accessibilityLabel("\(n) unread")
+                    .accessibilityIdentifier("unread")
             }
         }
         .padding(.vertical, 2)
     }
 
-    /// Where it is: the folder, or for a pane running ssh, the command (the folder is this computer's, not the host's).
+    /// Working (a spinner), waiting for you (yellow), something running (green) or nothing.
+    @ViewBuilder private var marker: some View {
+        switch session.status {
+        case "working": ProgressView().controlSize(.mini).tint(.orange)
+        case "waiting": Circle().fill(Color.yellow)
+        default: Circle().fill(session.busy ? Color.green : Color.secondary.opacity(0.4)).padding(1)
+        }
+    }
+
+    /// Where it is: the folder, or for a command such as `ssh host` or a script that runs it (`fr fnviewer`), the
+    /// command (the folder is this computer's, not the host's).
     private var subtitle: String {
-        let place = (session.running ?? "").hasPrefix("ssh ") ? session.running ?? "" : folder
+        let run = session.running ?? ""
+        let local = run.isEmpty || !run.contains(" ") || run.lowercased().hasPrefix("claude") || run.lowercased().hasPrefix("codex")
+        let place = local ? folder : run
         return session.tab_name == session.title ? place : "\(session.tab_name) · \(place)"
     }
 

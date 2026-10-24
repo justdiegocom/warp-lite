@@ -26,6 +26,12 @@ final class Model: ObservableObject {
     @Published var path: NetPath?
     @Published var rtt: Double?
     @Published var sessions: [Session] = []
+    /// The protocol the computer speaks (3 and up: a subagent can be opened).
+    @Published var version = 0
+    /// What is open: a terminal, and maybe one of its subagents.
+    @Published var nav = NavigationPath()
+    /// The list of terminals is on screen: it follows them (badges, what each agent does).
+    var listVisible = false
     @Published var error: String?
     /// The core's code for `error` ("unavailable", "not_paired", "revoked"…).
     @Published var errorCode: String?
@@ -91,6 +97,7 @@ final class Model: ObservableObject {
             errorCode = nil
             failures = 0
             sessions = a.sessions ?? []
+            version = a.version ?? version
             host = a.host ?? host
             path = a.path
             let p = await core.call(["op": "ping"])
@@ -105,8 +112,9 @@ final class Model: ObservableObject {
         }
     }
 
-    /// While the app is open: a ping every 5 s keeps the connection and shows how it goes (direct or relay). When the
-    /// computer doesn't answer, it tries again until the list says it can't reach it (then Try again, or pull to refresh).
+    /// While the app is open: a ping every 5 s keeps the connection and shows how it goes (direct or relay), and while
+    /// the list is on screen the terminals are asked again instead. When the computer doesn't answer, it tries again
+    /// until the list says it can't reach it (then Try again, or pull to refresh).
     private func keepPinging() {
         pinger?.cancel()
         pinger = Task { [weak self] in
@@ -114,6 +122,11 @@ final class Model: ObservableObject {
                 try? await Task.sleep(for: .seconds(5))
                 guard let self, self.paired, !self.connecting, !self.unreachable, !self.needsPairing else { continue }
                 if self.error != nil {
+                    await self.refresh()
+                    continue
+                }
+                // The list on screen follows the terminals (badges, what each agent does); otherwise a ping.
+                if self.listVisible {
                     await self.refresh()
                     continue
                 }
@@ -143,6 +156,7 @@ final class Model: ObservableObject {
         paired = false
         host = ""
         sessions = []
+        nav = NavigationPath()
         path = nil
         rtt = nil
         error = nil
