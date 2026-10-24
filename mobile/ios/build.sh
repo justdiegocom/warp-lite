@@ -26,7 +26,7 @@ case "$kind" in
   demo)
     booted=$(xcrun simctl list devices booted | sed -n 's/.*(\([0-9A-F-]\{36\}\)) (Booted).*/\1/p' | head -n 1)
     [[ -n "$booted" ]] || { echo "boot a Simulator first (xcrun simctl boot 'iPhone 17 Pro')" >&2; exit 1; }
-    exec xcodebuild "${args[@]}" -destination "id=$booted" CODE_SIGN_IDENTITY=- test -quiet ;;
+    exec xcodebuild "${args[@]}" -destination "id=$booted" CODE_SIGN_IDENTITY=- -only-testing:WarpRemoteUITests/DemoTests test -quiet ;;
   device)
     team=${2:?team id: Xcode → Settings → Accounts}
     xcodebuild "${args[@]}" -destination 'generic/platform=iOS' -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
